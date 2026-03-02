@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "three": "0.180.0",
+    "three-mesh-bvh": "0.9.1"
+  },
+  "devDependencies": {
+    "vite": "7.1.5"
+  }
+}

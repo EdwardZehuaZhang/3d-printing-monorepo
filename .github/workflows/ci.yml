@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: admin-website
+            install: npm ci
+            command: npm run lint
+            cache: npm
+            cache-dep: admin-website/package-lock.json
+
+          - service: agent-backend
+            install: npm ci
+            command: |
+              npm run lint
+              npm run type-check
+              npm run build
+            cache: npm
+            cache-dep: agent-backend/package-lock.json
+
+          - service: andyou-mobile
+            install: npm ci
+            command: npm run lint
+            cache: npm
+            cache-dep: andyou-mobile/package-lock.json
+
+          - service: lab-report-generator
+            install: npm ci
+            command: |
+              npm run lint
+              npm run type-check
+              npm run build
+            cache: npm
+            cache-dep: lab-report-generator/package-lock.json
+
+    name: ${{ matrix.service }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        if: matrix.cache == 'pnpm'
+        with:
+          version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: ${{ matrix.cache }}
+          cache-dependency-path: ${{ matrix.cache-dep }}
+
+      - name: Install dependencies
+        run: ${{ matrix.install }}
+
+      - name: Run checks
+        run: ${{ matrix.command }}

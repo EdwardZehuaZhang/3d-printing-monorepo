@@ -1,0 +1,57 @@
+.venv/
+venv/
+
+*.npy
+*.json
+!package.json
+*.csv
+*.pdf
+
+node_modules
+
+dist/
+archive/
+*.egg-info/
+build/
+data/
+lightning_logs/
+.vs_code/
+.vscode/
+__pycache__
+.DS_Store
+.ipynb_checkpoints/
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+*.stl
+*.gcode
+*.3mf
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app

@@ -1,0 +1,16 @@
+name: Validate Ports
+
+on:
+  pull_request:
+    paths:
+      - '**/. env*'
+      - '**/src/index.ts'
+      - 'scripts/validate-ports.sh'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate port assignments
+        run: bash scripts/validate-ports.sh
