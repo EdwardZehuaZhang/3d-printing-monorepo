@@ -7,6 +7,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tupl
 
 GridIndex = Tuple[int, int, int]
 FloatPoint = Tuple[float, float, float]
+RoominessMap = Dict[GridIndex, int]
 
 
 class RoutingError(RuntimeError):
@@ -64,6 +65,41 @@ def _local_roominess(valid_cells: Set[GridIndex], center: GridIndex, radius: int
                 if candidate in valid_cells:
                     roominess += 1
     return roominess
+
+
+def _build_roominess_map(valid_cells: Set[GridIndex], radius: int = 2) -> RoominessMap:
+    return {
+        cell: _local_roominess(valid_cells, cell, radius)
+        for cell in valid_cells
+    }
+
+
+def _roominess(roominess_map: RoominessMap, valid_cells: Set[GridIndex], cell: GridIndex) -> int:
+    if cell in roominess_map:
+        return roominess_map[cell]
+    return _local_roominess(valid_cells, cell)
+
+
+def _bottleneck_threshold(roominess_map: RoominessMap) -> int:
+    if not roominess_map:
+        return 0
+    values = sorted(roominess_map.values())
+    percentile_index = max(0, min(len(values) - 1, int(len(values) * 0.2)))
+    return values[percentile_index]
+
+
+def _path_bottleneck_penalty(
+    path: Sequence[GridIndex],
+    roominess_map: RoominessMap,
+    valid_cells: Set[GridIndex],
+    threshold: int,
+) -> int:
+    if threshold <= 0:
+        return 0
+    return sum(
+        max(0, threshold - _roominess(roominess_map, valid_cells, cell))
+        for cell in path[1:-1]
+    )
 
 
 def _path_length(path: Sequence[GridIndex]) -> float:
@@ -233,6 +269,8 @@ def _grow_path_toward_target(
     valid_cells: Set[GridIndex],
     target_length: float,
     self_avoid_radius: int,
+    roominess_map: RoominessMap,
+    bottleneck_threshold: int,
 ) -> List[GridIndex]:
     grown = list(path)
     if len(grown) < 2:
@@ -242,7 +280,10 @@ def _grow_path_toward_target(
     if current_length + 1e-9 >= target_length:
         return grown
 
-    max_iterations = max(32, int(target_length - current_length) * 2)
+    max_iterations = min(
+        max(32, int(target_length - current_length) * 2),
+        max(32, len(valid_cells) * 2),
+    )
     for _ in range(max_iterations):
         if current_length + 1e-9 >= target_length:
             break
@@ -250,8 +291,8 @@ def _grow_path_toward_target(
         edge_indices = sorted(
             range(len(grown) - 1),
             key=lambda index: min(
-                _local_roominess(valid_cells, grown[index]),
-                _local_roominess(valid_cells, grown[index + 1]),
+                _roominess(roominess_map, valid_cells, grown[index]),
+                _roominess(roominess_map, valid_cells, grown[index + 1]),
             ),
             reverse=True,
         )
@@ -286,9 +327,17 @@ def _grow_path_toward_target(
                     continue
 
                 expanded_length = _path_length(expanded_path)
+                shortfall = max(0.0, target_length - expanded_length)
+                overshoot = max(0.0, expanded_length - target_length)
                 score = (
-                    abs(expanded_length - target_length),
-                    expanded_length < target_length,
+                    shortfall,
+                    overshoot,
+                    _path_bottleneck_penalty(
+                        expanded_path,
+                        roominess_map,
+                        valid_cells,
+                        bottleneck_threshold,
+                    ),
                     _path_vertical_span(expanded_path),
                     _path_layer_count(expanded_path),
                     _path_xy_footprint(expanded_path),
@@ -356,8 +405,10 @@ def _select_detour_waypoints(
     target_length: float,
     limit: int,
     allow_diagonals: bool,
+    roominess_map: RoominessMap,
+    bottleneck_threshold: int,
 ) -> List[GridIndex]:
-    ranked: List[Tuple[Tuple[float, float, float, float], GridIndex]] = []
+    ranked: List[Tuple[Tuple[float, float, float, float, float], GridIndex]] = []
     for candidate in valid_cells:
         if candidate == start or candidate == goal:
             continue
@@ -372,15 +423,17 @@ def _select_detour_waypoints(
             continue
 
         line_distance = _point_to_segment_distance(candidate, start, goal)
-        roominess = _local_roominess(valid_cells, candidate)
+        roominess = _roominess(roominess_map, valid_cells, candidate)
+        bottleneck_penalty = max(0, bottleneck_threshold - roominess)
         midplane_offset = abs((candidate[2] * 2) - (start[2] + goal[2]))
         score = (
             abs(total_distance - target_length),
-            midplane_offset,
+            bottleneck_penalty,
             -roominess,
+            -total_distance,
+            midplane_offset,
             -line_distance,
             -min(start_distance, goal_distance),
-            -total_distance,
         )
         ranked.append((score, candidate))
 
@@ -398,14 +451,15 @@ def _select_detour_waypoints(
     pool = [candidate for _, candidate in ranked[: min(len(ranked), limit * 8)]]
     while len(selected) < limit:
         best_candidate: Optional[GridIndex] = None
-        best_score: Optional[Tuple[float, float, float]] = None
+        best_score: Optional[Tuple[float, float, float, float]] = None
         for pool_index, candidate in enumerate(pool):
             if candidate in selected_set:
                 continue
             diversity = min(_distance(candidate, existing) for existing in selected)
             line_distance = _point_to_segment_distance(candidate, start, goal)
-            roominess = _local_roominess(valid_cells, candidate)
-            score = (roominess, diversity, line_distance, -float(pool_index))
+            roominess = _roominess(roominess_map, valid_cells, candidate)
+            bottleneck_penalty = max(0, bottleneck_threshold - roominess)
+            score = (-bottleneck_penalty, roominess, diversity, line_distance, -float(pool_index))
             if best_score is None or score > best_score:
                 best_score = score
                 best_candidate = candidate
@@ -570,15 +624,22 @@ def _dedupe_paths(paths: Sequence[Sequence[GridIndex]]) -> List[List[GridIndex]]
 def _sort_candidate_paths(
     paths: Sequence[Sequence[GridIndex]],
     target_length: Optional[float],
+    roominess_map: Optional[RoominessMap] = None,
+    valid_cells: Optional[Set[GridIndex]] = None,
+    bottleneck_threshold: int = 0,
 ) -> List[List[GridIndex]]:
     if target_length is None:
         return sorted((list(path) for path in paths), key=_path_length)
 
+    roominess_lookup = roominess_map or {}
+    valid = valid_cells or set()
+
     return sorted(
         (list(path) for path in paths),
         key=lambda path: (
-            abs(_path_length(path) - target_length),
-            _path_length(path) < target_length,
+            max(0.0, target_length - _path_length(path)),
+            max(0.0, _path_length(path) - target_length),
+            _path_bottleneck_penalty(path, roominess_lookup, valid, bottleneck_threshold),
             _path_vertical_span(path),
             _path_layer_count(path),
             _path_xy_footprint(path),
@@ -624,6 +685,10 @@ def _segment_candidate_paths(
     max_candidates: int = 14,
     vertical_move_penalty: float = 0.0,
 ) -> List[List[GridIndex]]:
+    roominess_map = _build_roominess_map(valid_cells)
+    bottleneck_threshold = _bottleneck_threshold(roominess_map)
+    target_first_vertical_penalty = 0.0 if target_length is not None else vertical_move_penalty
+
     direct_path = astar_path(
         valid_cells=valid_cells,
         start=start,
@@ -631,7 +696,7 @@ def _segment_candidate_paths(
         penalty_cells=penalty_cells,
         penalty_weight=penalty_weight,
         allow_diagonals=allow_diagonals,
-        vertical_move_penalty=vertical_move_penalty,
+        vertical_move_penalty=target_first_vertical_penalty,
     )
 
     candidates: List[List[GridIndex]] = [direct_path]
@@ -647,13 +712,15 @@ def _segment_candidate_paths(
         target_length=target_length,
         limit=18,
         allow_diagonals=allow_diagonals,
+        roominess_map=roominess_map,
+        bottleneck_threshold=bottleneck_threshold,
     )
 
     beam: List[Tuple[GridIndex, ...]] = [tuple()]
     beam_width = 14
     max_waypoints = 4
     for _ in range(max_waypoints):
-        expanded: List[Tuple[Tuple[float, bool, float, float], Tuple[GridIndex, ...]]] = []
+        expanded: List[Tuple[Tuple[float, float, int, int, int, float, float], Tuple[GridIndex, ...]]] = []
         for waypoint_sequence in beam:
             used = set(waypoint_sequence)
             for waypoint in candidate_waypoints:
@@ -669,8 +736,14 @@ def _segment_candidate_paths(
                 expanded.append(
                     (
                         (
-                            abs(estimated_length - target_length),
-                            estimated_length < target_length,
+                            max(0.0, target_length - estimated_length),
+                            max(0.0, estimated_length - target_length),
+                            _path_bottleneck_penalty(
+                                (start,) + next_sequence + (goal,),
+                                roominess_map,
+                                valid_cells,
+                                bottleneck_threshold,
+                            ),
                             _path_vertical_span((start,) + next_sequence + (goal,)),
                             _path_layer_count((start,) + next_sequence + (goal,)),
                             _path_xy_footprint((start,) + next_sequence + (goal,)),
@@ -696,7 +769,7 @@ def _segment_candidate_paths(
                         penalty_weight=penalty_weight,
                         allow_diagonals=allow_diagonals,
                         self_avoid_radius=self_avoid_radius,
-                        vertical_move_penalty=vertical_move_penalty,
+                        vertical_move_penalty=target_first_vertical_penalty,
                     )
                 )
             except RoutingError:
@@ -710,11 +783,19 @@ def _segment_candidate_paths(
                 valid_cells,
                 target_length,
                 max(0, self_avoid_radius),
+                roominess_map,
+                bottleneck_threshold,
             )
             for path in unique_candidates
         ]
         unique_candidates = _dedupe_paths(unique_candidates + grown_candidates)
-    return _sort_candidate_paths(unique_candidates, target_length)[:max_candidates]
+    return _sort_candidate_paths(
+        unique_candidates,
+        target_length,
+        roominess_map=roominess_map,
+        valid_cells=valid_cells,
+        bottleneck_threshold=bottleneck_threshold,
+    )[:max_candidates]
 
 
 def _neighbor_offsets(allow_diagonals: bool) -> Iterator[Tuple[GridIndex, float]]:

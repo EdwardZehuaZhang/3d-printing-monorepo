@@ -38,6 +38,7 @@ MIN_TOUCH_NODE_FLUSH_DIAMETER_MM = 0.5
 TERMINAL_DIAMETER_MM = 3.0
 TERMINAL_LENGTH_MM = 6.0
 MAX_DP_NODES = 10
+MAX_EXACT_TOUCH_ORDER_NODES = 6
 DEFAULT_TOUCH_READING_DELTA_KOHM = 50.0
 MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
@@ -45,6 +46,7 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
+ROUTER_BUILD_TAG = "2026-03-09 target-first-bottleneck-v1"
 
 
 @dataclass(frozen=True)
@@ -297,7 +299,7 @@ def _target_order_candidates(
     touch_nodes: Sequence[TouchNodePlacement],
     end: TerminalPlacement,
     target_leg_length: float,
-    max_exact_nodes: int = 7,
+    max_exact_nodes: int = MAX_EXACT_TOUCH_ORDER_NODES,
 ) -> List[TouchNodeOrderCandidate]:
     if not touch_nodes:
         empty_metrics = NodeOrderMetrics(
@@ -1304,6 +1306,7 @@ def _add_output_geometry(
 def run_generate_internal_wire() -> Rhino.Commands.Result:
     doc = _active_doc()
     tolerance = doc.ModelAbsoluteTolerance
+    Rhino.RhinoApp.WriteLine("GenerateInternalWire build: {}".format(ROUTER_BUILD_TAG))
 
     casing_thickness = _mm_to_model(doc, CASING_THICKNESS_MM)
     boundary_clearance = _mm_to_model(doc, BOUNDARY_CLEARANCE_MM)
@@ -1375,6 +1378,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
+    Rhino.RhinoApp.WriteLine("Ranking touch-node orders against the requested resistance target...")
     order_candidates = _target_order_candidates(
         start_terminal,
         touch_nodes,
@@ -1426,6 +1430,9 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
 
         attempted_orders += 1
         try:
+            Rhino.RhinoApp.WriteLine(
+                "Trying touch-node order {}...".format(" -> ".join(label for label in route_labels[1:-1]))
+            )
             segments = route_node_sequence(
                 valid_cells=valid_cells,
                 node_sequence=node_cells,
