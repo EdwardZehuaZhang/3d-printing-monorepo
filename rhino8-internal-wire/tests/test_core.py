@@ -6,7 +6,7 @@ LIBRARIES = Path(__file__).resolve().parents[1] / "Libraries"
 if str(LIBRARIES) not in sys.path:
     sys.path.insert(0, str(LIBRARIES))
 
-from wire_router.core import GridSpec, route_node_sequence
+from wire_router.core import route_node_sequence
 
 
 class CoreRouterTests(unittest.TestCase):
@@ -59,6 +59,25 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(len(segments), 2)
         self.assertEqual(segments[0], [(0, 0, 0), (4, 0, 0)])
         self.assertEqual(segments[1], [(4, 0, 0), (1, 0, 0)])
+
+    def test_blocked_radius_keeps_later_segments_apart(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(7) for y in range(4)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 1, 0), (3, 1, 0), (6, 1, 0)],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            blocked_exemption_radius=1,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0][0], (0, 1, 0))
+        self.assertEqual(segments[0][-1], (3, 1, 0))
+        self.assertEqual(segments[1][0], (3, 1, 0))
+        self.assertEqual(segments[1][-1], (6, 1, 0))
+        self.assertTrue(any(cell[1] != 1 for cell in segments[1][1:-1]))
 
 
 if __name__ == "__main__":

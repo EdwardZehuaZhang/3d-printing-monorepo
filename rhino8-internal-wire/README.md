@@ -5,10 +5,11 @@ This folder contains a Rhino 8 script-plugin MVP that generates a wire path insi
 ## What it does
 
 - lets the user select one closed target geometry
-- lets the user pick node points in order on that geometry
+- lets the user pick node points in order on that geometry with live node preview
+- validates node size and node spacing during picking
 - builds an interior voxel graph
 - routes one continuous wire through the nodes
-- adds a centerline curve and a pipe solid back into Rhino
+- adds separate conductive path, casing, and node solids back into Rhino
 
 ## Current scope
 
@@ -70,30 +71,51 @@ If the command is still not available, open `PlugInManager`, right-click the
 plugin, and choose `Commands` to verify that `GenerateInternalWire` is included
 in the loaded plugin.
 
+## Update an already installed plugin
+
+If Rhino reports `Unable to load ... .rhp: ID already in use`, Rhino already has
+this plugin registered and you should update the existing installed copy instead
+of installing a second one.
+
+1. In Rhino, run `PlugInManager`.
+2. Find the plugin in the list and select it.
+3. Right-click the plugin and choose `Open Containing Folder`.
+4. Leave that folder open. This is the installed plugin location Rhino is using.
+5. Close Rhino completely.
+6. From the newly published build output, copy the updated `.rhp` file.
+7. Paste it into the installed plugin folder and replace the old file.
+8. Reopen Rhino.
+9. Run `PlugInManager` and, if needed, right-click the plugin and choose `Load plug-in`.
+10. Optionally right-click the plugin and choose `Commands` to confirm that `GenerateInternalWire` is available.
+
+For repeat updates, publish to a temporary build folder and then replace the
+installed `.rhp` file after Rhino is closed.
+
 ## Generated geometry
 
-The command currently creates two outputs:
+The command currently creates four outputs:
 
 - a polyline centerline named `GenerateInternalWire_Centerline`
-- a pipe Brep named `GenerateInternalWire_ConductivePath`
+- conductive path solid(s) named `GenerateInternalWire_ConductivePath`
+- casing solid(s) named `GenerateInternalWire_Casing`
+- node solid(s) named `GenerateInternalWire_Nodes`
 
-The pipe Brep is the conductive-path volume that follows the routed centerline.
-The selected solid is not modified, and the command does not currently boolean
-subtract the path from the host body or generate a separate outer casing body.
-
-If you want a printable channel or cavity inside another body, that would be a
-separate modeling step after the path is generated.
+The selected object is used as the host body for routing and node placement, but
+it is not modified automatically. The generated solids are separate objects that
+can be used for downstream boolean operations or fabrication workflows.
 
 ## Routing options
 
 - `VoxelSize`: the spacing of the internal routing grid. Smaller values capture
    more detail and can route through tighter features, but they make the solve
    slower and increase memory use.
-- `Clearance`: the minimum offset from the outside shell when marking valid
-   routing cells. Larger values keep the path farther away from the part surface
-   and leave more wall thickness, but can eliminate valid routes in thin regions.
-- `WireRadius`: the radius of the generated pipe Brep. This controls the size of
-   the visualized conductive path volume. It does not change the routing grid.
+- `Clearance`: the casing thickness around the conductive path. The routed
+   centerline stays at least `WireRadius + Clearance` away from the outside shell
+   so the casing fits inside the host object.
+- `WireRadius`: the radius of the conductive path solid. The command enforces a
+   minimum conductive path diameter of 0.5 mm.
+- `NodeSize`: the node diameter. The command enforces a minimum node diameter of
+   0.5 mm and rejects nodes that come within 0.5 mm of another node.
 
 ## Use the command
 
@@ -103,26 +125,42 @@ separate modeling step after the path is generated.
    - `VoxelSize`
    - `Clearance`
    - `WireRadius`
+   - `NodeSize`
 4. Pick node points in order.
-5. Press Enter after the last node.
+5. Watch the live node preview while placing each node.
+6. Press Enter after the last node.
 
 The command adds:
 
 - a polyline centerline
-- a pipe Brep representing the wire
+- conductive path solid(s)
+- casing solid(s)
+- node solid(s)
+
+Node placement rules:
+
+- node diameter must be at least 0.5 mm
+- nodes must stay at least 0.5 mm apart from each other
+- node solids must fit inside the selected object at the picked location
+
+Routing rules:
+
+- conductive path diameter must be at least 0.5 mm
+- later routed segments are kept away from earlier segments to preserve at least
+  0.5 mm separation where possible
 
 ## Tuning guidance
 
 - Smaller `VoxelSize` = better detail, slower solve.
-- Larger `Clearance` = path stays farther from the shell, but may fail in thin regions.
-- Larger `WireRadius` only changes the output pipe size; it does not change the routing graph.
+- Larger `Clearance` = thicker casing and more distance from the conductive path to the casing wall, but may fail in thin regions.
+- Larger `WireRadius` = thicker conductive path and a larger minimum routing envelope.
+- Larger `NodeSize` = larger conductive nodes, but fewer valid placements on tight geometry.
 
 ## Suggested next upgrades
 
 - surface routing mode for open geometry
 - branch / multi-wire support
 - automatic node ordering
-- live preview while picking nodes
 - export directly to fabrication workflow
 
 ## Suggested commit message

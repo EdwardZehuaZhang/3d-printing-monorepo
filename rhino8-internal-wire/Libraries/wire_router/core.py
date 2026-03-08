@@ -164,6 +164,8 @@ def route_node_sequence(
     node_sequence: Sequence[GridIndex],
     penalty_radius: int = 1,
     penalty_weight: float = 10.0,
+    blocked_radius: int = 0,
+    blocked_exemption_radius: int = 0,
     allow_diagonals: bool = True,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
@@ -171,14 +173,24 @@ def route_node_sequence(
 
     segments: List[List[GridIndex]] = []
     penalty_cells: Set[GridIndex] = set()
+    blocked_cells: Set[GridIndex] = set()
 
     for start, goal in zip(node_sequence[:-1], node_sequence[1:]):
+        segment_valid_cells = set(valid_cells)
+        if blocked_cells:
+            local_blocked = set(blocked_cells)
+            if blocked_exemption_radius > 0:
+                local_blocked.difference_update(
+                    dilate_cells({start, goal}, blocked_exemption_radius)
+                )
+            segment_valid_cells.difference_update(local_blocked)
+
         local_penalties = set(penalty_cells)
         local_penalties.discard(start)
         local_penalties.discard(goal)
 
         segment = astar_path(
-            valid_cells=valid_cells,
+            valid_cells=segment_valid_cells,
             start=start,
             goal=goal,
             penalty_cells=local_penalties,
@@ -191,5 +203,6 @@ def route_node_sequence(
         penalty_cells.update(dilate_cells(segment, penalty_radius))
         penalty_cells.discard(start)
         penalty_cells.discard(goal)
+        blocked_cells.update(dilate_cells(segment, blocked_radius))
 
     return segments

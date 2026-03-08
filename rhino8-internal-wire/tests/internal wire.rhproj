@@ -16,7 +16,7 @@
     "description": "test of 3d printed condictive wiring"
   },
   "settings": {
-    "buildPath": "build/",
+    "buildPath": "file:///C:/Users/augus/Documents/github/3d-printing-monorepo/rhino8-internal-wire/rhino builds/internal wiring v2",
     "buildTarget": {
       "host": {
         "name": "Rhino3D",
