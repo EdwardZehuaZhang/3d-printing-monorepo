@@ -166,16 +166,20 @@ def route_node_sequence(
     penalty_weight: float = 10.0,
     blocked_radius: int = 0,
     blocked_exemption_radius: int = 0,
+    node_labels: Optional[Sequence[str]] = None,
     allow_diagonals: bool = True,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
 
+    if node_labels is not None and len(node_labels) != len(node_sequence):
+        raise RoutingError("Node labels must match the routed node sequence length.")
+
     segments: List[List[GridIndex]] = []
     penalty_cells: Set[GridIndex] = set()
     blocked_cells: Set[GridIndex] = set()
 
-    for start, goal in zip(node_sequence[:-1], node_sequence[1:]):
+    for segment_index, (start, goal) in enumerate(zip(node_sequence[:-1], node_sequence[1:])):
         segment_valid_cells = set(valid_cells)
         if blocked_cells:
             local_blocked = set(blocked_cells)
@@ -189,14 +193,25 @@ def route_node_sequence(
         local_penalties.discard(start)
         local_penalties.discard(goal)
 
-        segment = astar_path(
-            valid_cells=segment_valid_cells,
-            start=start,
-            goal=goal,
-            penalty_cells=local_penalties,
-            penalty_weight=penalty_weight,
-            allow_diagonals=allow_diagonals,
-        )
+        try:
+            segment = astar_path(
+                valid_cells=segment_valid_cells,
+                start=start,
+                goal=goal,
+                penalty_cells=local_penalties,
+                penalty_weight=penalty_weight,
+                allow_diagonals=allow_diagonals,
+            )
+        except RoutingError:
+            if node_labels is not None:
+                raise RoutingError(
+                    "Pathway between {} and {} is not big enough for the standardized conductive path and casing.".format(
+                        node_labels[segment_index],
+                        node_labels[segment_index + 1],
+                    )
+                )
+            raise
+
         segment = compress_index_path(segment)
         segments.append(segment)
 

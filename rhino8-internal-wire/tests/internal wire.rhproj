@@ -8,7 +8,7 @@
   "id": "17b2b8e4-030d-4607-ace4-9004a6203486",
   "identity": {
     "name": "internal wire",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "publisher": {
       "email": "augustineelliotten@gmail.com",
       "name": "Augustine"
@@ -16,7 +16,7 @@
     "description": "test of 3d printed condictive wiring"
   },
   "settings": {
-    "buildPath": "file:///C:/Users/augus/Documents/github/3d-printing-monorepo/rhino8-internal-wire/rhino builds/internal wiring v2",
+    "buildPath": "file:///C:/Users/augus/Documents/github/3d-printing-monorepo/rhino8-internal-wire/rhino builds/internal wiring v3",
     "buildTarget": {
       "host": {
         "name": "Rhino3D",

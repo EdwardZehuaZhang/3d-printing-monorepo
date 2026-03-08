@@ -5,10 +5,11 @@ This folder contains a Rhino 8 script-plugin MVP that generates a wire path insi
 ## What it does
 
 - lets the user select one closed target geometry
-- lets the user pick node points in order on that geometry with live node preview
-- validates node size and node spacing during picking
-- builds an interior voxel graph
-- routes one continuous wire through the nodes
+- lets the user pick start and end terminal connectors on the object first
+- lets the user pick touch nodes on the object with live preview
+- trims touch nodes flush to the object boundary
+- builds an interior routing grid automatically
+- routes one continuous conductive path from start to end through all touch nodes in an optimized order
 - adds separate conductive path, casing, and node solids back into Rhino
 
 ## Current scope
@@ -104,31 +105,43 @@ The selected object is used as the host body for routing and node placement, but
 it is not modified automatically. The generated solids are separate objects that
 can be used for downstream boolean operations or fabrication workflows.
 
-## Routing options
+## Standardized geometry
 
-- `VoxelSize`: the spacing of the internal routing grid. Smaller values capture
-   more detail and can route through tighter features, but they make the solve
-   slower and increase memory use.
-- `Clearance`: the casing thickness around the conductive path. The routed
-   centerline stays at least `WireRadius + Clearance` away from the outside shell
-   so the casing fits inside the host object.
-- `WireRadius`: the radius of the conductive path solid. The command enforces a
-   minimum conductive path diameter of 0.5 mm.
-- `NodeSize`: the node diameter. The command enforces a minimum node diameter of
-   0.5 mm and rejects nodes that come within 0.5 mm of another node.
+The command now uses fixed fabrication dimensions instead of prompting for
+`VoxelSize`, `Clearance`, `WireRadius`, or `NodeSize`:
+
+- conductive path diameter: `0.5 mm`
+- conductive path casing thickness: `0.5 mm`
+- minimum clearance from casing to host-object wall: `0.5 mm`
+- minimum conductive path spacing from other conductive paths: `0.5 mm`
+- touch node diameter: `3.0 mm`
+- start and end terminal connector diameter: `3.0 mm`
+- start and end terminal connector length: `6.0 mm`
+
+The routing grid resolution is computed automatically in the background.
+
+## Electrical estimate
+
+The command prints an estimated conductive resistance range using ProtoPasta
+Conductive PLA, scaled from the published `2.0-3.5 kohm per 10 cm` value for
+`1.75 mm` filament.
+
+It reports:
+
+- estimated total start-to-end resistance for the generated path
+- estimated resistance from the start terminal to each touch node along the final route
 
 ## Use the command
 
 1. Start `GenerateInternalWire`.
 2. Select one closed target object.
-3. Adjust:
-   - `VoxelSize`
-   - `Clearance`
-   - `WireRadius`
-   - `NodeSize`
-4. Pick node points in order.
-5. Watch the live node preview while placing each node.
-6. Press Enter after the last node.
+3. Pick the `Start` terminal on the object.
+4. Choose whether that terminal is `Flush` or `Protrude`.
+5. Pick the `End` terminal on the object.
+6. Choose whether that terminal is `Flush` or `Protrude`.
+7. Pick touch nodes on the object surface.
+8. Watch the live node preview while placing each touch node.
+9. Press Enter after the last touch node.
 
 The command adds:
 
@@ -137,30 +150,37 @@ The command adds:
 - casing solid(s)
 - node solid(s)
 
-Node placement rules:
+Terminal rules:
 
-- node diameter must be at least 0.5 mm
+- start and end connectors are cylinders of diameter `3.0 mm` and length `6.0 mm`
+- each terminal can be placed as either `Flush` or `Protrude`
+- a terminal must fit on the chosen surface area or the command rejects that placement
+
+Touch-node rules:
+
+- touch nodes are spherical conductive solids trimmed flush to the object surface
 - nodes must stay at least 0.5 mm apart from each other
-- node solids must fit inside the selected object at the picked location
+- nodes are optimized into the final routing order automatically and do not use the click order as the final electrical sequence
 
 Routing rules:
 
 - conductive path diameter must be at least 0.5 mm
-- later routed segments are kept away from earlier segments to preserve at least
-  0.5 mm separation where possible
+- conductive path casing thickness is fixed at 0.5 mm
+- conductive paths stay at least 0.5 mm away from other conductive paths where the geometry allows
+- path casing stays at least 0.5 mm away from the host-object wall
+- if a path between two successive optimized nodes cannot fit, the command reports that the pathway between those nodes is not big enough
+- routing uses orthogonal grid motion to encourage a zig-zag style path instead of the shortest straight line
 
 ## Tuning guidance
 
-- Smaller `VoxelSize` = better detail, slower solve.
-- Larger `Clearance` = thicker casing and more distance from the conductive path to the casing wall, but may fail in thin regions.
-- Larger `WireRadius` = thicker conductive path and a larger minimum routing envelope.
-- Larger `NodeSize` = larger conductive nodes, but fewer valid placements on tight geometry.
+- Larger host geometries allow longer zig-zag conductive paths and more separation between touch nodes.
+- Tight corners, thin walls, and narrow necks are the main reasons routing fails.
+- If the command reports that a pathway is not big enough, move the touch nodes farther apart or use a larger host body.
 
 ## Suggested next upgrades
 
 - surface routing mode for open geometry
 - branch / multi-wire support
-- automatic node ordering
 - export directly to fabrication workflow
 
 ## Suggested commit message

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import Rhino
 import Rhino.DocObjects as rd
@@ -17,25 +17,34 @@ from .core import GridIndex, GridSpec, RoutingError, index_to_point, route_node_
 
 
 MAX_ESTIMATED_CELLS = 180000
-MIN_NODE_DIAMETER_MM = 0.5
-MIN_WIRE_DIAMETER_MM = 0.5
-MIN_NODE_GAP_MM = 0.5
-MIN_CASING_THICKNESS_MM = 0.5
+WIRE_DIAMETER_MM = 0.5
+WIRE_RADIUS_MM = WIRE_DIAMETER_MM * 0.5
+CASING_THICKNESS_MM = 0.5
+BOUNDARY_CLEARANCE_MM = 0.5
+PATH_SEPARATION_MM = 0.5
+TOUCH_NODE_DIAMETER_MM = 3.0
+TERMINAL_DIAMETER_MM = 3.0
+TERMINAL_LENGTH_MM = 6.0
+MAX_DP_NODES = 10
+PROTO_PASTA_BASE_DIAMETER_MM = 1.75
+PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 
 
 @dataclass(frozen=True)
-class RoutingOptions:
-    step: float
-    clearance: float
-    wire_radius: float
-    node_radius: float
-
-
-@dataclass(frozen=True)
-class NodePlacement:
+class TouchNodePlacement:
+    label: str
     surface_point: rg.Point3d
     center_point: rg.Point3d
-    inward_direction: rg.Vector3d
+    outward_direction: rg.Vector3d
+
+
+@dataclass(frozen=True)
+class TerminalPlacement:
+    label: str
+    surface_point: rg.Point3d
+    anchor_point: rg.Point3d
+    outward_direction: rg.Vector3d
+    protrudes: bool
 
 
 def _active_doc() -> Rhino.RhinoDoc:
@@ -48,6 +57,10 @@ def _mm_to_model(doc: Rhino.RhinoDoc, value_mm: float) -> float:
     return value_mm * Rhino.RhinoMath.UnitScale(
         Rhino.UnitSystem.Millimeters, doc.ModelUnitSystem
     )
+
+
+def _model_to_mm(doc: Rhino.RhinoDoc, value: float) -> float:
+    return value * Rhino.RhinoMath.UnitScale(doc.ModelUnitSystem, Rhino.UnitSystem.Millimeters)
 
 
 def _mesh_from_objref(objref: Rhino.DocObjects.ObjRef, tolerance: float) -> Optional[rg.Mesh]:
@@ -85,6 +98,30 @@ def _mesh_from_objref(objref: Rhino.DocObjects.ObjRef, tolerance: float) -> Opti
     return mesh
 
 
+def _host_brep_from_objref(objref: Rhino.DocObjects.ObjRef, tolerance: float) -> Optional[rg.Brep]:
+    geometry = objref.Geometry()
+    if geometry is None:
+        return None
+
+    if isinstance(geometry, rg.Brep):
+        brep = geometry.DuplicateBrep()
+    elif isinstance(geometry, rg.Extrusion):
+        brep = geometry.ToBrep(True)
+    elif isinstance(geometry, rg.Mesh):
+        brep = rg.Brep.CreateFromMesh(geometry, True)
+    elif isinstance(geometry, rg.SubD):
+        mesh = rg.Mesh.CreateFromSubD(geometry, 2)
+        brep = rg.Brep.CreateFromMesh(mesh, True) if mesh is not None else None
+    else:
+        brep = rg.Brep.TryConvertBrep(geometry)
+
+    if brep is None or not brep.IsSolid:
+        return None
+
+    brep.MergeCoplanarFaces(tolerance)
+    return brep
+
+
 def _select_target_geometry() -> Optional[Rhino.DocObjects.ObjRef]:
     go = ric.GetObject()
     go.SetCommandPrompt("Select one closed object to route inside")
@@ -109,74 +146,16 @@ def _estimate_grid_cells(bbox: rg.BoundingBox, step: float) -> int:
     return x_count * y_count * z_count
 
 
-def _prompt_for_options(mesh: rg.Mesh, doc: Rhino.RhinoDoc) -> Optional[RoutingOptions]:
+def _auto_step(mesh: rg.Mesh, doc: Rhino.RhinoDoc) -> float:
     bbox = mesh.GetBoundingBox(True)
     diagonal = bbox.Diagonal.Length
-    minimum = max(doc.ModelAbsoluteTolerance * 2.0, diagonal / 1000.0)
+    minimum = max(_mm_to_model(doc, WIRE_DIAMETER_MM), doc.ModelAbsoluteTolerance * 2.0)
+    step = max(minimum, diagonal / 100.0)
 
-    min_clearance = _mm_to_model(doc, MIN_CASING_THICKNESS_MM)
-    min_wire_radius = _mm_to_model(doc, MIN_WIRE_DIAMETER_MM * 0.5)
-    min_node_diameter = _mm_to_model(doc, MIN_NODE_DIAMETER_MM)
-
-    default_step = max(minimum, diagonal / 55.0)
-    default_clearance = max(min_clearance, default_step * 0.75)
-    default_wire_radius = max(min_wire_radius, default_step * 0.35)
-    default_node_diameter = max(min_node_diameter, default_wire_radius * 4.0)
-
-    get_option = ric.GetOption()
-    get_option.SetCommandPrompt("Set routing options. Press Enter to continue")
-    get_option.AcceptNothing(True)
-    get_option.AcceptEnterWhenDone(True)
-
-    voxel_option = ric.OptionDouble(
-        default_step,
-        minimum,
-        max(default_step * 20.0, minimum * 2.0),
-    )
-    clearance_option = ric.OptionDouble(
-        default_clearance,
-        min_clearance,
-        max(diagonal / 2.0, default_clearance + minimum),
-    )
-    wire_option = ric.OptionDouble(
-        default_wire_radius,
-        min_wire_radius,
-        max(diagonal / 4.0, default_wire_radius + minimum),
-    )
-    node_option = ric.OptionDouble(
-        default_node_diameter,
-        min_node_diameter,
-        max(diagonal / 2.0, default_node_diameter + minimum),
-    )
-
-    get_option.AddOptionDouble("VoxelSize", voxel_option)
-    get_option.AddOptionDouble("Clearance", clearance_option)
-    get_option.AddOptionDouble("WireRadius", wire_option)
-    get_option.AddOptionDouble("NodeSize", node_option)
-
-    while True:
-        result = get_option.Get()
-        if result == ri.GetResult.Option:
-            continue
-        if result == ri.GetResult.Nothing:
-            step = voxel_option.CurrentValue
-            estimated = _estimate_grid_cells(bbox, step)
-            if estimated > MAX_ESTIMATED_CELLS:
-                adjusted_step = step * ((estimated / float(MAX_ESTIMATED_CELLS)) ** (1.0 / 3.0))
-                Rhino.RhinoApp.WriteLine(
-                    "VoxelSize increased from {:.4f} to {:.4f} to keep the routing grid manageable.".format(
-                        step, adjusted_step
-                    )
-                )
-                step = adjusted_step
-
-            return RoutingOptions(
-                step=step,
-                clearance=max(clearance_option.CurrentValue, min_clearance),
-                wire_radius=max(wire_option.CurrentValue, min_wire_radius),
-                node_radius=max(node_option.CurrentValue * 0.5, min_node_diameter * 0.5),
-            )
-        return None
+    estimated = _estimate_grid_cells(bbox, step)
+    if estimated > MAX_ESTIMATED_CELLS:
+        step *= (estimated / float(MAX_ESTIMATED_CELLS)) ** (1.0 / 3.0)
+    return step
 
 
 def _mesh_distance(mesh: rg.Mesh, point: rg.Point3d) -> float:
@@ -186,12 +165,12 @@ def _mesh_distance(mesh: rg.Mesh, point: rg.Point3d) -> float:
     return point.DistanceTo(mesh.ClosestPoint(point))
 
 
-def _create_node_placement(
+def _inward_center_for_surface_point(
     mesh: rg.Mesh,
     surface_point: rg.Point3d,
-    node_radius: float,
+    inset: float,
     tolerance: float,
-) -> Optional[NodePlacement]:
+) -> Optional[Tuple[rg.Point3d, rg.Vector3d]]:
     mesh_point = mesh.ClosestMeshPoint(surface_point, 0.0)
     if mesh_point is None:
         return None
@@ -200,146 +179,413 @@ def _create_node_placement(
     if not normal.Unitize():
         return None
 
-    candidates: List[NodePlacement] = []
-    for scale in (-1.0, 1.0):
-        direction = rg.Vector3d(normal)
-        direction *= scale
-        center = surface_point + (direction * node_radius)
+    candidates: List[Tuple[float, rg.Point3d, rg.Vector3d]] = []
+    for outward in (rg.Vector3d(normal), rg.Vector3d(-normal)):
+        center = surface_point - (outward * inset)
         if not mesh.IsPointInside(center, tolerance, False):
             continue
-        if _mesh_distance(mesh, center) + tolerance < node_radius:
+        if _mesh_distance(mesh, center) + tolerance < inset:
             continue
-        inward_direction = rg.Vector3d(direction)
-        inward_direction.Unitize()
-        candidates.append(
-            NodePlacement(
-                surface_point=rg.Point3d(surface_point),
-                center_point=center,
-                inward_direction=inward_direction,
-            )
-        )
+        candidates.append((_mesh_distance(mesh, center), center, outward))
 
     if not candidates:
         return None
-    return max(candidates, key=lambda candidate: _mesh_distance(mesh, candidate.center_point))
+
+    _, center, outward = max(candidates, key=lambda item: item[0])
+    outward.Unitize()
+    return center, outward
 
 
-def _validate_node_placement(
-    candidate: Optional[NodePlacement],
-    nodes: Sequence[NodePlacement],
+def _create_touch_node(
+    mesh: rg.Mesh,
+    label: str,
+    surface_point: rg.Point3d,
     node_radius: float,
+    tolerance: float,
+) -> Optional[TouchNodePlacement]:
+    result = _inward_center_for_surface_point(mesh, surface_point, node_radius, tolerance)
+    if result is None:
+        return None
+    center, outward = result
+    return TouchNodePlacement(
+        label=label,
+        surface_point=rg.Point3d(surface_point),
+        center_point=center,
+        outward_direction=outward,
+    )
+
+
+def _create_terminal(
+    mesh: rg.Mesh,
+    label: str,
+    surface_point: rg.Point3d,
+    protrudes: bool,
+    anchor_depth: float,
+    tolerance: float,
+) -> Optional[TerminalPlacement]:
+    result = _inward_center_for_surface_point(mesh, surface_point, anchor_depth, tolerance)
+    if result is None:
+        return None
+    anchor_point, outward = result
+    return TerminalPlacement(
+        label=label,
+        surface_point=rg.Point3d(surface_point),
+        anchor_point=anchor_point,
+        outward_direction=outward,
+        protrudes=protrudes,
+    )
+
+
+def _orthonormal_frame(direction: rg.Vector3d) -> Tuple[rg.Vector3d, rg.Vector3d]:
+    direction = rg.Vector3d(direction)
+    direction.Unitize()
+    reference = rg.Vector3d(0.0, 0.0, 1.0)
+    if abs(direction * reference) > 0.95:
+        reference = rg.Vector3d(1.0, 0.0, 0.0)
+    axis_x = rg.Vector3d.CrossProduct(direction, reference)
+    axis_x.Unitize()
+    axis_y = rg.Vector3d.CrossProduct(direction, axis_x)
+    axis_y.Unitize()
+    return axis_x, axis_y
+
+
+def _make_cylinder_brep(
+    base_center: rg.Point3d,
+    axis_direction: rg.Vector3d,
+    length: float,
+    radius: float,
+) -> Optional[rg.Brep]:
+    direction = rg.Vector3d(axis_direction)
+    if not direction.Unitize():
+        return None
+    plane = rg.Plane(base_center, direction)
+    circle = rg.Circle(plane, radius)
+    cylinder = rg.Cylinder(circle, length)
+    return cylinder.ToBrep(True, True)
+
+
+def _brep_volume(brep: rg.Brep) -> float:
+    props = rg.VolumeMassProperties.Compute(brep)
+    if props is None:
+        return 0.0
+    return props.Volume
+
+
+def _boolean_intersection(
+    minuend: Sequence[rg.Brep],
+    cutters: Sequence[rg.Brep],
+    tolerance: float,
+) -> List[rg.Brep]:
+    valid_minuend = [brep for brep in minuend if brep is not None and brep.IsValid]
+    valid_cutters = [brep for brep in cutters if brep is not None and brep.IsValid]
+    if not valid_minuend or not valid_cutters:
+        return []
+
+    result = rg.Brep.CreateBooleanIntersection(valid_minuend, valid_cutters, tolerance)
+    return list(result) if result else []
+
+
+def _boolean_union(breps: Sequence[rg.Brep], tolerance: float) -> List[rg.Brep]:
+    valid = [brep for brep in breps if brep is not None and brep.IsValid]
+    if not valid:
+        return []
+    if len(valid) == 1:
+        return valid
+
+    union = rg.Brep.CreateBooleanUnion(valid, tolerance)
+    return list(union) if union else valid
+
+
+def _boolean_difference(
+    minuend: Sequence[rg.Brep],
+    subtractors: Sequence[rg.Brep],
+    tolerance: float,
+) -> List[rg.Brep]:
+    valid_minuend = [brep for brep in minuend if brep is not None and brep.IsValid]
+    valid_subtractors = [brep for brep in subtractors if brep is not None and brep.IsValid]
+    if not valid_minuend:
+        return []
+    if not valid_subtractors:
+        return valid_minuend
+
+    difference = rg.Brep.CreateBooleanDifference(valid_minuend, valid_subtractors, tolerance)
+    return list(difference) if difference else valid_minuend
+
+
+def _terminal_internal_brep(
+    terminal: TerminalPlacement,
+    terminal_radius: float,
+    terminal_length: float,
+) -> Optional[rg.Brep]:
+    inward = -terminal.outward_direction
+    if terminal.protrudes:
+        return _make_cylinder_brep(
+            terminal.surface_point,
+            inward,
+            terminal_radius,
+            terminal_radius,
+        )
+    return _make_cylinder_brep(
+        terminal.surface_point,
+        inward,
+        terminal_length,
+        terminal_radius,
+    )
+
+
+def _terminal_conductive_breps(
+    terminal: TerminalPlacement,
+    host_brep: rg.Brep,
+    terminal_radius: float,
+    terminal_length: float,
+    tolerance: float,
+) -> Optional[List[rg.Brep]]:
+    internal = _terminal_internal_brep(terminal, terminal_radius, terminal_length)
+    if internal is None:
+        return None
+
+    trimmed_internal = _boolean_intersection([internal], [host_brep], tolerance)
+    if not trimmed_internal:
+        return None
+
+    original_volume = _brep_volume(internal)
+    retained_volume = sum(_brep_volume(brep) for brep in trimmed_internal)
+    if original_volume > tolerance and retained_volume < (original_volume * 0.9):
+        return None
+
+    if not terminal.protrudes:
+        return trimmed_internal
+
+    external = _make_cylinder_brep(
+        terminal.surface_point,
+        terminal.outward_direction,
+        terminal_length,
+        terminal_radius,
+    )
+    if external is None:
+        return None
+    return trimmed_internal + [external]
+
+
+def _validate_touch_node(
+    candidate: Optional[TouchNodePlacement],
+    touch_nodes: Sequence[TouchNodePlacement],
+    terminals: Sequence[TerminalPlacement],
+    node_radius: float,
+    terminal_radius: float,
     min_gap: float,
     tolerance: float,
 ) -> Optional[str]:
-    if (node_radius * 2.0) + tolerance < min_gap:
-        return "NodeSize must be at least 0.5 mm."
-
     if candidate is None:
-        return "NodeSize is too large for this location on the object."
+        return "That touch node is too large for the selected surface location."
 
-    for index, node in enumerate(nodes, start=1):
+    for node in touch_nodes:
         edge_gap = candidate.center_point.DistanceTo(node.center_point) - (node_radius * 2.0)
         if edge_gap + tolerance < min_gap:
-            return "Node {} is too close. Node solids must stay at least 0.5 mm apart.".format(index)
+            return "Touch nodes must stay at least 0.5 mm apart."
+
+    for terminal in terminals:
+        edge_gap = candidate.center_point.DistanceTo(terminal.anchor_point) - (node_radius + terminal_radius)
+        if edge_gap + tolerance < min_gap:
+            return "That touch node is too close to a terminal connector."
     return None
 
 
-class _NodePointGetter(ric.GetPoint):
+class _TouchNodeGetter(ric.GetPoint):
     def __init__(
         self,
         mesh: rg.Mesh,
-        nodes: Sequence[NodePlacement],
+        touch_nodes: Sequence[TouchNodePlacement],
+        terminals: Sequence[TerminalPlacement],
         node_radius: float,
-        tolerance: float,
+        terminal_radius: float,
         min_gap: float,
+        tolerance: float,
     ) -> None:
-        super(_NodePointGetter, self).__init__()
+        super(_TouchNodeGetter, self).__init__()
         self._mesh = mesh
-        self._nodes = list(nodes)
+        self._touch_nodes = list(touch_nodes)
+        self._terminals = list(terminals)
         self._node_radius = node_radius
-        self._tolerance = tolerance
+        self._terminal_radius = terminal_radius
         self._min_gap = min_gap
+        self._tolerance = tolerance
 
     def OnDynamicDraw(self, e: ri.GetPointDrawEventArgs) -> None:
-        super(_NodePointGetter, self).OnDynamicDraw(e)
+        super(_TouchNodeGetter, self).OnDynamicDraw(e)
 
-        accepted_color = System.Drawing.Color.DeepSkyBlue
-        for node in self._nodes:
-            e.Display.DrawSphere(rg.Sphere(node.center_point, self._node_radius), accepted_color)
+        for node in self._touch_nodes:
+            e.Display.DrawSphere(rg.Sphere(node.center_point, self._node_radius), System.Drawing.Color.DeepSkyBlue)
 
-        preview = _create_node_placement(
+        for terminal in self._terminals:
+            e.Display.DrawPoint(terminal.surface_point, Rhino.Display.PointStyle.ControlPoint, 6, System.Drawing.Color.Gold)
+
+        preview = _create_touch_node(
             self._mesh,
+            "Preview",
             e.CurrentPoint,
             self._node_radius,
             self._tolerance,
         )
-        preview_error = _validate_node_placement(
+        error = _validate_touch_node(
             preview,
-            self._nodes,
+            self._touch_nodes,
+            self._terminals,
             self._node_radius,
+            self._terminal_radius,
             self._min_gap,
             self._tolerance,
         )
-
         if preview is None:
             return
 
-        preview_color = (
-            System.Drawing.Color.OrangeRed
-            if preview_error is not None
-            else System.Drawing.Color.LimeGreen
+        color = System.Drawing.Color.OrangeRed if error is not None else System.Drawing.Color.LimeGreen
+        e.Display.DrawSphere(rg.Sphere(preview.center_point, self._node_radius), color)
+
+
+class _TerminalGetter(ric.GetPoint):
+    def __init__(
+        self,
+        mesh: rg.Mesh,
+        label: str,
+        existing_terminals: Sequence[TerminalPlacement],
+        terminal_radius: float,
+        tolerance: float,
+    ) -> None:
+        super(_TerminalGetter, self).__init__()
+        self._mesh = mesh
+        self._label = label
+        self._existing_terminals = list(existing_terminals)
+        self._terminal_radius = terminal_radius
+        self._tolerance = tolerance
+        self.protrude_toggle = ric.OptionToggle(False, "Flush", "Protrude")
+
+    def OnDynamicDraw(self, e: ri.GetPointDrawEventArgs) -> None:
+        super(_TerminalGetter, self).OnDynamicDraw(e)
+
+        for terminal in self._existing_terminals:
+            e.Display.DrawPoint(terminal.surface_point, Rhino.Display.PointStyle.X, 6, System.Drawing.Color.Gold)
+
+        preview = _create_terminal(
+            self._mesh,
+            self._label,
+            e.CurrentPoint,
+            bool(self.protrude_toggle.CurrentValue),
+            self._terminal_radius if self.protrude_toggle.CurrentValue else _mm_to_model(_active_doc(), TERMINAL_LENGTH_MM),
+            self._tolerance,
         )
-        e.Display.DrawSphere(rg.Sphere(preview.center_point, self._node_radius), preview_color)
+        if preview is None:
+            return
 
-        if self._nodes:
-            e.Display.DrawLine(
-                self._nodes[-1].center_point,
-                preview.center_point,
-                System.Drawing.Color.Gold,
-                2,
-            )
+        e.Display.DrawPoint(preview.surface_point, Rhino.Display.PointStyle.ControlPoint, 8, System.Drawing.Color.LimeGreen)
+        e.Display.DrawLine(
+            preview.surface_point,
+            preview.anchor_point,
+            System.Drawing.Color.Gold,
+            2,
+        )
 
 
-def _collect_nodes(
+def _collect_terminals(
     mesh: rg.Mesh,
-    node_radius: float,
+    host_brep: rg.Brep,
+    terminal_radius: float,
+    terminal_length: float,
     tolerance: float,
+) -> Optional[Tuple[TerminalPlacement, TerminalPlacement]]:
+    terminals: List[TerminalPlacement] = []
+
+    for label in ("Start", "End"):
+        gp = _TerminalGetter(mesh, label, terminals, terminal_radius, tolerance)
+        gp.SetCommandPrompt("Pick the {} terminal on the object".format(label.lower()))
+        gp.Constrain(mesh, False)
+        gp.AddOptionToggle("TerminalMode", gp.protrude_toggle)
+
+        while True:
+            result = gp.Get()
+            if result == ri.GetResult.Option:
+                continue
+            if result == ri.GetResult.Cancel:
+                return None
+            if result != ri.GetResult.Point:
+                return None
+
+            protrudes = bool(gp.protrude_toggle.CurrentValue)
+            anchor_depth = terminal_radius if protrudes else terminal_length
+            terminal = _create_terminal(mesh, label, gp.Point(), protrudes, anchor_depth, tolerance)
+            if terminal is None:
+                Rhino.RhinoApp.WriteLine("That terminal does not fit on the selected surface.")
+                continue
+
+            if _terminal_conductive_breps(terminal, host_brep, terminal_radius, terminal_length, tolerance) is None:
+                Rhino.RhinoApp.WriteLine(
+                    "The {} terminal cylinder does not fit on the selected surface. Choose a flatter or larger area.".format(
+                        label.lower()
+                    )
+                )
+                continue
+
+            terminals.append(terminal)
+            break
+
+    return terminals[0], terminals[1]
+
+
+def _collect_touch_nodes(
+    mesh: rg.Mesh,
+    terminals: Sequence[TerminalPlacement],
+    node_radius: float,
+    terminal_radius: float,
     min_gap: float,
-) -> Optional[List[NodePlacement]]:
-    nodes: List[NodePlacement] = []
+    tolerance: float,
+) -> Optional[List[TouchNodePlacement]]:
+    touch_nodes: List[TouchNodePlacement] = []
 
     while True:
-        gp = _NodePointGetter(mesh, nodes, node_radius, tolerance, min_gap)
+        gp = _TouchNodeGetter(
+            mesh,
+            touch_nodes,
+            terminals,
+            node_radius,
+            terminal_radius,
+            min_gap,
+            tolerance,
+        )
         gp.SetCommandPrompt(
-            "Pick node point {}. Press Enter when done".format(len(nodes) + 1)
+            "Pick a touch node. Press Enter when done"
         )
         gp.Constrain(mesh, False)
-        gp.AcceptNothing(len(nodes) >= 2)
+        gp.AcceptNothing(True)
         gp.AcceptEnterWhenDone(True)
-        if nodes:
-            gp.SetBasePoint(nodes[-1].center_point, False)
-            gp.DrawLineFromPoint(nodes[-1].center_point, False)
 
         result = gp.Get()
         if result == ri.GetResult.Point:
-            placement = _create_node_placement(mesh, gp.Point(), node_radius, tolerance)
-            error = _validate_node_placement(placement, nodes, node_radius, min_gap, tolerance)
+            label = "Node {}".format(len(touch_nodes) + 1)
+            candidate = _create_touch_node(mesh, label, gp.Point(), node_radius, tolerance)
+            error = _validate_touch_node(
+                candidate,
+                touch_nodes,
+                terminals,
+                node_radius,
+                terminal_radius,
+                min_gap,
+                tolerance,
+            )
             if error is not None:
                 Rhino.RhinoApp.WriteLine(error)
                 continue
-            nodes.append(placement)
+            touch_nodes.append(candidate)
             continue
-        if result == ri.GetResult.Nothing and len(nodes) >= 2:
-            return nodes
+        if result == ri.GetResult.Nothing:
+            return touch_nodes
         if result == ri.GetResult.Cancel:
             return None
-        Rhino.RhinoApp.WriteLine("Pick at least two valid node points.")
 
 
 def _build_valid_grid(
     mesh: rg.Mesh,
     step: float,
-    clearance: float,
+    route_clearance: float,
     tolerance: float,
 ) -> Tuple[Set[GridIndex], GridSpec]:
     bbox = mesh.GetBoundingBox(True)
@@ -364,7 +610,7 @@ def _build_valid_grid(
                 point = rg.Point3d(x, y, z)
                 if not mesh.IsPointInside(point, tolerance, False):
                     continue
-                if clearance > 0.0 and _mesh_distance(mesh, point) + tolerance < clearance:
+                if _mesh_distance(mesh, point) + tolerance < route_clearance:
                     continue
                 valid_cells.add((ix, iy, iz))
 
@@ -396,7 +642,7 @@ def _find_nearest_valid_cell(
     best_index: Optional[GridIndex] = None
     best_distance = float("inf")
 
-    for radius in range(1, 40):
+    for radius in range(1, 50):
         found_in_radius = False
         for ix in range(seed[0] - radius, seed[0] + radius + 1):
             for iy in range(seed[1] - radius, seed[1] + radius + 1):
@@ -443,16 +689,16 @@ def _simplify_points(points: Sequence[rg.Point3d], tolerance: float) -> List[rg.
 
 
 def _segments_to_polyline_points(
-    node_points: Sequence[rg.Point3d],
+    anchor_points: Sequence[rg.Point3d],
     segments: Sequence[Sequence[GridIndex]],
     grid: GridSpec,
     tolerance: float,
 ) -> List[rg.Point3d]:
-    combined: List[rg.Point3d] = [node_points[0]]
+    combined: List[rg.Point3d] = [anchor_points[0]]
 
     for index, segment in enumerate(segments):
         segment_points = [_grid_point(cell, grid) for cell in segment]
-        stitched = [node_points[index]] + segment_points + [node_points[index + 1]]
+        stitched = [anchor_points[index]] + segment_points + [anchor_points[index + 1]]
         if index > 0:
             stitched = stitched[1:]
 
@@ -462,6 +708,152 @@ def _segments_to_polyline_points(
             combined.append(point)
 
     return _simplify_points(combined, tolerance)
+
+
+def _distance_between(a: rg.Point3d, b: rg.Point3d) -> float:
+    return a.DistanceTo(b)
+
+
+def _solve_touch_node_order(
+    start: TerminalPlacement,
+    touch_nodes: Sequence[TouchNodePlacement],
+    end: TerminalPlacement,
+) -> List[TouchNodePlacement]:
+    if not touch_nodes:
+        return []
+
+    if len(touch_nodes) > MAX_DP_NODES:
+        remaining = list(touch_nodes)
+        ordered: List[TouchNodePlacement] = []
+        current = start.anchor_point
+        while remaining:
+            next_node = min(
+                remaining,
+                key=lambda node: _distance_between(current, node.center_point) + (_distance_between(node.center_point, end.anchor_point) * 0.1),
+            )
+            ordered.append(next_node)
+            remaining.remove(next_node)
+            current = next_node.center_point
+        return ordered
+
+    node_count = len(touch_nodes)
+    distances = [[0.0 for _ in range(node_count)] for _ in range(node_count)]
+    start_distances = [0.0 for _ in range(node_count)]
+    end_distances = [0.0 for _ in range(node_count)]
+
+    for index, node in enumerate(touch_nodes):
+        start_distances[index] = _distance_between(start.anchor_point, node.center_point)
+        end_distances[index] = _distance_between(node.center_point, end.anchor_point)
+        for other_index, other in enumerate(touch_nodes):
+            distances[index][other_index] = _distance_between(node.center_point, other.center_point)
+
+    dp: Dict[Tuple[int, int], float] = {}
+    parent: Dict[Tuple[int, int], Optional[int]] = {}
+
+    for index in range(node_count):
+        mask = 1 << index
+        dp[(mask, index)] = start_distances[index]
+        parent[(mask, index)] = None
+
+    for mask in range(1, 1 << node_count):
+        for last in range(node_count):
+            state = (mask, last)
+            if state not in dp:
+                continue
+            for nxt in range(node_count):
+                if mask & (1 << nxt):
+                    continue
+                next_mask = mask | (1 << nxt)
+                candidate = dp[state] + distances[last][nxt]
+                next_state = (next_mask, nxt)
+                if candidate < dp.get(next_state, float("inf")):
+                    dp[next_state] = candidate
+                    parent[next_state] = last
+
+    full_mask = (1 << node_count) - 1
+    best_last = min(
+        range(node_count),
+        key=lambda index: dp[(full_mask, index)] + end_distances[index],
+    )
+
+    order_indices: List[int] = []
+    state = (full_mask, best_last)
+    while True:
+        mask, last = state
+        order_indices.append(last)
+        previous = parent[state]
+        if previous is None:
+            break
+        state = (mask ^ (1 << last), previous)
+
+    order_indices.reverse()
+    return [touch_nodes[index] for index in order_indices]
+
+
+def _segment_solids(
+    doc: Rhino.RhinoDoc,
+    points: Sequence[rg.Point3d],
+    radius: float,
+) -> List[rg.Brep]:
+    solids: List[rg.Brep] = []
+    for start, end in zip(points[:-1], points[1:]):
+        if start.DistanceTo(end) <= doc.ModelAbsoluteTolerance:
+            continue
+        line_curve = rg.LineCurve(start, end)
+        pipes = rg.Brep.CreatePipe(
+            line_curve,
+            radius,
+            False,
+            rg.PipeCapMode.Flat,
+            True,
+            doc.ModelAbsoluteTolerance,
+            doc.ModelAngleToleranceRadians,
+        )
+        if pipes:
+            solids.extend(pipe for pipe in pipes if pipe is not None and pipe.IsValid)
+
+    for point in points:
+        sphere = rg.Sphere(point, radius).ToBrep()
+        if sphere is not None and sphere.IsValid:
+            solids.append(sphere)
+    return solids
+
+
+def _touch_node_conductive_breps(
+    touch_nodes: Sequence[TouchNodePlacement],
+    host_brep: rg.Brep,
+    node_radius: float,
+    tolerance: float,
+) -> List[rg.Brep]:
+    breps: List[rg.Brep] = []
+    for node in touch_nodes:
+        sphere = rg.Sphere(node.center_point, node_radius).ToBrep()
+        if sphere is None or not sphere.IsValid:
+            continue
+        trimmed = _boolean_intersection([sphere], [host_brep], tolerance)
+        breps.extend(trimmed)
+    return breps
+
+
+def _touch_node_casing_breps(
+    touch_nodes: Sequence[TouchNodePlacement],
+    host_brep: rg.Brep,
+    node_radius: float,
+    casing_thickness: float,
+    tolerance: float,
+) -> List[rg.Brep]:
+    outer_radius = node_radius + casing_thickness
+    outer_breps: List[rg.Brep] = []
+    inner_breps = _touch_node_conductive_breps(touch_nodes, host_brep, node_radius, tolerance)
+
+    for node in touch_nodes:
+        sphere = rg.Sphere(node.center_point, outer_radius).ToBrep()
+        if sphere is None or not sphere.IsValid:
+            continue
+        trimmed = _boolean_intersection([sphere], [host_brep], tolerance)
+        outer_breps.extend(trimmed)
+
+    return _boolean_difference(outer_breps, inner_breps, tolerance)
 
 
 def _polyline_curve(points: Sequence[rg.Point3d]) -> Optional[rg.PolylineCurve]:
@@ -480,78 +872,6 @@ def _add_named_curve(doc: Rhino.RhinoDoc, points: Sequence[rg.Point3d], name: st
     return doc.Objects.AddCurve(curve, attributes) != System.Guid.Empty
 
 
-def _segment_solids(
-    doc: Rhino.RhinoDoc,
-    points: Sequence[rg.Point3d],
-    radius: float,
-) -> List[rg.Brep]:
-    solids: List[rg.Brep] = []
-
-    for start, end in zip(points[:-1], points[1:]):
-        if start.DistanceTo(end) <= doc.ModelAbsoluteTolerance:
-            continue
-        line_curve = rg.LineCurve(start, end)
-        pipes = rg.Brep.CreatePipe(
-            line_curve,
-            radius,
-            False,
-            rg.PipeCapMode.Flat,
-            True,
-            doc.ModelAbsoluteTolerance,
-            doc.ModelAngleToleranceRadians,
-        )
-        if pipes:
-            solids.extend(pipe for pipe in pipes if pipe is not None and pipe.IsValid)
-
-    for point in points:
-        sphere = rg.Sphere(point, radius)
-        brep = sphere.ToBrep()
-        if brep is not None and brep.IsValid:
-            solids.append(brep)
-
-    return solids
-
-
-def _node_solids(nodes: Sequence[NodePlacement], node_radius: float) -> List[rg.Brep]:
-    solids: List[rg.Brep] = []
-    for node in nodes:
-        brep = rg.Sphere(node.center_point, node_radius).ToBrep()
-        if brep is not None and brep.IsValid:
-            solids.append(brep)
-    return solids
-
-
-def _boolean_union(breps: Sequence[rg.Brep], tolerance: float) -> List[rg.Brep]:
-    valid = [brep for brep in breps if brep is not None and brep.IsValid]
-    if not valid:
-        return []
-    if len(valid) == 1:
-        return valid
-
-    union = rg.Brep.CreateBooleanUnion(valid, tolerance)
-    if union:
-        return list(union)
-    return valid
-
-
-def _boolean_difference(
-    minuend: Sequence[rg.Brep],
-    subtractors: Sequence[rg.Brep],
-    tolerance: float,
-) -> List[rg.Brep]:
-    valid_minuend = [brep for brep in minuend if brep is not None and brep.IsValid]
-    valid_subtractors = [brep for brep in subtractors if brep is not None and brep.IsValid]
-    if not valid_minuend:
-        return []
-    if not valid_subtractors:
-        return valid_minuend
-
-    difference = rg.Brep.CreateBooleanDifference(valid_minuend, valid_subtractors, tolerance)
-    if difference:
-        return list(difference)
-    return valid_minuend
-
-
 def _add_breps(doc: Rhino.RhinoDoc, breps: Sequence[rg.Brep], name: str) -> bool:
     attributes = rd.ObjectAttributes()
     attributes.Name = name
@@ -562,12 +882,47 @@ def _add_breps(doc: Rhino.RhinoDoc, breps: Sequence[rg.Brep], name: str) -> bool
     return added
 
 
+def _cumulative_anchor_lengths(
+    polyline_points: Sequence[rg.Point3d],
+    anchor_points: Sequence[rg.Point3d],
+    tolerance: float,
+) -> List[float]:
+    if not polyline_points or not anchor_points:
+        return []
+
+    lengths: List[float] = [0.0]
+    anchor_index = 1
+    cumulative = 0.0
+
+    for start, end in zip(polyline_points[:-1], polyline_points[1:]):
+        cumulative += start.DistanceTo(end)
+        while anchor_index < len(anchor_points) and end.DistanceTo(anchor_points[anchor_index]) <= tolerance:
+            lengths.append(cumulative)
+            anchor_index += 1
+
+    while len(lengths) < len(anchor_points):
+        lengths.append(cumulative)
+    return lengths
+
+
+def _resistance_range_kohm(doc: Rhino.RhinoDoc, length_in_model_units: float) -> Tuple[float, float]:
+    length_mm = _model_to_mm(doc, length_in_model_units)
+    diameter_ratio_sq = (PROTO_PASTA_BASE_DIAMETER_MM / WIRE_DIAMETER_MM) ** 2
+    low = PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] * diameter_ratio_sq * (length_mm / 100.0)
+    high = PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1] * diameter_ratio_sq * (length_mm / 100.0)
+    return low, high
+
+
 def _add_output_geometry(
     doc: Rhino.RhinoDoc,
+    host_brep: rg.Brep,
     polyline_points: Sequence[rg.Point3d],
-    nodes: Sequence[NodePlacement],
+    touch_nodes: Sequence[TouchNodePlacement],
+    terminals: Sequence[TerminalPlacement],
     wire_radius: float,
     node_radius: float,
+    terminal_radius: float,
+    terminal_length: float,
     casing_thickness: float,
 ) -> bool:
     if len(polyline_points) < 2:
@@ -576,92 +931,123 @@ def _add_output_geometry(
     if not _add_named_curve(doc, polyline_points, "GenerateInternalWire_Centerline"):
         return False
 
-    path_union = _boolean_union(_segment_solids(doc, polyline_points, wire_radius), doc.ModelAbsoluteTolerance)
-    if not path_union:
-        return False
+    path_breps = _segment_solids(doc, polyline_points, wire_radius)
+    touch_node_breps = _touch_node_conductive_breps(touch_nodes, host_brep, node_radius, doc.ModelAbsoluteTolerance)
+    terminal_breps: List[rg.Brep] = []
+    for terminal in terminals:
+        solids = _terminal_conductive_breps(
+            terminal,
+            host_brep,
+            terminal_radius,
+            terminal_length,
+            doc.ModelAbsoluteTolerance,
+        )
+        if solids is None:
+            return False
+        terminal_breps.extend(solids)
 
-    node_union = _boolean_union(_node_solids(nodes, node_radius), doc.ModelAbsoluteTolerance)
-    if not node_union:
-        return False
+    conductive_path = _boolean_union(path_breps + terminal_breps, doc.ModelAbsoluteTolerance)
+    conductive_nodes = _boolean_union(touch_node_breps, doc.ModelAbsoluteTolerance)
+    conductive_path = _boolean_difference(conductive_path, conductive_nodes, doc.ModelAbsoluteTolerance)
 
-    path_without_nodes = _boolean_difference(path_union, node_union, doc.ModelAbsoluteTolerance)
-    if path_without_nodes:
-        path_union = path_without_nodes
-
-    outer_radius = wire_radius + casing_thickness
-    casing_outer = _boolean_union(_segment_solids(doc, polyline_points, outer_radius), doc.ModelAbsoluteTolerance)
-    if not casing_outer:
-        return False
-
-    casing_shell = _boolean_difference(
-        casing_outer,
-        list(path_union) + list(node_union),
+    path_casing_outer = _segment_solids(doc, polyline_points, wire_radius + casing_thickness)
+    path_casing_outer = _boolean_intersection(path_casing_outer, [host_brep], doc.ModelAbsoluteTolerance)
+    node_casing = _touch_node_casing_breps(
+        touch_nodes,
+        host_brep,
+        node_radius,
+        casing_thickness,
+        doc.ModelAbsoluteTolerance,
+    )
+    casing = _boolean_union(path_casing_outer + node_casing, doc.ModelAbsoluteTolerance)
+    casing = _boolean_difference(
+        casing,
+        list(conductive_path) + list(conductive_nodes),
         doc.ModelAbsoluteTolerance,
     )
 
-    path_added = _add_breps(doc, path_union, "GenerateInternalWire_ConductivePath")
-    casing_added = _add_breps(doc, casing_shell, "GenerateInternalWire_Casing")
-    node_added = _add_breps(doc, node_union, "GenerateInternalWire_Nodes")
+    path_added = _add_breps(doc, conductive_path, "GenerateInternalWire_ConductivePath")
+    node_added = _add_breps(doc, conductive_nodes, "GenerateInternalWire_Nodes")
+    casing_added = _add_breps(doc, casing, "GenerateInternalWire_Casing")
     doc.Views.Redraw()
-    return path_added and casing_added and node_added
+    return path_added and node_added and casing_added
 
 
 def run_generate_internal_wire() -> Rhino.Commands.Result:
     doc = _active_doc()
     tolerance = doc.ModelAbsoluteTolerance
-    min_node_gap = _mm_to_model(doc, MIN_NODE_GAP_MM)
+
+    wire_radius = _mm_to_model(doc, WIRE_RADIUS_MM)
+    casing_thickness = _mm_to_model(doc, CASING_THICKNESS_MM)
+    boundary_clearance = _mm_to_model(doc, BOUNDARY_CLEARANCE_MM)
+    path_separation = _mm_to_model(doc, PATH_SEPARATION_MM)
+    node_radius = _mm_to_model(doc, TOUCH_NODE_DIAMETER_MM * 0.5)
+    terminal_radius = _mm_to_model(doc, TERMINAL_DIAMETER_MM * 0.5)
+    terminal_length = _mm_to_model(doc, TERMINAL_LENGTH_MM)
+    route_clearance = wire_radius + casing_thickness + boundary_clearance
 
     objref = _select_target_geometry()
     if objref is None:
         return Rhino.Commands.Result.Cancel
 
     mesh = _mesh_from_objref(objref, tolerance)
-    if mesh is None:
+    host_brep = _host_brep_from_objref(objref, tolerance)
+    if mesh is None or host_brep is None:
         Rhino.RhinoApp.WriteLine(
-            "The selected object must be a closed mesh or a solid that can be converted to a closed mesh."
+            "The selected object must be a closed mesh or a solid that can be converted to a closed solid."
         )
         return Rhino.Commands.Result.Failure
 
-    options = _prompt_for_options(mesh, doc)
-    if options is None:
+    step = _auto_step(mesh, doc)
+
+    terminals = _collect_terminals(mesh, host_brep, terminal_radius, terminal_length, tolerance)
+    if terminals is None:
+        return Rhino.Commands.Result.Cancel
+    start_terminal, end_terminal = terminals
+
+    touch_nodes = _collect_touch_nodes(
+        mesh,
+        terminals,
+        node_radius,
+        terminal_radius,
+        path_separation,
+        tolerance,
+    )
+    if touch_nodes is None:
         return Rhino.Commands.Result.Cancel
 
-    if (options.node_radius * 2.0) + tolerance < _mm_to_model(doc, MIN_NODE_DIAMETER_MM):
-        Rhino.RhinoApp.WriteLine("NodeSize must be at least 0.5 mm.")
-        return Rhino.Commands.Result.Failure
-
-    if (options.wire_radius * 2.0) + tolerance < _mm_to_model(doc, MIN_WIRE_DIAMETER_MM):
-        Rhino.RhinoApp.WriteLine("WireRadius must define a conductive path diameter of at least 0.5 mm.")
-        return Rhino.Commands.Result.Failure
-
-    nodes = _collect_nodes(mesh, options.node_radius, tolerance, min_node_gap)
-    if nodes is None:
-        return Rhino.Commands.Result.Cancel
+    ordered_touch_nodes = _solve_touch_node_order(start_terminal, touch_nodes, end_terminal)
+    ordered_labels = [node.label for node in ordered_touch_nodes]
+    if ordered_labels:
+        Rhino.RhinoApp.WriteLine(
+            "Optimized touch-node order: {}".format(" -> ".join(ordered_labels))
+        )
 
     Rhino.RhinoApp.WriteLine("Building routing grid...")
-    routing_clearance = options.wire_radius + options.clearance
-    valid_cells, grid = _build_valid_grid(mesh, options.step, routing_clearance, tolerance)
+    valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
-            "No valid routing cells were found. Increase VoxelSize or reduce Clearance or NodeSize."
+            "No valid routing cells were found. The object is not large enough for 0.5 mm conductive pathing with 0.5 mm casing and 0.5 mm wall clearance."
         )
         return Rhino.Commands.Result.Failure
 
-    node_centers = [node.center_point for node in nodes]
+    route_points = [start_terminal.anchor_point] + [node.center_point for node in ordered_touch_nodes] + [end_terminal.anchor_point]
+    route_labels = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
+
     node_cells: List[GridIndex] = []
-    for node_center in node_centers:
-        cell = _find_nearest_valid_cell(node_center, valid_cells, grid)
+    for point in route_points:
+        cell = _find_nearest_valid_cell(point, valid_cells, grid)
         if cell is None:
             Rhino.RhinoApp.WriteLine(
-                "A node could not be mapped into the routing volume. Reduce Clearance, reduce NodeSize, or use a smaller VoxelSize."
+                "A selected terminal or node could not be mapped into the routing volume. Choose a location with more internal space."
             )
             return Rhino.Commands.Result.Failure
         node_cells.append(cell)
 
-    spacing_radius = max(0, int(math.ceil(((options.wire_radius * 2.0) + min_node_gap) / options.step)))
+    spacing_radius = max(0, int(math.ceil((WIRE_DIAMETER_MM + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)))
     node_exemption_radius = max(
         1,
-        int(math.ceil((options.node_radius + (options.wire_radius * 2.0) + min_node_gap) / options.step)),
+        int(math.ceil((max(TOUCH_NODE_DIAMETER_MM, TERMINAL_DIAMETER_MM) * 0.5 + WIRE_DIAMETER_MM + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)),
     )
 
     try:
@@ -669,36 +1055,57 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             valid_cells=valid_cells,
             node_sequence=node_cells,
             penalty_radius=0,
-            penalty_weight=options.step,
+            penalty_weight=step,
             blocked_radius=spacing_radius,
             blocked_exemption_radius=node_exemption_radius,
-            allow_diagonals=True,
+            node_labels=route_labels,
+            allow_diagonals=False,
         )
     except RoutingError as error:
         Rhino.RhinoApp.WriteLine(str(error))
         Rhino.RhinoApp.WriteLine(
-            "Try increasing VoxelSize or choosing nodes with more internal space between them."
+            "The pathway between those points is not big enough for 0.5 mm wiring, 0.5 mm casing, and 0.5 mm spacing."
         )
         return Rhino.Commands.Result.Failure
 
-    polyline_points = _segments_to_polyline_points(node_centers, segments, grid, tolerance)
+    polyline_points = _segments_to_polyline_points(route_points, segments, grid, tolerance)
     if not _add_output_geometry(
         doc,
+        host_brep,
         polyline_points,
-        nodes,
-        options.wire_radius,
-        options.node_radius,
-        options.clearance,
+        ordered_touch_nodes,
+        terminals,
+        wire_radius,
+        node_radius,
+        terminal_radius,
+        terminal_length,
+        casing_thickness,
     ):
-        Rhino.RhinoApp.WriteLine("Failed to add the conductive path, casing, or node solids to the document.")
+        Rhino.RhinoApp.WriteLine(
+            "Failed to add the conductive path, casing, or node solids to the document."
+        )
         return Rhino.Commands.Result.Failure
 
+    cumulative_lengths = _cumulative_anchor_lengths(polyline_points, route_points, tolerance)
+    total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1])
     Rhino.RhinoApp.WriteLine(
-        "Generated {} conductive node solid(s), one conductive path solid, and one casing solid.".format(
-            len(nodes)
+        "Estimated start-to-end conductive resistance at 0.5 mm diameter with ProtoPasta Conductive PLA: {:.1f}-{:.1f} kohm.".format(
+            total_low,
+            total_high,
         )
     )
+
+    for label, length_value in zip(route_labels[1:-1], cumulative_lengths[1:-1]):
+        low, high = _resistance_range_kohm(doc, length_value)
+        Rhino.RhinoApp.WriteLine(
+            "{} is approximately {:.1f}-{:.1f} kohm from the start terminal.".format(
+                label,
+                low,
+                high,
+            )
+        )
+
     Rhino.RhinoApp.WriteLine(
-        "NodeSize is the node diameter. Clearance is the casing thickness around the conductive path. WireRadius defines the conductive path radius."
+        "Generated fixed 0.5 mm conductive pathing with 0.5 mm casing thickness, 0.5 mm wall clearance, 3 mm touch nodes, and 3 mm x 6 mm terminal connectors."
     )
     return Rhino.Commands.Result.Success
