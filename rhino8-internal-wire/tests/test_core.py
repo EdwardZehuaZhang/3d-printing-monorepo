@@ -6,10 +6,108 @@ LIBRARIES = Path(__file__).resolve().parents[1] / "Libraries"
 if str(LIBRARIES) not in sys.path:
     sys.path.insert(0, str(LIBRARIES))
 
-from wire_router.core import route_node_sequence
+from wire_router.core import (
+    evaluate_node_order,
+    optimize_node_order_for_maximum_spacing,
+    optimize_node_order_for_path,
+    optimize_node_order_for_target_leg_length,
+    route_node_sequence,
+)
 
 
 class CoreRouterTests(unittest.TestCase):
+    def test_path_optimizer_prefers_shortest_total_route(self) -> None:
+        order = optimize_node_order_for_path(
+            start_distances=[1.0, 7.0, 7.0],
+            end_distances=[7.0, 7.0, 1.0],
+            pair_distances=[
+                [0.0, 1.0, 6.0],
+                [1.0, 0.0, 6.0],
+                [6.0, 6.0, 0.0],
+            ],
+        )
+
+        self.assertEqual(order, (0, 1, 2))
+        metrics = evaluate_node_order(
+            order,
+            start_distances=[1.0, 7.0, 7.0],
+            end_distances=[7.0, 7.0, 1.0],
+            pair_distances=[
+                [0.0, 1.0, 6.0],
+                [1.0, 0.0, 6.0],
+                [6.0, 6.0, 0.0],
+            ],
+        )
+
+        self.assertEqual(metrics.touch_leg_lengths, (1.0, 1.0, 6.0))
+        self.assertEqual(metrics.total_path_length, 9.0)
+
+    def test_spacing_optimizer_can_reject_shortest_path_shape(self) -> None:
+        start_distances = [1.0, 7.0, 7.0]
+        end_distances = [7.0, 7.0, 1.0]
+        pair_distances = [
+            [0.0, 1.0, 6.0],
+            [1.0, 0.0, 6.0],
+            [6.0, 6.0, 0.0],
+        ]
+
+        path_order = optimize_node_order_for_path(
+            start_distances=start_distances,
+            end_distances=end_distances,
+            pair_distances=pair_distances,
+        )
+        spacing_order = optimize_node_order_for_target_leg_length(
+            start_distances=start_distances,
+            end_distances=end_distances,
+            pair_distances=pair_distances,
+            target_leg_length=5.0,
+        )
+
+        self.assertEqual(path_order, (0, 1, 2))
+        self.assertEqual(spacing_order, (1, 2, 0))
+
+        path_metrics = evaluate_node_order(
+            path_order,
+            start_distances=start_distances,
+            end_distances=end_distances,
+            pair_distances=pair_distances,
+        )
+        spacing_metrics = evaluate_node_order(
+            spacing_order,
+            start_distances=start_distances,
+            end_distances=end_distances,
+            pair_distances=pair_distances,
+        )
+
+        self.assertEqual(path_metrics.min_touch_leg_length, 1.0)
+        self.assertEqual(spacing_metrics.min_touch_leg_length, 6.0)
+        self.assertGreater(spacing_metrics.total_path_length, path_metrics.total_path_length)
+
+    def test_maximize_separation_optimizer_prefers_larger_minimum_leg(self) -> None:
+        start_distances = [1.0, 7.0, 7.0]
+        end_distances = [7.0, 7.0, 1.0]
+        pair_distances = [
+            [0.0, 1.0, 6.0],
+            [1.0, 0.0, 6.0],
+            [6.0, 6.0, 0.0],
+        ]
+
+        max_spacing_order = optimize_node_order_for_maximum_spacing(
+            start_distances=start_distances,
+            end_distances=end_distances,
+            pair_distances=pair_distances,
+        )
+
+        self.assertEqual(max_spacing_order, (1, 2, 0))
+
+        max_spacing_metrics = evaluate_node_order(
+            max_spacing_order,
+            start_distances=start_distances,
+            end_distances=end_distances,
+            pair_distances=pair_distances,
+        )
+        self.assertEqual(max_spacing_metrics.min_touch_leg_length, 6.0)
+
     def test_routes_around_block(self) -> None:
         valid_cells = {
             (x, y, 0)

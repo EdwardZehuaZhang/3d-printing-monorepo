@@ -19,6 +19,20 @@ class GridSpec:
     step: float
 
 
+@dataclass(frozen=True)
+class NodeOrderMetrics:
+    order: Tuple[int, ...]
+    total_path_length: float
+    touch_leg_lengths: Tuple[float, ...]
+    end_leg_length: float
+
+    @property
+    def min_touch_leg_length(self) -> float:
+        if not self.touch_leg_lengths:
+            return 0.0
+        return min(self.touch_leg_lengths)
+
+
 def index_to_point(index: GridIndex, grid: GridSpec) -> FloatPoint:
     return (
         grid.origin[0] + index[0] * grid.step,
@@ -157,6 +171,262 @@ def compress_index_path(path: Sequence[GridIndex]) -> List[GridIndex]:
 
     compressed.append(path[-1])
     return compressed
+
+
+def evaluate_node_order(
+    order: Sequence[int],
+    start_distances: Sequence[float],
+    end_distances: Sequence[float],
+    pair_distances: Sequence[Sequence[float]],
+) -> NodeOrderMetrics:
+    ordered = tuple(order)
+    if not ordered:
+        return NodeOrderMetrics(order=(), total_path_length=0.0, touch_leg_lengths=(), end_leg_length=0.0)
+
+    touch_leg_lengths: List[float] = [start_distances[ordered[0]]]
+    total_path_length = touch_leg_lengths[0]
+
+    for previous, current in zip(ordered[:-1], ordered[1:]):
+        leg_length = pair_distances[previous][current]
+        touch_leg_lengths.append(leg_length)
+        total_path_length += leg_length
+
+    end_leg_length = end_distances[ordered[-1]]
+    total_path_length += end_leg_length
+    return NodeOrderMetrics(
+        order=ordered,
+        total_path_length=total_path_length,
+        touch_leg_lengths=tuple(touch_leg_lengths),
+        end_leg_length=end_leg_length,
+    )
+
+
+def optimize_node_order_for_path(
+    start_distances: Sequence[float],
+    end_distances: Sequence[float],
+    pair_distances: Sequence[Sequence[float]],
+    max_exact_nodes: int = 10,
+) -> Tuple[int, ...]:
+    node_count = len(start_distances)
+    if node_count == 0:
+        return ()
+
+    if node_count > max_exact_nodes:
+        remaining = list(range(node_count))
+        ordered: List[int] = []
+        last_index: Optional[int] = None
+        while remaining:
+            if last_index is None:
+                next_index = min(
+                    remaining,
+                    key=lambda index: start_distances[index] + (end_distances[index] * 0.1),
+                )
+            else:
+                next_index = min(
+                    remaining,
+                    key=lambda index: pair_distances[last_index][index] + (end_distances[index] * 0.1),
+                )
+            ordered.append(next_index)
+            remaining.remove(next_index)
+            last_index = next_index
+        return tuple(ordered)
+
+    dp: Dict[Tuple[int, int], float] = {}
+    parent: Dict[Tuple[int, int], Optional[int]] = {}
+
+    for index in range(node_count):
+        mask = 1 << index
+        dp[(mask, index)] = start_distances[index]
+        parent[(mask, index)] = None
+
+    for mask in range(1, 1 << node_count):
+        for last in range(node_count):
+            state = (mask, last)
+            if state not in dp:
+                continue
+            for nxt in range(node_count):
+                if mask & (1 << nxt):
+                    continue
+                next_mask = mask | (1 << nxt)
+                candidate = dp[state] + pair_distances[last][nxt]
+                next_state = (next_mask, nxt)
+                if candidate < dp.get(next_state, float("inf")):
+                    dp[next_state] = candidate
+                    parent[next_state] = last
+
+    full_mask = (1 << node_count) - 1
+    best_last = min(
+        range(node_count),
+        key=lambda index: dp[(full_mask, index)] + end_distances[index],
+    )
+    return _reconstruct_order(parent, full_mask, best_last)
+
+
+def optimize_node_order_for_target_leg_length(
+    start_distances: Sequence[float],
+    end_distances: Sequence[float],
+    pair_distances: Sequence[Sequence[float]],
+    target_leg_length: float,
+    max_exact_nodes: int = 10,
+) -> Tuple[int, ...]:
+    node_count = len(start_distances)
+    if node_count == 0:
+        return ()
+
+    def leg_cost(distance: float) -> float:
+        if distance < target_leg_length:
+            shortfall = target_leg_length - distance
+            return shortfall * 8.0
+
+        overshoot = distance - target_leg_length
+        return overshoot * 0.35
+
+    if node_count > max_exact_nodes:
+        remaining = list(range(node_count))
+        ordered: List[int] = []
+        last_index: Optional[int] = None
+        while remaining:
+            if last_index is None:
+                next_index = min(
+                    remaining,
+                    key=lambda index: leg_cost(start_distances[index]) + (end_distances[index] * 0.1),
+                )
+            else:
+                next_index = min(
+                    remaining,
+                    key=lambda index: leg_cost(pair_distances[last_index][index]) + (end_distances[index] * 0.1),
+                )
+            ordered.append(next_index)
+            remaining.remove(next_index)
+            last_index = next_index
+        return tuple(ordered)
+
+    dp: Dict[Tuple[int, int], float] = {}
+    parent: Dict[Tuple[int, int], Optional[int]] = {}
+
+    for index in range(node_count):
+        mask = 1 << index
+        dp[(mask, index)] = leg_cost(start_distances[index])
+        parent[(mask, index)] = None
+
+    for mask in range(1, 1 << node_count):
+        for last in range(node_count):
+            state = (mask, last)
+            if state not in dp:
+                continue
+            for nxt in range(node_count):
+                if mask & (1 << nxt):
+                    continue
+                next_mask = mask | (1 << nxt)
+                candidate = dp[state] + leg_cost(pair_distances[last][nxt])
+                next_state = (next_mask, nxt)
+                if candidate < dp.get(next_state, float("inf")):
+                    dp[next_state] = candidate
+                    parent[next_state] = last
+
+    full_mask = (1 << node_count) - 1
+    best_last = min(
+        range(node_count),
+        key=lambda index: dp[(full_mask, index)] + end_distances[index],
+    )
+    return _reconstruct_order(parent, full_mask, best_last)
+
+
+def optimize_node_order_for_maximum_spacing(
+    start_distances: Sequence[float],
+    end_distances: Sequence[float],
+    pair_distances: Sequence[Sequence[float]],
+    max_exact_nodes: int = 10,
+) -> Tuple[int, ...]:
+    node_count = len(start_distances)
+    if node_count == 0:
+        return ()
+
+    if node_count > max_exact_nodes:
+        remaining = list(range(node_count))
+        ordered: List[int] = []
+        last_index: Optional[int] = None
+        while remaining:
+            if last_index is None:
+                next_index = max(
+                    remaining,
+                    key=lambda index: (start_distances[index], -end_distances[index]),
+                )
+            else:
+                next_index = max(
+                    remaining,
+                    key=lambda index: (pair_distances[last_index][index], -end_distances[index]),
+                )
+            ordered.append(next_index)
+            remaining.remove(next_index)
+            last_index = next_index
+        return tuple(ordered)
+
+    score_dp: Dict[Tuple[int, int], Tuple[float, float]] = {}
+    parent: Dict[Tuple[int, int], Optional[int]] = {}
+
+    for index in range(node_count):
+        mask = 1 << index
+        score_dp[(mask, index)] = (start_distances[index], start_distances[index])
+        parent[(mask, index)] = None
+
+    for mask in range(1, 1 << node_count):
+        for last in range(node_count):
+            state = (mask, last)
+            if state not in score_dp:
+                continue
+            current_min_leg, current_total = score_dp[state]
+            for nxt in range(node_count):
+                if mask & (1 << nxt):
+                    continue
+                next_mask = mask | (1 << nxt)
+                next_leg = pair_distances[last][nxt]
+                candidate = (
+                    min(current_min_leg, next_leg),
+                    current_total + next_leg,
+                )
+                next_state = (next_mask, nxt)
+                existing = score_dp.get(next_state)
+                if existing is None or _is_better_spacing_score(candidate, existing):
+                    score_dp[next_state] = candidate
+                    parent[next_state] = last
+
+    full_mask = (1 << node_count) - 1
+    best_last = max(
+        range(node_count),
+        key=lambda index: (
+            score_dp[(full_mask, index)][0],
+            -score_dp[(full_mask, index)][1] - end_distances[index],
+        ),
+    )
+    return _reconstruct_order(parent, full_mask, best_last)
+
+
+def _is_better_spacing_score(
+    candidate: Tuple[float, float], existing: Tuple[float, float]
+) -> bool:
+    if candidate[0] > existing[0] + 1e-9:
+        return True
+    if existing[0] > candidate[0] + 1e-9:
+        return False
+    return candidate[1] + 1e-9 < existing[1]
+
+
+def _reconstruct_order(
+    parent: Dict[Tuple[int, int], Optional[int]], full_mask: int, best_last: int
+) -> Tuple[int, ...]:
+    order_indices: List[int] = []
+    state = (full_mask, best_last)
+    while True:
+        mask, last = state
+        order_indices.append(last)
+        previous = parent[state]
+        if previous is None:
+            break
+        state = (mask ^ (1 << last), previous)
+
+    order_indices.reverse()
+    return tuple(order_indices)
 
 
 def route_node_sequence(

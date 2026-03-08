@@ -9,8 +9,9 @@ This folder contains a Rhino 8 script-plugin MVP that generates a wire path insi
 - lets the user pick touch nodes on the object with live preview
 - trims touch nodes flush to the object boundary
 - builds an interior routing grid automatically
-- routes one continuous conductive path from start to end through all touch nodes in an optimized order
-- adds separate conductive path, casing, and node solids back into Rhino
+- runs a logic check between shortest-path node ordering and resistance-separation-aware ordering before choosing the final node sequence
+- routes one continuous conductive path from start to end through all touch nodes in the chosen optimized order
+- adds separate conductive path and conductive pathway node solids back into Rhino
 
 ## Current scope
 
@@ -55,15 +56,17 @@ First-use workflow inside Rhino:
 1. Start `GenerateInternalWire`.
 2. Select one closed solid, closed mesh, extrusion, or SubD.
 3. Enter the conductive pathway node sphere diameter in millimeters.
-4. Enter the minimum conductive pathway node reading separation in kohm.
-5. Pick the `Start` terminal.
-6. Set that terminal to `Flush` or `Protrude`.
-7. Pick the `End` terminal.
+4. Enter the conductive path diameter in millimeters.
+5. Enter the minimum conductive pathway node reading separation in kohm.
+6. Enter the touch-node ordering mode: `threshold-first`, `shortest-path-first`, or `maximize-separation`.
+7. Pick the `Start` terminal.
 8. Set that terminal to `Flush` or `Protrude`.
-9. Pick conductive pathway nodes on the surface.
-10. Press Enter when all nodes are placed.
-11. Inspect the generated conductive path and conductive nodes.
-12. Check the Rhino command history for estimated resistance and per-node resistance spacing.
+9. Pick the `End` terminal.
+10. Set that terminal to `Flush` or `Protrude`.
+11. Pick conductive pathway nodes on the surface.
+12. Press Enter when all nodes are placed.
+13. Inspect the generated conductive path and conductive nodes.
+14. Check the Rhino command history for the order logic check, estimated resistance, and per-node resistance spacing.
 
 ## Important publish behavior
 
@@ -131,10 +134,10 @@ can be used for downstream boolean operations or fabrication workflows.
 
 ## Standardized geometry
 
-The command now uses fixed fabrication dimensions instead of prompting for
-`VoxelSize`, `Clearance`, `WireRadius`, or `NodeSize`:
+The command now uses fixed fabrication rules instead of prompting for
+`VoxelSize`, `Clearance`, or legacy `WireRadius` settings:
 
-- conductive path diameter: `0.5 mm`
+- conductive path diameter: user-defined per command run, but never smaller than `0.5 mm` and never larger than the selected conductive pathway node diameter
 - retained casing-equivalent clearance margin around conductive paths: `0.5 mm`
 - minimum clearance from that retained margin to the host-object wall: `0.5 mm`
 - minimum conductive path spacing from other conductive paths: `0.5 mm`
@@ -148,12 +151,14 @@ The routing grid resolution is computed automatically in the background.
 
 The command prints an estimated conductive resistance range using ProtoPasta
 Conductive PLA, scaled from the published `2.0-3.5 kohm per 10 cm` value for
-`1.75 mm` filament.
+`1.75 mm` filament and the user-selected conductive path diameter.
 
 It reports:
 
 - estimated total start-to-end resistance for the generated path
 - estimated resistance from the start terminal to each touch node along the final route
+- a logic-check comparison between the shortest-anchor node order and the spacing-aware node order when those two disagree
+- the active ordering mode and, when strategies differ, a comparison across all three available order strategies
 - a suggested Arduino send-pin resistor range of `470 kohm` to `2.2 Mohm`, with `1 Mohm` as the starting point
 - a design-rule failure if successive touch nodes are below the user-selected nominal separation threshold
 
@@ -162,14 +167,16 @@ It reports:
 1. Start `GenerateInternalWire`.
 2. Select one closed target object.
 3. Enter the conductive pathway node sphere diameter in millimeters.
-4. Enter the minimum conductive pathway node reading separation threshold in kohm.
-5. Pick the `Start` terminal on the object.
-6. Choose whether that terminal is `Flush` or `Protrude`.
-7. Pick the `End` terminal on the object.
+4. Enter the conductive path diameter in millimeters.
+5. Enter the minimum conductive pathway node reading separation threshold in kohm.
+6. Enter the ordering mode: `threshold-first`, `shortest-path-first`, or `maximize-separation`.
+7. Pick the `Start` terminal on the object.
 8. Choose whether that terminal is `Flush` or `Protrude`.
-9. Pick touch nodes on the object surface.
-10. Watch the live node preview while placing each touch node.
-11. Press Enter after the last touch node.
+9. Pick the `End` terminal on the object.
+10. Choose whether that terminal is `Flush` or `Protrude`.
+11. Pick touch nodes on the object surface.
+12. Watch the live node preview while placing each touch node.
+13. Press Enter after the last touch node.
 
 The command adds:
 
@@ -196,13 +203,19 @@ Touch-node rules:
 
 Routing rules:
 
+- conductive path diameter is chosen by the user for the entire command run
 - conductive path diameter must be at least 0.5 mm
+- conductive path diameter cannot exceed the selected conductive pathway node diameter
+- if a chosen conductive path diameter is geometrically too large and would force overlaps with nodes or pathways, routing fails and the command reports that the pathway is not big enough
 - no casing geometry is generated, but a virtual 0.5 mm casing-equivalent clearance margin is still enforced in the routing logic
 - conductive paths stay at least 0.5 mm away from other conductive paths where the geometry allows
 - conductive paths reserve protected space around every terminal and every conductive pathway node so the route cannot cut through another anchor
 - the retained casing-equivalent margin stays at least 0.5 mm away from the host-object wall
 - if a path between two successive optimized nodes cannot fit, the command reports that the pathway between those nodes is not big enough
 - the user chooses the minimum acceptable nominal separation between successive conductive pathway nodes in kohm for each run
+- `threshold-first` compares all candidate orders and chooses the shortest one that still satisfies the selected resistance threshold when possible
+- `shortest-path-first` always uses the geometrically shortest candidate order, even if another mode would create a larger resistance gap
+- `maximize-separation` chooses the candidate order with the largest minimum per-node resistance step and only breaks ties using shorter total path length
 - the optimizer targets a value above that chosen threshold so quick prototype iterations can use a lower threshold and final runs can use a higher threshold
 - if the final routed layout drops below the chosen threshold, the command rejects the layout
 - routing uses orthogonal grid motion to encourage a zig-zag style path instead of the shortest straight line

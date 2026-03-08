@@ -13,12 +13,24 @@ import System
 import System.Drawing
 import scriptcontext as sc
 
-from .core import GridIndex, GridSpec, RoutingError, dilate_cells, index_to_point, route_node_sequence
+from .core import (
+    GridIndex,
+    GridSpec,
+    NodeOrderMetrics,
+    RoutingError,
+    dilate_cells,
+    evaluate_node_order,
+    index_to_point,
+    optimize_node_order_for_maximum_spacing,
+    optimize_node_order_for_path,
+    optimize_node_order_for_target_leg_length,
+    route_node_sequence,
+)
 
 
 MAX_ESTIMATED_CELLS = 180000
-WIRE_DIAMETER_MM = 0.5
-WIRE_RADIUS_MM = WIRE_DIAMETER_MM * 0.5
+DEFAULT_WIRE_DIAMETER_MM = 0.5
+MIN_WIRE_DIAMETER_MM = 0.5
 CASING_THICKNESS_MM = 0.5
 BOUNDARY_CLEARANCE_MM = 0.5
 PATH_SEPARATION_MM = 0.5
@@ -29,6 +41,9 @@ TERMINAL_LENGTH_MM = 6.0
 MAX_DP_NODES = 10
 DEFAULT_MIN_TOUCH_READING_DELTA_KOHM = 10.0
 MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
+ORDER_MODE_THRESHOLD_FIRST = "threshold-first"
+ORDER_MODE_SHORTEST_PATH_FIRST = "shortest-path-first"
+ORDER_MODE_MAXIMIZE_SEPARATION = "maximize-separation"
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
 PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
@@ -50,6 +65,18 @@ class TerminalPlacement:
     anchor_point: rg.Point3d
     outward_direction: rg.Vector3d
     protrudes: bool
+
+
+@dataclass(frozen=True)
+class TouchNodeOrderDecision:
+    ordered_nodes: Tuple[TouchNodePlacement, ...]
+    selected_strategy: str
+    path_nodes: Tuple[TouchNodePlacement, ...]
+    threshold_nodes: Tuple[TouchNodePlacement, ...]
+    max_spacing_nodes: Tuple[TouchNodePlacement, ...]
+    path_metrics: NodeOrderMetrics
+    threshold_metrics: NodeOrderMetrics
+    max_spacing_metrics: NodeOrderMetrics
 
 
 def _active_doc() -> Rhino.RhinoDoc:
@@ -151,10 +178,10 @@ def _estimate_grid_cells(bbox: rg.BoundingBox, step: float) -> int:
     return x_count * y_count * z_count
 
 
-def _auto_step(mesh: rg.Mesh, doc: Rhino.RhinoDoc) -> float:
+def _auto_step(mesh: rg.Mesh, doc: Rhino.RhinoDoc, wire_diameter_mm: float) -> float:
     bbox = mesh.GetBoundingBox(True)
     diagonal = bbox.Diagonal.Length
-    minimum = max(_mm_to_model(doc, WIRE_DIAMETER_MM), doc.ModelAbsoluteTolerance * 2.0)
+    minimum = max(_mm_to_model(doc, wire_diameter_mm), doc.ModelAbsoluteTolerance * 2.0)
     step = max(minimum, diagonal / 100.0)
 
     estimated = _estimate_grid_cells(bbox, step)
@@ -784,38 +811,11 @@ def _distance_between(a: rg.Point3d, b: rg.Point3d) -> float:
     return a.DistanceTo(b)
 
 
-def _solve_touch_node_order(
+def _touch_node_distance_tables(
     start: TerminalPlacement,
     touch_nodes: Sequence[TouchNodePlacement],
     end: TerminalPlacement,
-    target_leg_length: float,
-) -> List[TouchNodePlacement]:
-    if not touch_nodes:
-        return []
-
-    def leg_cost(distance: float) -> float:
-        if distance < target_leg_length:
-            shortfall = target_leg_length - distance
-            return shortfall * 8.0
-
-        overshoot = distance - target_leg_length
-        return overshoot * 0.35
-
-    if len(touch_nodes) > MAX_DP_NODES:
-        remaining = list(touch_nodes)
-        ordered: List[TouchNodePlacement] = []
-        current = start.anchor_point
-        while remaining:
-            next_node = min(
-                remaining,
-                key=lambda node: leg_cost(_distance_between(current, node.anchor_point))
-                + (_distance_between(node.anchor_point, end.anchor_point) * 0.1),
-            )
-            ordered.append(next_node)
-            remaining.remove(next_node)
-            current = next_node.anchor_point
-        return ordered
-
+) -> Tuple[List[float], List[float], List[List[float]]]:
     node_count = len(touch_nodes)
     distances = [[0.0 for _ in range(node_count)] for _ in range(node_count)]
     start_distances = [0.0 for _ in range(node_count)]
@@ -827,47 +827,156 @@ def _solve_touch_node_order(
         for other_index, other in enumerate(touch_nodes):
             distances[index][other_index] = _distance_between(node.anchor_point, other.anchor_point)
 
-    dp: Dict[Tuple[int, int], float] = {}
-    parent: Dict[Tuple[int, int], Optional[int]] = {}
+    return start_distances, end_distances, distances
 
-    for index in range(node_count):
-        mask = 1 << index
-        dp[(mask, index)] = leg_cost(start_distances[index])
-        parent[(mask, index)] = None
 
-    for mask in range(1, 1 << node_count):
-        for last in range(node_count):
-            state = (mask, last)
-            if state not in dp:
-                continue
-            for nxt in range(node_count):
-                if mask & (1 << nxt):
-                    continue
-                next_mask = mask | (1 << nxt)
-                candidate = dp[state] + leg_cost(distances[last][nxt])
-                next_state = (next_mask, nxt)
-                if candidate < dp.get(next_state, float("inf")):
-                    dp[next_state] = candidate
-                    parent[next_state] = last
+def _nodes_from_order_indices(
+    touch_nodes: Sequence[TouchNodePlacement], order_indices: Sequence[int]
+) -> Tuple[TouchNodePlacement, ...]:
+    return tuple(touch_nodes[index] for index in order_indices)
 
-    full_mask = (1 << node_count) - 1
-    best_last = min(
-        range(node_count),
-        key=lambda index: dp[(full_mask, index)] + _distance_between(touch_nodes[index].anchor_point, end.anchor_point),
+
+def _minimum_leg_delta_kohm(
+    doc: Rhino.RhinoDoc, metrics: NodeOrderMetrics, wire_diameter_mm: float
+) -> float:
+    if not metrics.touch_leg_lengths:
+        return 0.0
+    return min(_nominal_resistance_kohm(doc, leg_length, wire_diameter_mm) for leg_length in metrics.touch_leg_lengths)
+
+
+def _best_metrics_by_threshold(
+    doc: Rhino.RhinoDoc,
+    candidates: Sequence[Tuple[str, NodeOrderMetrics]],
+    minimum_delta_kohm: float,
+    wire_diameter_mm: float,
+) -> str:
+    satisfying: List[Tuple[str, NodeOrderMetrics]] = []
+    for strategy, metrics in candidates:
+        if _minimum_leg_delta_kohm(doc, metrics, wire_diameter_mm) + 1e-9 >= minimum_delta_kohm:
+            satisfying.append((strategy, metrics))
+
+    if satisfying:
+        return min(satisfying, key=lambda item: item[1].total_path_length)[0]
+
+    return max(
+        candidates,
+        key=lambda item: (
+            _minimum_leg_delta_kohm(doc, item[1], wire_diameter_mm),
+            -item[1].total_path_length,
+        ),
+    )[0]
+
+
+def _best_metrics_by_separation(
+    doc: Rhino.RhinoDoc,
+    candidates: Sequence[Tuple[str, NodeOrderMetrics]],
+    wire_diameter_mm: float,
+) -> str:
+    return max(
+        candidates,
+        key=lambda item: (
+            _minimum_leg_delta_kohm(doc, item[1], wire_diameter_mm),
+            -item[1].total_path_length,
+        ),
+    )[0]
+
+
+def _ordering_mode_label(mode: str) -> str:
+    if mode == ORDER_MODE_THRESHOLD_FIRST:
+        return "threshold-first"
+    if mode == ORDER_MODE_SHORTEST_PATH_FIRST:
+        return "shortest-path-first"
+    if mode == ORDER_MODE_MAXIMIZE_SEPARATION:
+        return "maximize-separation"
+    return mode
+
+
+def _choose_touch_node_order(
+    doc: Rhino.RhinoDoc,
+    start: TerminalPlacement,
+    touch_nodes: Sequence[TouchNodePlacement],
+    end: TerminalPlacement,
+    target_leg_length: float,
+    minimum_delta_kohm: float,
+    wire_diameter_mm: float,
+    ordering_mode: str,
+) -> TouchNodeOrderDecision:
+    if not touch_nodes:
+        empty_metrics = NodeOrderMetrics(order=(), total_path_length=0.0, touch_leg_lengths=(), end_leg_length=0.0)
+        return TouchNodeOrderDecision(
+            ordered_nodes=(),
+            selected_strategy=ORDER_MODE_SHORTEST_PATH_FIRST,
+            path_nodes=(),
+            threshold_nodes=(),
+            max_spacing_nodes=(),
+            path_metrics=empty_metrics,
+            threshold_metrics=empty_metrics,
+            max_spacing_metrics=empty_metrics,
+        )
+
+    start_distances, end_distances, pair_distances = _touch_node_distance_tables(start, touch_nodes, end)
+
+    path_order = optimize_node_order_for_path(
+        start_distances,
+        end_distances,
+        pair_distances,
+        max_exact_nodes=MAX_DP_NODES,
+    )
+    threshold_order = optimize_node_order_for_target_leg_length(
+        start_distances,
+        end_distances,
+        pair_distances,
+        target_leg_length,
+        max_exact_nodes=MAX_DP_NODES,
+    )
+    max_spacing_order = optimize_node_order_for_maximum_spacing(
+        start_distances,
+        end_distances,
+        pair_distances,
+        max_exact_nodes=MAX_DP_NODES,
     )
 
-    order_indices: List[int] = []
-    state = (full_mask, best_last)
-    while True:
-        mask, last = state
-        order_indices.append(last)
-        previous = parent[state]
-        if previous is None:
-            break
-        state = (mask ^ (1 << last), previous)
+    path_metrics = evaluate_node_order(path_order, start_distances, end_distances, pair_distances)
+    threshold_metrics = evaluate_node_order(threshold_order, start_distances, end_distances, pair_distances)
+    max_spacing_metrics = evaluate_node_order(max_spacing_order, start_distances, end_distances, pair_distances)
 
-    order_indices.reverse()
-    return [touch_nodes[index] for index in order_indices]
+    candidates = [
+        (ORDER_MODE_SHORTEST_PATH_FIRST, path_metrics),
+        (ORDER_MODE_THRESHOLD_FIRST, threshold_metrics),
+        (ORDER_MODE_MAXIMIZE_SEPARATION, max_spacing_metrics),
+    ]
+
+    if ordering_mode == ORDER_MODE_THRESHOLD_FIRST:
+        selected_strategy = _best_metrics_by_threshold(
+            doc,
+            candidates,
+            minimum_delta_kohm,
+            wire_diameter_mm,
+        )
+    elif ordering_mode == ORDER_MODE_MAXIMIZE_SEPARATION:
+        selected_strategy = _best_metrics_by_separation(doc, candidates, wire_diameter_mm)
+    else:
+        selected_strategy = ORDER_MODE_SHORTEST_PATH_FIRST
+
+    path_nodes = _nodes_from_order_indices(touch_nodes, path_metrics.order)
+    threshold_nodes = _nodes_from_order_indices(touch_nodes, threshold_metrics.order)
+    max_spacing_nodes = _nodes_from_order_indices(touch_nodes, max_spacing_metrics.order)
+    if selected_strategy == ORDER_MODE_THRESHOLD_FIRST:
+        ordered_nodes = threshold_nodes
+    elif selected_strategy == ORDER_MODE_MAXIMIZE_SEPARATION:
+        ordered_nodes = max_spacing_nodes
+    else:
+        ordered_nodes = path_nodes
+    return TouchNodeOrderDecision(
+        ordered_nodes=ordered_nodes,
+        selected_strategy=selected_strategy,
+        path_nodes=path_nodes,
+        threshold_nodes=threshold_nodes,
+        max_spacing_nodes=max_spacing_nodes,
+        path_metrics=path_metrics,
+        threshold_metrics=threshold_metrics,
+        max_spacing_metrics=max_spacing_metrics,
+    )
 
 
 def _segment_solids(
@@ -978,24 +1087,28 @@ def _cumulative_anchor_lengths(
     return lengths
 
 
-def _resistance_range_kohm(doc: Rhino.RhinoDoc, length_in_model_units: float) -> Tuple[float, float]:
+def _resistance_range_kohm(
+    doc: Rhino.RhinoDoc, length_in_model_units: float, wire_diameter_mm: float
+) -> Tuple[float, float]:
     length_mm = _model_to_mm(doc, length_in_model_units)
-    diameter_ratio_sq = (PROTO_PASTA_BASE_DIAMETER_MM / WIRE_DIAMETER_MM) ** 2
+    diameter_ratio_sq = (PROTO_PASTA_BASE_DIAMETER_MM / wire_diameter_mm) ** 2
     low = PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] * diameter_ratio_sq * (length_mm / 100.0)
     high = PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1] * diameter_ratio_sq * (length_mm / 100.0)
     return low, high
 
 
-def _nominal_resistance_kohm(doc: Rhino.RhinoDoc, length_in_model_units: float) -> float:
-    low, high = _resistance_range_kohm(doc, length_in_model_units)
+def _nominal_resistance_kohm(
+    doc: Rhino.RhinoDoc, length_in_model_units: float, wire_diameter_mm: float
+) -> float:
+    low, high = _resistance_range_kohm(doc, length_in_model_units, wire_diameter_mm)
     return (low + high) * 0.5
 
 
-def _reading_delta_length(doc: Rhino.RhinoDoc, delta_kohm: float) -> float:
+def _reading_delta_length(doc: Rhino.RhinoDoc, delta_kohm: float, wire_diameter_mm: float) -> float:
     mean_kohm_per_100mm = (
         (PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] + PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1])
         * 0.5
-        * (PROTO_PASTA_BASE_DIAMETER_MM / WIRE_DIAMETER_MM) ** 2
+        * (PROTO_PASTA_BASE_DIAMETER_MM / wire_diameter_mm) ** 2
     )
     mean_kohm_per_mm = mean_kohm_per_100mm / 100.0
     required_mm = delta_kohm / mean_kohm_per_mm
@@ -1017,14 +1130,15 @@ def _validate_touch_reading_spacing(
     touch_node_labels: Sequence[str],
     touch_lengths: Sequence[float],
     minimum_delta_kohm: float,
+    wire_diameter_mm: float,
 ) -> Optional[str]:
     if len(touch_lengths) < 2:
         return None
 
     previous_label = touch_node_labels[0]
-    previous_resistance = _nominal_resistance_kohm(doc, touch_lengths[0])
+    previous_resistance = _nominal_resistance_kohm(doc, touch_lengths[0], wire_diameter_mm)
     for label, length_value in zip(touch_node_labels[1:], touch_lengths[1:]):
-        current_resistance = _nominal_resistance_kohm(doc, length_value)
+        current_resistance = _nominal_resistance_kohm(doc, length_value, wire_diameter_mm)
         delta = current_resistance - previous_resistance
         if delta + 1e-9 < minimum_delta_kohm:
             return (
@@ -1058,6 +1172,36 @@ def _get_touch_node_flush_diameter_mm() -> Optional[float]:
         return value
 
 
+def _get_conductive_path_diameter_mm(maximum_diameter_mm: float) -> Optional[float]:
+    getter = ric.GetNumber()
+    getter.SetCommandPrompt("Set the conductive path diameter in millimeters")
+    getter.SetDefaultNumber(DEFAULT_WIRE_DIAMETER_MM)
+    getter.AcceptNothing(True)
+
+    while True:
+        result = getter.Get()
+        if result == ri.GetResult.Cancel:
+            return None
+        if result == ri.GetResult.Nothing:
+            value = DEFAULT_WIRE_DIAMETER_MM
+        elif result == ri.GetResult.Number:
+            value = getter.Number()
+        else:
+            continue
+
+        if value + 1e-9 < MIN_WIRE_DIAMETER_MM:
+            Rhino.RhinoApp.WriteLine("Conductive path diameter is too small. It must be at least 0.5 mm.")
+            continue
+        if value - 1e-9 > maximum_diameter_mm:
+            Rhino.RhinoApp.WriteLine(
+                "Conductive path diameter is too large. It cannot exceed the selected conductive pathway node diameter of {:.2f} mm.".format(
+                    maximum_diameter_mm
+                )
+            )
+            continue
+        return value
+
+
 def _get_min_touch_reading_delta_kohm() -> Optional[float]:
     getter = ric.GetNumber()
     getter.SetCommandPrompt("Set the minimum conductive pathway node reading separation in kohm")
@@ -1080,6 +1224,43 @@ def _get_min_touch_reading_delta_kohm() -> Optional[float]:
             )
             continue
         return value
+
+
+def _get_touch_node_ordering_mode() -> Optional[str]:
+    getter = ric.GetString()
+    getter.SetCommandPrompt(
+        "Set touch-node ordering mode: threshold-first, shortest-path-first, or maximize-separation"
+    )
+    getter.SetDefaultString(ORDER_MODE_THRESHOLD_FIRST)
+    getter.AcceptNothing(True)
+
+    aliases = {
+        "threshold-first": ORDER_MODE_THRESHOLD_FIRST,
+        "threshold": ORDER_MODE_THRESHOLD_FIRST,
+        "shortest-path-first": ORDER_MODE_SHORTEST_PATH_FIRST,
+        "shortest": ORDER_MODE_SHORTEST_PATH_FIRST,
+        "path": ORDER_MODE_SHORTEST_PATH_FIRST,
+        "maximize-separation": ORDER_MODE_MAXIMIZE_SEPARATION,
+        "maximize": ORDER_MODE_MAXIMIZE_SEPARATION,
+        "separation": ORDER_MODE_MAXIMIZE_SEPARATION,
+        "max": ORDER_MODE_MAXIMIZE_SEPARATION,
+    }
+
+    while True:
+        result = getter.Get()
+        if result == ri.GetResult.Cancel:
+            return None
+        if result == ri.GetResult.Nothing:
+            return ORDER_MODE_THRESHOLD_FIRST
+        if result != ri.GetResult.String:
+            continue
+
+        value = getter.StringResult().strip().lower()
+        if value in aliases:
+            return aliases[value]
+        Rhino.RhinoApp.WriteLine(
+            "Invalid ordering mode. Use threshold-first, shortest-path-first, or maximize-separation."
+        )
 
 
 def _protected_anchor_cells(
@@ -1106,7 +1287,6 @@ def _add_output_geometry(
     node_radius: float,
     terminal_radius: float,
     terminal_length: float,
-    casing_thickness: float,
 ) -> bool:
     if len(polyline_points) < 2:
         return False
@@ -1148,13 +1328,11 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     doc = _active_doc()
     tolerance = doc.ModelAbsoluteTolerance
 
-    wire_radius = _mm_to_model(doc, WIRE_RADIUS_MM)
     casing_thickness = _mm_to_model(doc, CASING_THICKNESS_MM)
     boundary_clearance = _mm_to_model(doc, BOUNDARY_CLEARANCE_MM)
     path_separation = _mm_to_model(doc, PATH_SEPARATION_MM)
     terminal_radius = _mm_to_model(doc, TERMINAL_DIAMETER_MM * 0.5)
     terminal_length = _mm_to_model(doc, TERMINAL_LENGTH_MM)
-    route_clearance = wire_radius + casing_thickness + boundary_clearance
 
     objref = _select_target_geometry()
     if objref is None:
@@ -1172,16 +1350,27 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if flush_node_diameter_mm is None:
         return Rhino.Commands.Result.Cancel
 
+    wire_diameter_mm = _get_conductive_path_diameter_mm(flush_node_diameter_mm)
+    if wire_diameter_mm is None:
+        return Rhino.Commands.Result.Cancel
+
+    wire_radius = _mm_to_model(doc, wire_diameter_mm * 0.5)
+    route_clearance = wire_radius + casing_thickness + boundary_clearance
+
     min_touch_reading_delta_kohm = _get_min_touch_reading_delta_kohm()
     if min_touch_reading_delta_kohm is None:
         return Rhino.Commands.Result.Cancel
 
+    ordering_mode = _get_touch_node_ordering_mode()
+    if ordering_mode is None:
+        return Rhino.Commands.Result.Cancel
+
     node_radius = _mm_to_model(doc, flush_node_diameter_mm * 0.5)
-    step = _auto_step(mesh, doc)
+    step = _auto_step(mesh, doc, wire_diameter_mm)
     target_touch_reading_delta_kohm = _target_touch_reading_delta_kohm(
         min_touch_reading_delta_kohm
     )
-    target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm)
+    target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm, wire_diameter_mm)
 
     terminals = _collect_terminals(
         mesh,
@@ -1206,13 +1395,49 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if touch_nodes is None:
         return Rhino.Commands.Result.Cancel
 
-    ordered_touch_nodes = _solve_touch_node_order(
+    order_decision = _choose_touch_node_order(
+        doc,
         start_terminal,
         touch_nodes,
         end_terminal,
         target_leg_length,
+        min_touch_reading_delta_kohm,
+        wire_diameter_mm,
+        ordering_mode,
     )
+    ordered_touch_nodes = list(order_decision.ordered_nodes)
     ordered_labels = [node.label for node in ordered_touch_nodes]
+
+    if ordered_labels:
+        path_min_delta = _minimum_leg_delta_kohm(doc, order_decision.path_metrics, wire_diameter_mm)
+        threshold_min_delta = _minimum_leg_delta_kohm(doc, order_decision.threshold_metrics, wire_diameter_mm)
+        max_spacing_min_delta = _minimum_leg_delta_kohm(doc, order_decision.max_spacing_metrics, wire_diameter_mm)
+        if len({
+            order_decision.path_metrics.order,
+            order_decision.threshold_metrics.order,
+            order_decision.max_spacing_metrics.order,
+        }) > 1:
+            Rhino.RhinoApp.WriteLine(
+                "Order logic check: shortest-path-first gives {:.1f} kohm minimum step, threshold-first gives {:.1f} kohm, and maximize-separation gives {:.1f} kohm.".format(
+                    path_min_delta,
+                    threshold_min_delta,
+                    max_spacing_min_delta,
+                )
+            )
+            Rhino.RhinoApp.WriteLine(
+                "Using {} mode. Selected order source: {}."
+                .format(
+                    _ordering_mode_label(ordering_mode),
+                    _ordering_mode_label(order_decision.selected_strategy),
+                )
+            )
+        else:
+            Rhino.RhinoApp.WriteLine(
+                "Using {} mode. All three ordering strategies converged to the same node order at the selected {:.1f} kohm threshold.".format(
+                    _ordering_mode_label(ordering_mode),
+                    min_touch_reading_delta_kohm,
+                )
+            )
     if ordered_labels:
         Rhino.RhinoApp.WriteLine(
             "Optimized touch-node order for distinct readings: {}".format(" -> ".join(ordered_labels))
@@ -1222,7 +1447,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
-            "No valid routing cells were found. The object is not large enough for 0.5 mm conductive pathing with the retained 0.5 mm casing-equivalent clearance margin and 0.5 mm wall clearance."
+            "No valid routing cells were found. The object is not large enough for {:.2f} mm conductive pathing with the retained 0.5 mm casing-equivalent clearance margin and 0.5 mm wall clearance."
+            .format(wire_diameter_mm)
         )
         return Rhino.Commands.Result.Failure
 
@@ -1242,10 +1468,10 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     anchor_radii = [terminal_radius] + [node_radius for _ in ordered_touch_nodes] + [terminal_radius]
     reserved_cells, reserved_exemption_radius = _protected_anchor_cells(anchor_cells=node_cells, anchor_radii=anchor_radii, step=step)
 
-    spacing_radius = max(0, int(math.ceil((WIRE_DIAMETER_MM + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)))
+    spacing_radius = max(0, int(math.ceil((wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)))
     node_exemption_radius = max(
         1,
-        int(math.ceil((max(flush_node_diameter_mm, TERMINAL_DIAMETER_MM) * 0.5 + WIRE_DIAMETER_MM + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)),
+        int(math.ceil((max(flush_node_diameter_mm, TERMINAL_DIAMETER_MM) * 0.5 + wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)),
     )
 
     try:
@@ -1264,7 +1490,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     except RoutingError as error:
         Rhino.RhinoApp.WriteLine(str(error))
         Rhino.RhinoApp.WriteLine(
-            "The pathway between those points is not big enough for 0.5 mm wiring, the retained 0.5 mm casing-equivalent clearance margin, 0.5 mm spacing, and the selected conductive pathway node sphere diameter."
+            "The pathway between those points is not big enough for {:.2f} mm wiring, the retained 0.5 mm casing-equivalent clearance margin, 0.5 mm spacing, and the selected conductive pathway node sphere diameter."
+            .format(wire_diameter_mm)
         )
         return Rhino.Commands.Result.Failure
 
@@ -1276,6 +1503,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         ordered_labels,
         touch_lengths,
         min_touch_reading_delta_kohm,
+        wire_diameter_mm,
     )
     if sensing_error is not None:
         Rhino.RhinoApp.WriteLine(sensing_error)
@@ -1294,16 +1522,16 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         node_radius,
         terminal_radius,
         terminal_length,
-        casing_thickness,
     ):
         Rhino.RhinoApp.WriteLine(
             "Failed to add the conductive path or conductive pathway node solids to the document."
         )
         return Rhino.Commands.Result.Failure
 
-    total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1])
+    total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1], wire_diameter_mm)
     Rhino.RhinoApp.WriteLine(
-        "Estimated start-to-end conductive resistance at 0.5 mm diameter with ProtoPasta Conductive PLA: {:.1f}-{:.1f} kohm.".format(
+        "Estimated start-to-end conductive resistance at {:.2f} mm diameter with ProtoPasta Conductive PLA: {:.1f}-{:.1f} kohm.".format(
+            wire_diameter_mm,
             total_low,
             total_high,
         )
@@ -1316,16 +1544,17 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
     )
     Rhino.RhinoApp.WriteLine(
-        "Distinct-touch targeting uses a nominal {:.1f} kohm step per successive conductive pathway node and rejects anything below the selected {:.1f} kohm threshold."
+        "Distinct-touch targeting uses a nominal {:.1f} kohm step per successive conductive pathway node at {:.2f} mm path diameter and rejects anything below the selected {:.1f} kohm threshold."
         .format(
             target_touch_reading_delta_kohm,
+            wire_diameter_mm,
             min_touch_reading_delta_kohm,
         )
     )
 
     for label, length_value in zip(route_labels[1:-1], cumulative_lengths[1:-1]):
-        low, high = _resistance_range_kohm(doc, length_value)
-        nominal = _nominal_resistance_kohm(doc, length_value)
+        low, high = _resistance_range_kohm(doc, length_value, wire_diameter_mm)
+        nominal = _nominal_resistance_kohm(doc, length_value, wire_diameter_mm)
         Rhino.RhinoApp.WriteLine(
             "{} is approximately {:.1f}-{:.1f} kohm from the start terminal (nominal {:.1f} kohm).".format(
                 label,
@@ -1336,7 +1565,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
 
     Rhino.RhinoApp.WriteLine(
-        "Generated fixed 0.5 mm conductive pathing with a retained 0.5 mm casing-equivalent clearance margin, 0.5 mm wall clearance, a user-set conductive pathway node sphere diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
-        .format(flush_node_diameter_mm)
+        "Generated {:.2f} mm conductive pathing with a retained 0.5 mm casing-equivalent clearance margin, 0.5 mm wall clearance, a user-set conductive pathway node sphere diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
+        .format(wire_diameter_mm, flush_node_diameter_mm)
     )
     return Rhino.Commands.Result.Success
