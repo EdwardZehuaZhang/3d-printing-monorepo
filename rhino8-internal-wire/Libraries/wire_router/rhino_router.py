@@ -1227,24 +1227,16 @@ def _get_min_touch_reading_delta_kohm() -> Optional[float]:
 
 
 def _get_touch_node_ordering_mode() -> Optional[str]:
-    getter = ric.GetString()
+    getter = ric.GetOption()
     getter.SetCommandPrompt(
-        "Set touch-node ordering mode: threshold-first, shortest-path-first, or maximize-separation"
+        "Choose touch-node ordering mode. Press Enter for ThresholdFirst"
     )
-    getter.SetDefaultString(ORDER_MODE_THRESHOLD_FIRST)
     getter.AcceptNothing(True)
+    getter.AcceptEnterWhenDone(True)
 
-    aliases = {
-        "threshold-first": ORDER_MODE_THRESHOLD_FIRST,
-        "threshold": ORDER_MODE_THRESHOLD_FIRST,
-        "shortest-path-first": ORDER_MODE_SHORTEST_PATH_FIRST,
-        "shortest": ORDER_MODE_SHORTEST_PATH_FIRST,
-        "path": ORDER_MODE_SHORTEST_PATH_FIRST,
-        "maximize-separation": ORDER_MODE_MAXIMIZE_SEPARATION,
-        "maximize": ORDER_MODE_MAXIMIZE_SEPARATION,
-        "separation": ORDER_MODE_MAXIMIZE_SEPARATION,
-        "max": ORDER_MODE_MAXIMIZE_SEPARATION,
-    }
+    threshold_option = getter.AddOption("ThresholdFirst")
+    shortest_path_option = getter.AddOption("ShortestPathFirst")
+    maximize_separation_option = getter.AddOption("MaximizeSeparation")
 
     while True:
         result = getter.Get()
@@ -1252,15 +1244,18 @@ def _get_touch_node_ordering_mode() -> Optional[str]:
             return None
         if result == ri.GetResult.Nothing:
             return ORDER_MODE_THRESHOLD_FIRST
-        if result != ri.GetResult.String:
+        if result != ri.GetResult.Option:
             continue
 
-        value = getter.StringResult().strip().lower()
-        if value in aliases:
-            return aliases[value]
-        Rhino.RhinoApp.WriteLine(
-            "Invalid ordering mode. Use threshold-first, shortest-path-first, or maximize-separation."
-        )
+        selected = getter.Option()
+        if selected is None:
+            continue
+        if selected.Index == threshold_option:
+            return ORDER_MODE_THRESHOLD_FIRST
+        if selected.Index == shortest_path_option:
+            return ORDER_MODE_SHORTEST_PATH_FIRST
+        if selected.Index == maximize_separation_option:
+            return ORDER_MODE_MAXIMIZE_SEPARATION
 
 
 def _protected_anchor_cells(
