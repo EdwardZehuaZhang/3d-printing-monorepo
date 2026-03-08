@@ -98,7 +98,7 @@ The command currently creates four outputs:
 
 - a polyline centerline named `GenerateInternalWire_Centerline`
 - conductive path solid(s) named `GenerateInternalWire_ConductivePath`
-- casing solid(s) named `GenerateInternalWire_Casing`
+- conductive-path casing solid(s) named `GenerateInternalWire_Casing`
 - conductive pathway node solid(s) named `GenerateInternalWire_ConductivePathwayNodes`
 
 The selected object is used as the host body for routing and node placement, but
@@ -114,8 +114,7 @@ The command now uses fixed fabrication dimensions instead of prompting for
 - conductive path casing thickness: `0.5 mm`
 - minimum clearance from casing to host-object wall: `0.5 mm`
 - minimum conductive path spacing from other conductive paths: `0.5 mm`
-- conductive pathway node body diameter: `3.0 mm`
-- conductive pathway node flush diameter: user-defined per command run, but never smaller than `0.5 mm`
+- conductive pathway node sphere diameter: user-defined per command run, but never smaller than `0.5 mm`
 - start and end terminal connector diameter: `3.0 mm`
 - start and end terminal connector length: `6.0 mm`
 
@@ -138,7 +137,7 @@ It reports:
 
 1. Start `GenerateInternalWire`.
 2. Select one closed target object.
-3. Enter the conductive pathway node flush diameter in millimeters.
+3. Enter the conductive pathway node sphere diameter in millimeters.
 4. Pick the `Start` terminal on the object.
 5. Choose whether that terminal is `Flush` or `Protrude`.
 6. Pick the `End` terminal on the object.
@@ -163,10 +162,12 @@ Terminal rules:
 Touch-node rules:
 
 - conductive pathway nodes are conductive solids, not casing
-- the exposed flush diameter is chosen by the user for the entire command run
-- if the flush diameter is smaller than `0.5 mm`, the command rejects it as too small
-- if the flush diameter is too large for the selected location, overlaps another node or terminal, or leaves no protected routing corridor, the command rejects it as too big
-- corners are valid placement targets when the selected flush diameter still fits the routing clearance
+- the conductive node sphere diameter is chosen by the user for the entire command run
+- if the sphere diameter is smaller than `0.5 mm`, the command rejects it as too small
+- if the sphere diameter is too large for the selected location, overlaps another node or terminal, or leaves no protected routing corridor, the command rejects it as too big
+- the picked surface point becomes the center of the conductive node sphere, and any part of that sphere outside the host geometry is trimmed away
+- no non-conductive casing is generated around conductive pathway nodes
+- corners are valid placement targets when the selected sphere diameter still fits the routing clearance
 - nodes are optimized into the final routing order automatically to improve distinguishability and do not use the click order as the final electrical sequence
 
 Routing rules:
