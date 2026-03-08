@@ -59,7 +59,7 @@ First-use workflow inside Rhino:
 2. Select one closed solid, closed mesh, extrusion, or SubD.
 3. Enter the conductive pathway node sphere diameter in millimeters. Press Enter to accept the default `10.0 mm` finger-sized conductive node.
 4. Enter the conductive path diameter in millimeters. Press Enter to accept the default `0.5 mm` single printable line.
-5. Enter the desired touch-to-touch resistance between successive nodes in kohm. Press Enter to accept the default `50.0 kohm` target for stronger noise separation.
+5. Enter the desired touch-to-touch resistance between successive nodes in kohm. Press Enter to accept the recommended default based on the selected conductive path diameter. With the default `0.5 mm` single printable line, the suggested target is `200.0 kohm` for stronger noise separation.
 6. Pick the `Start` terminal.
 7. Set that terminal to `Flush` or `Protrude`.
 8. Pick the `End` terminal.
@@ -145,7 +145,7 @@ The command now uses fixed fabrication rules instead of prompting for
 - conductive pathway node sphere diameter: user-defined per command run, but defaults to `10.0 mm` and is never smaller than `0.5 mm`
 - start and end terminal connector diameter: `3.0 mm`
 - start and end terminal connector length: `6.0 mm`
-- default desired touch-to-touch resistance target: `50.0 kohm`
+- default desired touch-to-touch resistance target: recommended from conductive path diameter, using `50.0 kohm` at `1.0 mm` as the reference value and `200.0 kohm` for the default `0.5 mm` single printable line
 
 The routing grid resolution is computed automatically in the background.
 
@@ -217,6 +217,8 @@ Routing rules:
 - only touch-node-to-touch-node resistance steps are used to rank node orders; the start terminal leg and end terminal leg are excluded from that scoring rule
 - the router searches for the node order whose estimated touch-to-touch steps are closest to the requested value and then tries nearby alternatives until it finds a routable order
 - once an order is chosen, the router tries to spend free interior space on the touch-to-touch legs with chained detours so the actual routed resistance can move closer to the requested value instead of always collapsing to the shortest corridor
+- those chained detours are biased toward roomy interior regions and away from narrow connectors, so extra snaking happens in larger chambers before it spends scarce corridor space
+- each target-seeking touch leg also avoids folding back into itself at the configured path-spacing radius, which prevents self-overlap while it is trying to gain resistance length
 - if the routed result does not exactly match the requested touch-to-touch resistance, the command still succeeds and reports the actual touch-to-touch values and total start-to-end resistance
 - if no candidate order can be routed, the command explains that the blocking issue is a local corridor problem caused by path diameter, clearance, spacing, and protected node or terminal zones, not necessarily the overall object size
 - routing uses orthogonal grid motion to encourage a zig-zag style path instead of the shortest straight line

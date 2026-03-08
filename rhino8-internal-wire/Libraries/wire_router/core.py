@@ -55,6 +55,17 @@ def _movement_distance(a: GridIndex, b: GridIndex, allow_diagonals: bool) -> flo
     return float(abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]))
 
 
+def _local_roominess(valid_cells: Set[GridIndex], center: GridIndex, radius: int = 2) -> int:
+    roominess = 0
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            for dz in range(-radius, radius + 1):
+                candidate = (center[0] + dx, center[1] + dy, center[2] + dz)
+                if candidate in valid_cells:
+                    roominess += 1
+    return roominess
+
+
 def _path_length(path: Sequence[GridIndex]) -> float:
     if len(path) < 2:
         return 0.0
@@ -126,8 +137,10 @@ def _select_detour_waypoints(
             continue
 
         line_distance = _point_to_segment_distance(candidate, start, goal)
+        roominess = _local_roominess(valid_cells, candidate)
         score = (
             abs(total_distance - target_length),
+            -roominess,
             -line_distance,
             -min(start_distance, goal_distance),
             -total_distance,
@@ -154,7 +167,8 @@ def _select_detour_waypoints(
                 continue
             diversity = min(_distance(candidate, existing) for existing in selected)
             line_distance = _point_to_segment_distance(candidate, start, goal)
-            score = (diversity, line_distance, -float(pool_index))
+            roominess = _local_roominess(valid_cells, candidate)
+            score = (roominess, diversity, line_distance, -float(pool_index))
             if best_score is None or score > best_score:
                 best_score = score
                 best_candidate = candidate
@@ -172,6 +186,7 @@ def _route_through_waypoints(
     penalty_cells: Set[GridIndex],
     penalty_weight: float,
     allow_diagonals: bool,
+    self_avoid_radius: int,
 ) -> List[GridIndex]:
     combined: List[GridIndex] = []
     consumed_cells: Set[GridIndex] = set()
@@ -180,7 +195,8 @@ def _route_through_waypoints(
     for segment_index, (start, goal) in enumerate(zip(full_sequence[:-1], full_sequence[1:])):
         segment_valid_cells = set(valid_cells)
         if consumed_cells:
-            segment_valid_cells.difference_update(consumed_cells)
+            blocked_consumed = dilate_cells(consumed_cells, max(0, self_avoid_radius))
+            segment_valid_cells.difference_update(blocked_consumed)
             segment_valid_cells.add(start)
             segment_valid_cells.add(goal)
 
@@ -258,6 +274,7 @@ def _route_segment_with_target_length(
                 penalty_cells=penalty_cells,
                 penalty_weight=penalty_weight,
                 allow_diagonals=allow_diagonals,
+                self_avoid_radius=0,
             )
         except RoutingError:
             continue
@@ -282,6 +299,7 @@ def _route_segment_with_target_length(
                     penalty_cells=penalty_cells,
                     penalty_weight=penalty_weight,
                     allow_diagonals=allow_diagonals,
+                    self_avoid_radius=0,
                 )
             except RoutingError:
                 continue
@@ -356,6 +374,7 @@ def _segment_candidate_paths(
     penalty_weight: float,
     allow_diagonals: bool,
     target_length: Optional[float],
+    self_avoid_radius: int = 0,
     max_candidates: int = 14,
 ) -> List[List[GridIndex]]:
     direct_path = astar_path(
@@ -425,6 +444,7 @@ def _segment_candidate_paths(
                         penalty_cells=penalty_cells,
                         penalty_weight=penalty_weight,
                         allow_diagonals=allow_diagonals,
+                        self_avoid_radius=self_avoid_radius,
                     )
                 )
             except RoutingError:
@@ -918,6 +938,7 @@ def route_node_sequence(
                 penalty_weight=penalty_weight,
                 allow_diagonals=allow_diagonals,
                 target_length=segment_target_length,
+                self_avoid_radius=max(0, blocked_radius),
             )
         except RoutingError:
             candidate_paths = []

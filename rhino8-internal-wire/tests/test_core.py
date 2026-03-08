@@ -23,6 +23,38 @@ class CoreRouterTests(unittest.TestCase):
             total += abs(end[0] - start[0]) + abs(end[1] - start[1]) + abs(end[2] - start[2])
         return total
 
+    @staticmethod
+    def _expand_segment(segment: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+        expanded = [segment[0]]
+        for start, end in zip(segment[:-1], segment[1:]):
+            current = start
+            while current != end:
+                step = (
+                    current[0] + (1 if end[0] > current[0] else -1 if end[0] < current[0] else 0),
+                    current[1] + (1 if end[1] > current[1] else -1 if end[1] < current[1] else 0),
+                    current[2] + (1 if end[2] > current[2] else -1 if end[2] < current[2] else 0),
+                )
+                expanded.append(step)
+                current = step
+        return expanded
+
+    @staticmethod
+    def _has_nonlocal_close_approach(
+        path: list[tuple[int, int, int]],
+        radius: int,
+        local_window: int,
+    ) -> bool:
+        for current_index, current in enumerate(path):
+            for previous_index in range(max(0, current_index - len(path)), current_index - local_window):
+                previous = path[previous_index]
+                if max(
+                    abs(current[0] - previous[0]),
+                    abs(current[1] - previous[1]),
+                    abs(current[2] - previous[2]),
+                ) <= radius:
+                    return True
+        return False
+
     def test_path_optimizer_prefers_shortest_total_route(self) -> None:
         order = optimize_node_order_for_path(
             start_distances=[1.0, 7.0, 7.0],
@@ -271,6 +303,21 @@ class CoreRouterTests(unittest.TestCase):
 
         self.assertEqual(len(segments), 1)
         self.assertGreaterEqual(self._segment_length(segments[0]), 50.0)
+
+    def test_target_segment_avoids_nonlocal_self_overlap_when_spacing_is_required(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(12) for y in range(8)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(1, 1, 0), (10, 6, 0)],
+            segment_target_lengths=[50.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            allow_diagonals=False,
+        )
+
+        expanded = self._expand_segment(segments[0])
+        self.assertFalse(self._has_nonlocal_close_approach(expanded, radius=1, local_window=3))
 
 
 if __name__ == "__main__":

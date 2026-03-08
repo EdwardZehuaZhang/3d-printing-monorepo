@@ -38,7 +38,10 @@ MIN_TOUCH_NODE_FLUSH_DIAMETER_MM = 0.5
 TERMINAL_DIAMETER_MM = 3.0
 TERMINAL_LENGTH_MM = 6.0
 MAX_DP_NODES = 10
-DEFAULT_MIN_TOUCH_READING_DELTA_KOHM = 50.0
+REFERENCE_TOUCH_READING_DELTA_KOHM = 50.0
+REFERENCE_TOUCH_READING_DIAMETER_MM = 1.0
+MIN_RECOMMENDED_TOUCH_READING_DELTA_KOHM = 20.0
+MAX_RECOMMENDED_TOUCH_READING_DELTA_KOHM = 250.0
 MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
 PROTO_PASTA_BASE_DIAMETER_MM = 1.75
@@ -1178,10 +1181,22 @@ def _get_conductive_path_diameter_mm(maximum_diameter_mm: float) -> Optional[flo
         return value
 
 
-def _get_target_touch_reading_delta_kohm() -> Optional[float]:
+def _recommended_touch_reading_delta_kohm(wire_diameter_mm: float) -> float:
+    scaled = REFERENCE_TOUCH_READING_DELTA_KOHM * (
+        REFERENCE_TOUCH_READING_DIAMETER_MM / wire_diameter_mm
+    ) ** 2
+    bounded = max(
+        MIN_RECOMMENDED_TOUCH_READING_DELTA_KOHM,
+        min(MAX_RECOMMENDED_TOUCH_READING_DELTA_KOHM, scaled),
+    )
+    return round(bounded / 5.0) * 5.0
+
+
+def _get_target_touch_reading_delta_kohm(wire_diameter_mm: float) -> Optional[float]:
+    recommended_delta_kohm = _recommended_touch_reading_delta_kohm(wire_diameter_mm)
     getter = ric.GetNumber()
     getter.SetCommandPrompt("Set the desired touch-to-touch resistance between successive nodes in kohm")
-    getter.SetDefaultNumber(DEFAULT_MIN_TOUCH_READING_DELTA_KOHM)
+    getter.SetDefaultNumber(recommended_delta_kohm)
     getter.AcceptNothing(True)
 
     while True:
@@ -1189,7 +1204,7 @@ def _get_target_touch_reading_delta_kohm() -> Optional[float]:
         if result == ri.GetResult.Cancel:
             return None
         if result == ri.GetResult.Nothing:
-            return DEFAULT_MIN_TOUCH_READING_DELTA_KOHM
+            return recommended_delta_kohm
         if result != ri.GetResult.Number:
             continue
 
@@ -1308,7 +1323,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     wire_radius = _mm_to_model(doc, wire_diameter_mm * 0.5)
     route_clearance = wire_radius + casing_thickness + boundary_clearance
 
-    target_touch_reading_delta_kohm = _get_target_touch_reading_delta_kohm()
+    target_touch_reading_delta_kohm = _get_target_touch_reading_delta_kohm(wire_diameter_mm)
     if target_touch_reading_delta_kohm is None:
         return Rhino.Commands.Result.Cancel
 
