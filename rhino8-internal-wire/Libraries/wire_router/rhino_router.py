@@ -1138,20 +1138,10 @@ def _add_output_geometry(
     conductive_nodes = _boolean_union(touch_node_breps, doc.ModelAbsoluteTolerance)
     conductive_path = _boolean_difference(conductive_path, conductive_nodes, doc.ModelAbsoluteTolerance)
 
-    path_casing_outer = _segment_solids(doc, polyline_points, wire_radius + casing_thickness)
-    path_casing_outer = _boolean_intersection(path_casing_outer, [host_brep], doc.ModelAbsoluteTolerance)
-    casing = _boolean_union(path_casing_outer, doc.ModelAbsoluteTolerance)
-    casing = _boolean_difference(
-        casing,
-        list(conductive_path) + list(conductive_nodes),
-        doc.ModelAbsoluteTolerance,
-    )
-
     path_added = _add_breps(doc, conductive_path, "GenerateInternalWire_ConductivePath")
     node_added = _add_breps(doc, conductive_nodes, "GenerateInternalWire_ConductivePathwayNodes")
-    casing_added = _add_breps(doc, casing, "GenerateInternalWire_Casing")
     doc.Views.Redraw()
-    return path_added and node_added and casing_added
+    return path_added and node_added
 
 
 def run_generate_internal_wire() -> Rhino.Commands.Result:
@@ -1232,7 +1222,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
-            "No valid routing cells were found. The object is not large enough for 0.5 mm conductive pathing with 0.5 mm casing and 0.5 mm wall clearance."
+            "No valid routing cells were found. The object is not large enough for 0.5 mm conductive pathing with the retained 0.5 mm casing-equivalent clearance margin and 0.5 mm wall clearance."
         )
         return Rhino.Commands.Result.Failure
 
@@ -1274,7 +1264,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     except RoutingError as error:
         Rhino.RhinoApp.WriteLine(str(error))
         Rhino.RhinoApp.WriteLine(
-            "The pathway between those points is not big enough for 0.5 mm wiring, 0.5 mm casing, 0.5 mm spacing, and the selected conductive pathway node sphere diameter."
+            "The pathway between those points is not big enough for 0.5 mm wiring, the retained 0.5 mm casing-equivalent clearance margin, 0.5 mm spacing, and the selected conductive pathway node sphere diameter."
         )
         return Rhino.Commands.Result.Failure
 
@@ -1307,7 +1297,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         casing_thickness,
     ):
         Rhino.RhinoApp.WriteLine(
-            "Failed to add the conductive path, casing, or node solids to the document."
+            "Failed to add the conductive path or conductive pathway node solids to the document."
         )
         return Rhino.Commands.Result.Failure
 
@@ -1346,7 +1336,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
 
     Rhino.RhinoApp.WriteLine(
-        "Generated fixed 0.5 mm conductive pathing with 0.5 mm casing thickness, 0.5 mm wall clearance, a user-set conductive pathway node sphere diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
+        "Generated fixed 0.5 mm conductive pathing with a retained 0.5 mm casing-equivalent clearance margin, 0.5 mm wall clearance, a user-set conductive pathway node sphere diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
         .format(flush_node_diameter_mm)
     )
     return Rhino.Commands.Result.Success

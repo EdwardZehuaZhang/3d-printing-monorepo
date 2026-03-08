@@ -62,7 +62,7 @@ First-use workflow inside Rhino:
 8. Set that terminal to `Flush` or `Protrude`.
 9. Pick conductive pathway nodes on the surface.
 10. Press Enter when all nodes are placed.
-11. Inspect the generated conductive path, conductive nodes, and conductive-path casing.
+11. Inspect the generated conductive path and conductive nodes.
 12. Check the Rhino command history for estimated resistance and per-node resistance spacing.
 
 ## Important publish behavior
@@ -119,11 +119,10 @@ installed `.rhp` file after Rhino is closed.
 
 ## Generated geometry
 
-The command currently creates four outputs:
+The command currently creates three outputs:
 
 - a polyline centerline named `GenerateInternalWire_Centerline`
 - conductive path solid(s) named `GenerateInternalWire_ConductivePath`
-- conductive-path casing solid(s) named `GenerateInternalWire_Casing`
 - conductive pathway node solid(s) named `GenerateInternalWire_ConductivePathwayNodes`
 
 The selected object is used as the host body for routing and node placement, but
@@ -136,8 +135,8 @@ The command now uses fixed fabrication dimensions instead of prompting for
 `VoxelSize`, `Clearance`, `WireRadius`, or `NodeSize`:
 
 - conductive path diameter: `0.5 mm`
-- conductive path casing thickness: `0.5 mm`
-- minimum clearance from casing to host-object wall: `0.5 mm`
+- retained casing-equivalent clearance margin around conductive paths: `0.5 mm`
+- minimum clearance from that retained margin to the host-object wall: `0.5 mm`
 - minimum conductive path spacing from other conductive paths: `0.5 mm`
 - conductive pathway node sphere diameter: user-defined per command run, but never smaller than `0.5 mm`
 - start and end terminal connector diameter: `3.0 mm`
@@ -176,7 +175,6 @@ The command adds:
 
 - a polyline centerline
 - conductive path solid(s)
-- casing solid(s)
 - node solid(s)
 
 Terminal rules:
@@ -199,10 +197,10 @@ Touch-node rules:
 Routing rules:
 
 - conductive path diameter must be at least 0.5 mm
-- conductive path casing thickness is fixed at 0.5 mm
+- no casing geometry is generated, but a virtual 0.5 mm casing-equivalent clearance margin is still enforced in the routing logic
 - conductive paths stay at least 0.5 mm away from other conductive paths where the geometry allows
 - conductive paths reserve protected space around every terminal and every conductive pathway node so the route cannot cut through another anchor
-- path casing stays at least 0.5 mm away from the host-object wall
+- the retained casing-equivalent margin stays at least 0.5 mm away from the host-object wall
 - if a path between two successive optimized nodes cannot fit, the command reports that the pathway between those nodes is not big enough
 - the user chooses the minimum acceptable nominal separation between successive conductive pathway nodes in kohm for each run
 - the optimizer targets a value above that chosen threshold so quick prototype iterations can use a lower threshold and final runs can use a higher threshold
