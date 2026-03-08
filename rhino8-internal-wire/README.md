@@ -99,7 +99,7 @@ The command currently creates four outputs:
 - a polyline centerline named `GenerateInternalWire_Centerline`
 - conductive path solid(s) named `GenerateInternalWire_ConductivePath`
 - casing solid(s) named `GenerateInternalWire_Casing`
-- node solid(s) named `GenerateInternalWire_Nodes`
+- conductive pathway node solid(s) named `GenerateInternalWire_ConductivePathwayNodes`
 
 The selected object is used as the host body for routing and node placement, but
 it is not modified automatically. The generated solids are separate objects that
@@ -114,7 +114,8 @@ The command now uses fixed fabrication dimensions instead of prompting for
 - conductive path casing thickness: `0.5 mm`
 - minimum clearance from casing to host-object wall: `0.5 mm`
 - minimum conductive path spacing from other conductive paths: `0.5 mm`
-- touch node diameter: `3.0 mm`
+- conductive pathway node body diameter: `3.0 mm`
+- conductive pathway node flush diameter: user-defined per command run, but never smaller than `0.5 mm`
 - start and end terminal connector diameter: `3.0 mm`
 - start and end terminal connector length: `6.0 mm`
 
@@ -130,18 +131,21 @@ It reports:
 
 - estimated total start-to-end resistance for the generated path
 - estimated resistance from the start terminal to each touch node along the final route
+- a suggested Arduino send-pin resistor range of `470 kohm` to `2.2 Mohm`, with `1 Mohm` as the starting point
+- a design-rule failure if successive touch nodes are too electrically close to distinguish reliably
 
 ## Use the command
 
 1. Start `GenerateInternalWire`.
 2. Select one closed target object.
-3. Pick the `Start` terminal on the object.
-4. Choose whether that terminal is `Flush` or `Protrude`.
-5. Pick the `End` terminal on the object.
-6. Choose whether that terminal is `Flush` or `Protrude`.
-7. Pick touch nodes on the object surface.
-8. Watch the live node preview while placing each touch node.
-9. Press Enter after the last touch node.
+3. Enter the conductive pathway node flush diameter in millimeters.
+4. Pick the `Start` terminal on the object.
+5. Choose whether that terminal is `Flush` or `Protrude`.
+6. Pick the `End` terminal on the object.
+7. Choose whether that terminal is `Flush` or `Protrude`.
+8. Pick touch nodes on the object surface.
+9. Watch the live node preview while placing each touch node.
+10. Press Enter after the last touch node.
 
 The command adds:
 
@@ -158,17 +162,22 @@ Terminal rules:
 
 Touch-node rules:
 
-- touch nodes are spherical conductive solids trimmed flush to the object surface
-- nodes must stay at least 0.5 mm apart from each other
-- nodes are optimized into the final routing order automatically and do not use the click order as the final electrical sequence
+- conductive pathway nodes are conductive solids, not casing
+- the exposed flush diameter is chosen by the user for the entire command run
+- if the flush diameter is smaller than `0.5 mm`, the command rejects it as too small
+- if the flush diameter is too large for the selected location, overlaps another node or terminal, or leaves no protected routing corridor, the command rejects it as too big
+- corners are valid placement targets when the selected flush diameter still fits the routing clearance
+- nodes are optimized into the final routing order automatically to improve distinguishability and do not use the click order as the final electrical sequence
 
 Routing rules:
 
 - conductive path diameter must be at least 0.5 mm
 - conductive path casing thickness is fixed at 0.5 mm
 - conductive paths stay at least 0.5 mm away from other conductive paths where the geometry allows
+- conductive paths reserve protected space around every terminal and every conductive pathway node so the route cannot cut through another anchor
 - path casing stays at least 0.5 mm away from the host-object wall
 - if a path between two successive optimized nodes cannot fit, the command reports that the pathway between those nodes is not big enough
+- if successive conductive pathway nodes end up too close in nominal resistance, the command rejects the layout instead of generating an ambiguous sensor
 - routing uses orthogonal grid motion to encourage a zig-zag style path instead of the shortest straight line
 
 ## Tuning guidance

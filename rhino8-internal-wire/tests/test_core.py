@@ -79,6 +79,22 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(segments[1][-1], (6, 1, 0))
         self.assertTrue(any(cell[1] != 1 for cell in segments[1][1:-1]))
 
+    def test_reserved_cells_keep_earlier_segments_out_of_future_anchor(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(7) for y in range(3)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 1, 0), (6, 1, 0), (3, 1, 0)],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            reserved_cells={(3, 1, 0)},
+            reserved_exemption_radius=0,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 2)
+        self.assertNotIn((3, 1, 0), segments[0][1:-1])
+        self.assertEqual(segments[1][-1], (3, 1, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

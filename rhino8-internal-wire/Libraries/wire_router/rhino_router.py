@@ -13,7 +13,7 @@ import System
 import System.Drawing
 import scriptcontext as sc
 
-from .core import GridIndex, GridSpec, RoutingError, index_to_point, route_node_sequence
+from .core import GridIndex, GridSpec, RoutingError, dilate_cells, index_to_point, route_node_sequence
 
 
 MAX_ESTIMATED_CELLS = 180000
@@ -22,10 +22,14 @@ WIRE_RADIUS_MM = WIRE_DIAMETER_MM * 0.5
 CASING_THICKNESS_MM = 0.5
 BOUNDARY_CLEARANCE_MM = 0.5
 PATH_SEPARATION_MM = 0.5
-TOUCH_NODE_DIAMETER_MM = 3.0
+TOUCH_NODE_BODY_DIAMETER_MM = 3.0
+DEFAULT_TOUCH_NODE_FLUSH_DIAMETER_MM = 3.0
+MIN_TOUCH_NODE_FLUSH_DIAMETER_MM = 0.5
 TERMINAL_DIAMETER_MM = 3.0
 TERMINAL_LENGTH_MM = 6.0
 MAX_DP_NODES = 10
+MIN_TOUCH_READING_DELTA_KOHM = 6.0
+SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
 PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 
@@ -165,28 +169,60 @@ def _mesh_distance(mesh: rg.Mesh, point: rg.Point3d) -> float:
     return point.DistanceTo(mesh.ClosestPoint(point))
 
 
+def _mesh_bbox_center(mesh: rg.Mesh) -> rg.Point3d:
+    return mesh.GetBoundingBox(True).Center
+
+
+def _candidate_inward_directions(mesh: rg.Mesh, surface_point: rg.Point3d) -> List[rg.Vector3d]:
+    directions: List[rg.Vector3d] = []
+    mesh_point = mesh.ClosestMeshPoint(surface_point, 0.0)
+    if mesh_point is not None:
+        normal = mesh.NormalAt(mesh_point)
+        if normal.Unitize():
+            directions.append(rg.Vector3d(normal))
+            directions.append(rg.Vector3d(-normal))
+
+    bbox_center = _mesh_bbox_center(mesh)
+    bbox_vector = bbox_center - surface_point
+    if bbox_vector.Unitize():
+        directions.append(bbox_vector)
+
+    closest_mesh_point = mesh.ClosestPoint(bbox_center)
+    center_to_mesh = closest_mesh_point - surface_point
+    if center_to_mesh.Unitize():
+        directions.append(center_to_mesh)
+
+    return directions
+
+
 def _inward_center_for_surface_point(
     mesh: rg.Mesh,
     surface_point: rg.Point3d,
     inset: float,
+    minimum_clearance: float,
     tolerance: float,
 ) -> Optional[Tuple[rg.Point3d, rg.Vector3d]]:
-    mesh_point = mesh.ClosestMeshPoint(surface_point, 0.0)
-    if mesh_point is None:
-        return None
-
-    normal = mesh.NormalAt(mesh_point)
-    if not normal.Unitize():
-        return None
-
     candidates: List[Tuple[float, rg.Point3d, rg.Vector3d]] = []
-    for outward in (rg.Vector3d(normal), rg.Vector3d(-normal)):
-        center = surface_point - (outward * inset)
+    probe_distance = max(tolerance * 4.0, inset * 0.25)
+    for direction in _candidate_inward_directions(mesh, surface_point):
+        inward = rg.Vector3d(direction)
+        if not inward.Unitize():
+            continue
+
+        probe = surface_point + (inward * probe_distance)
+        if not mesh.IsPointInside(probe, tolerance, False):
+            continue
+
+        center = surface_point + (inward * inset)
         if not mesh.IsPointInside(center, tolerance, False):
             continue
-        if _mesh_distance(mesh, center) + tolerance < inset:
+
+        clearance = _mesh_distance(mesh, center)
+        if clearance + tolerance < minimum_clearance:
             continue
-        candidates.append((_mesh_distance(mesh, center), center, outward))
+
+        outward = -inward
+        candidates.append((clearance, center, outward))
 
     if not candidates:
         return None
@@ -200,10 +236,17 @@ def _create_touch_node(
     mesh: rg.Mesh,
     label: str,
     surface_point: rg.Point3d,
-    node_radius: float,
+    body_radius: float,
+    minimum_clearance: float,
     tolerance: float,
 ) -> Optional[TouchNodePlacement]:
-    result = _inward_center_for_surface_point(mesh, surface_point, node_radius, tolerance)
+    result = _inward_center_for_surface_point(
+        mesh,
+        surface_point,
+        body_radius,
+        minimum_clearance,
+        tolerance,
+    )
     if result is None:
         return None
     center, outward = result
@@ -221,9 +264,16 @@ def _create_terminal(
     surface_point: rg.Point3d,
     protrudes: bool,
     anchor_depth: float,
+    minimum_clearance: float,
     tolerance: float,
 ) -> Optional[TerminalPlacement]:
-    result = _inward_center_for_surface_point(mesh, surface_point, anchor_depth, tolerance)
+    result = _inward_center_for_surface_point(
+        mesh,
+        surface_point,
+        anchor_depth,
+        minimum_clearance,
+        tolerance,
+    )
     if result is None:
         return None
     anchor_point, outward = result
@@ -371,23 +421,23 @@ def _validate_touch_node(
     candidate: Optional[TouchNodePlacement],
     touch_nodes: Sequence[TouchNodePlacement],
     terminals: Sequence[TerminalPlacement],
-    node_radius: float,
+    body_radius: float,
     terminal_radius: float,
     min_gap: float,
     tolerance: float,
 ) -> Optional[str]:
     if candidate is None:
-        return "That touch node is too large for the selected surface location."
+        return "That conductive pathway node flush diameter is too big for the selected surface location."
 
     for node in touch_nodes:
-        edge_gap = candidate.center_point.DistanceTo(node.center_point) - (node_radius * 2.0)
+        edge_gap = candidate.center_point.DistanceTo(node.center_point) - (body_radius * 2.0)
         if edge_gap + tolerance < min_gap:
-            return "Touch nodes must stay at least 0.5 mm apart."
+            return "That conductive pathway node flush diameter is too big and overlaps another conductive pathway node."
 
     for terminal in terminals:
-        edge_gap = candidate.center_point.DistanceTo(terminal.anchor_point) - (node_radius + terminal_radius)
+        edge_gap = candidate.center_point.DistanceTo(terminal.anchor_point) - (body_radius + terminal_radius)
         if edge_gap + tolerance < min_gap:
-            return "That touch node is too close to a terminal connector."
+            return "That conductive pathway node flush diameter is too big and overlaps a terminal connector."
     return None
 
 
@@ -397,25 +447,27 @@ class _TouchNodeGetter(ric.GetPoint):
         mesh: rg.Mesh,
         touch_nodes: Sequence[TouchNodePlacement],
         terminals: Sequence[TerminalPlacement],
-        node_radius: float,
+        body_radius: float,
         terminal_radius: float,
         min_gap: float,
+        minimum_clearance: float,
         tolerance: float,
     ) -> None:
         super(_TouchNodeGetter, self).__init__()
         self._mesh = mesh
         self._touch_nodes = list(touch_nodes)
         self._terminals = list(terminals)
-        self._node_radius = node_radius
+        self._body_radius = body_radius
         self._terminal_radius = terminal_radius
         self._min_gap = min_gap
+        self._minimum_clearance = minimum_clearance
         self._tolerance = tolerance
 
     def OnDynamicDraw(self, e: ri.GetPointDrawEventArgs) -> None:
         super(_TouchNodeGetter, self).OnDynamicDraw(e)
 
         for node in self._touch_nodes:
-            e.Display.DrawSphere(rg.Sphere(node.center_point, self._node_radius), System.Drawing.Color.DeepSkyBlue)
+            e.Display.DrawSphere(rg.Sphere(node.center_point, self._body_radius), System.Drawing.Color.DeepSkyBlue)
 
         for terminal in self._terminals:
             e.Display.DrawPoint(terminal.surface_point, Rhino.Display.PointStyle.ControlPoint, 6, System.Drawing.Color.Gold)
@@ -424,14 +476,15 @@ class _TouchNodeGetter(ric.GetPoint):
             self._mesh,
             "Preview",
             e.CurrentPoint,
-            self._node_radius,
+            self._body_radius,
+            self._minimum_clearance,
             self._tolerance,
         )
         error = _validate_touch_node(
             preview,
             self._touch_nodes,
             self._terminals,
-            self._node_radius,
+            self._body_radius,
             self._terminal_radius,
             self._min_gap,
             self._tolerance,
@@ -440,7 +493,7 @@ class _TouchNodeGetter(ric.GetPoint):
             return
 
         color = System.Drawing.Color.OrangeRed if error is not None else System.Drawing.Color.LimeGreen
-        e.Display.DrawSphere(rg.Sphere(preview.center_point, self._node_radius), color)
+        e.Display.DrawSphere(rg.Sphere(preview.center_point, self._body_radius), color)
 
 
 class _TerminalGetter(ric.GetPoint):
@@ -450,6 +503,7 @@ class _TerminalGetter(ric.GetPoint):
         label: str,
         existing_terminals: Sequence[TerminalPlacement],
         terminal_radius: float,
+        minimum_clearance: float,
         tolerance: float,
     ) -> None:
         super(_TerminalGetter, self).__init__()
@@ -457,6 +511,7 @@ class _TerminalGetter(ric.GetPoint):
         self._label = label
         self._existing_terminals = list(existing_terminals)
         self._terminal_radius = terminal_radius
+        self._minimum_clearance = minimum_clearance
         self._tolerance = tolerance
         self.protrude_toggle = ric.OptionToggle(False, "Flush", "Protrude")
 
@@ -472,6 +527,7 @@ class _TerminalGetter(ric.GetPoint):
             e.CurrentPoint,
             bool(self.protrude_toggle.CurrentValue),
             self._terminal_radius if self.protrude_toggle.CurrentValue else _mm_to_model(_active_doc(), TERMINAL_LENGTH_MM),
+            self._minimum_clearance,
             self._tolerance,
         )
         if preview is None:
@@ -491,12 +547,13 @@ def _collect_terminals(
     host_brep: rg.Brep,
     terminal_radius: float,
     terminal_length: float,
+    minimum_clearance: float,
     tolerance: float,
 ) -> Optional[Tuple[TerminalPlacement, TerminalPlacement]]:
     terminals: List[TerminalPlacement] = []
 
     for label in ("Start", "End"):
-        gp = _TerminalGetter(mesh, label, terminals, terminal_radius, tolerance)
+        gp = _TerminalGetter(mesh, label, terminals, terminal_radius, minimum_clearance, tolerance)
         gp.SetCommandPrompt("Pick the {} terminal on the object".format(label.lower()))
         gp.Constrain(mesh, False)
         gp.AddOptionToggle("TerminalMode", gp.protrude_toggle)
@@ -512,7 +569,15 @@ def _collect_terminals(
 
             protrudes = bool(gp.protrude_toggle.CurrentValue)
             anchor_depth = terminal_radius if protrudes else terminal_length
-            terminal = _create_terminal(mesh, label, gp.Point(), protrudes, anchor_depth, tolerance)
+            terminal = _create_terminal(
+                mesh,
+                label,
+                gp.Point(),
+                protrudes,
+                anchor_depth,
+                minimum_clearance,
+                tolerance,
+            )
             if terminal is None:
                 Rhino.RhinoApp.WriteLine("That terminal does not fit on the selected surface.")
                 continue
@@ -534,9 +599,10 @@ def _collect_terminals(
 def _collect_touch_nodes(
     mesh: rg.Mesh,
     terminals: Sequence[TerminalPlacement],
-    node_radius: float,
+    body_radius: float,
     terminal_radius: float,
     min_gap: float,
+    minimum_clearance: float,
     tolerance: float,
 ) -> Optional[List[TouchNodePlacement]]:
     touch_nodes: List[TouchNodePlacement] = []
@@ -546,9 +612,10 @@ def _collect_touch_nodes(
             mesh,
             touch_nodes,
             terminals,
-            node_radius,
+            body_radius,
             terminal_radius,
             min_gap,
+            minimum_clearance,
             tolerance,
         )
         gp.SetCommandPrompt(
@@ -561,12 +628,19 @@ def _collect_touch_nodes(
         result = gp.Get()
         if result == ri.GetResult.Point:
             label = "Node {}".format(len(touch_nodes) + 1)
-            candidate = _create_touch_node(mesh, label, gp.Point(), node_radius, tolerance)
+            candidate = _create_touch_node(
+                mesh,
+                label,
+                gp.Point(),
+                body_radius,
+                minimum_clearance,
+                tolerance,
+            )
             error = _validate_touch_node(
                 candidate,
                 touch_nodes,
                 terminals,
-                node_radius,
+                body_radius,
                 terminal_radius,
                 min_gap,
                 tolerance,
@@ -718,9 +792,14 @@ def _solve_touch_node_order(
     start: TerminalPlacement,
     touch_nodes: Sequence[TouchNodePlacement],
     end: TerminalPlacement,
+    minimum_leg_length: float,
 ) -> List[TouchNodePlacement]:
     if not touch_nodes:
         return []
+
+    def leg_cost(distance: float) -> float:
+        shortfall = max(0.0, minimum_leg_length - distance)
+        return distance + (shortfall * 6.0)
 
     if len(touch_nodes) > MAX_DP_NODES:
         remaining = list(touch_nodes)
@@ -729,7 +808,8 @@ def _solve_touch_node_order(
         while remaining:
             next_node = min(
                 remaining,
-                key=lambda node: _distance_between(current, node.center_point) + (_distance_between(node.center_point, end.anchor_point) * 0.1),
+                key=lambda node: leg_cost(_distance_between(current, node.center_point))
+                + (_distance_between(node.center_point, end.anchor_point) * 0.1),
             )
             ordered.append(next_node)
             remaining.remove(next_node)
@@ -752,7 +832,7 @@ def _solve_touch_node_order(
 
     for index in range(node_count):
         mask = 1 << index
-        dp[(mask, index)] = start_distances[index]
+        dp[(mask, index)] = leg_cost(start_distances[index])
         parent[(mask, index)] = None
 
     for mask in range(1, 1 << node_count):
@@ -764,7 +844,7 @@ def _solve_touch_node_order(
                 if mask & (1 << nxt):
                     continue
                 next_mask = mask | (1 << nxt)
-                candidate = dp[state] + distances[last][nxt]
+                candidate = dp[state] + leg_cost(distances[last][nxt])
                 next_state = (next_mask, nxt)
                 if candidate < dp.get(next_state, float("inf")):
                     dp[next_state] = candidate
@@ -773,7 +853,7 @@ def _solve_touch_node_order(
     full_mask = (1 << node_count) - 1
     best_last = min(
         range(node_count),
-        key=lambda index: dp[(full_mask, index)] + end_distances[index],
+        key=lambda index: dp[(full_mask, index)] + _distance_between(touch_nodes[index].center_point, end.anchor_point),
     )
 
     order_indices: List[int] = []
@@ -819,18 +899,39 @@ def _segment_solids(
     return solids
 
 
+def _touch_node_shape_breps(
+    node: TouchNodePlacement,
+    flush_radius: float,
+    body_radius: float,
+) -> List[rg.Brep]:
+    inward = -node.outward_direction
+    shapes: List[rg.Brep] = []
+
+    stem = _make_cylinder_brep(node.surface_point, inward, body_radius, flush_radius)
+    if stem is not None and stem.IsValid:
+        shapes.append(stem)
+
+    sphere = rg.Sphere(node.center_point, body_radius).ToBrep()
+    if sphere is not None and sphere.IsValid:
+        shapes.append(sphere)
+
+    return shapes
+
+
 def _touch_node_conductive_breps(
     touch_nodes: Sequence[TouchNodePlacement],
     host_brep: rg.Brep,
-    node_radius: float,
+    flush_radius: float,
+    body_radius: float,
     tolerance: float,
 ) -> List[rg.Brep]:
     breps: List[rg.Brep] = []
     for node in touch_nodes:
-        sphere = rg.Sphere(node.center_point, node_radius).ToBrep()
-        if sphere is None or not sphere.IsValid:
+        shapes = _touch_node_shape_breps(node, flush_radius, body_radius)
+        if not shapes:
             continue
-        trimmed = _boolean_intersection([sphere], [host_brep], tolerance)
+        unified = _boolean_union(shapes, tolerance)
+        trimmed = _boolean_intersection(unified, [host_brep], tolerance)
         breps.extend(trimmed)
     return breps
 
@@ -838,19 +939,30 @@ def _touch_node_conductive_breps(
 def _touch_node_casing_breps(
     touch_nodes: Sequence[TouchNodePlacement],
     host_brep: rg.Brep,
-    node_radius: float,
+    flush_radius: float,
+    body_radius: float,
     casing_thickness: float,
     tolerance: float,
 ) -> List[rg.Brep]:
-    outer_radius = node_radius + casing_thickness
     outer_breps: List[rg.Brep] = []
-    inner_breps = _touch_node_conductive_breps(touch_nodes, host_brep, node_radius, tolerance)
+    inner_breps = _touch_node_conductive_breps(
+        touch_nodes,
+        host_brep,
+        flush_radius,
+        body_radius,
+        tolerance,
+    )
 
     for node in touch_nodes:
-        sphere = rg.Sphere(node.center_point, outer_radius).ToBrep()
-        if sphere is None or not sphere.IsValid:
+        outer_shapes = _touch_node_shape_breps(
+            node,
+            flush_radius + casing_thickness,
+            body_radius + casing_thickness,
+        )
+        if not outer_shapes:
             continue
-        trimmed = _boolean_intersection([sphere], [host_brep], tolerance)
+        unified = _boolean_union(outer_shapes, tolerance)
+        trimmed = _boolean_intersection(unified, [host_brep], tolerance)
         outer_breps.extend(trimmed)
 
     return _boolean_difference(outer_breps, inner_breps, tolerance)
@@ -913,6 +1025,87 @@ def _resistance_range_kohm(doc: Rhino.RhinoDoc, length_in_model_units: float) ->
     return low, high
 
 
+def _nominal_resistance_kohm(doc: Rhino.RhinoDoc, length_in_model_units: float) -> float:
+    low, high = _resistance_range_kohm(doc, length_in_model_units)
+    return (low + high) * 0.5
+
+
+def _minimum_touch_leg_length(doc: Rhino.RhinoDoc) -> float:
+    mean_kohm_per_100mm = (
+        (PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] + PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1])
+        * 0.5
+        * (PROTO_PASTA_BASE_DIAMETER_MM / WIRE_DIAMETER_MM) ** 2
+    )
+    mean_kohm_per_mm = mean_kohm_per_100mm / 100.0
+    required_mm = MIN_TOUCH_READING_DELTA_KOHM / mean_kohm_per_mm
+    return _mm_to_model(doc, required_mm)
+
+
+def _format_resistor_value(ohms: float) -> str:
+    if ohms >= 1000000.0:
+        return "{:.2f} Mohm".format(ohms / 1000000.0)
+    return "{:.0f} kohm".format(ohms / 1000.0)
+
+
+def _validate_touch_reading_spacing(
+    doc: Rhino.RhinoDoc,
+    touch_node_labels: Sequence[str],
+    touch_lengths: Sequence[float],
+) -> Optional[str]:
+    if len(touch_lengths) < 2:
+        return None
+
+    previous_label = touch_node_labels[0]
+    previous_resistance = _nominal_resistance_kohm(doc, touch_lengths[0])
+    for label, length_value in zip(touch_node_labels[1:], touch_lengths[1:]):
+        current_resistance = _nominal_resistance_kohm(doc, length_value)
+        delta = current_resistance - previous_resistance
+        if delta + 1e-9 < MIN_TOUCH_READING_DELTA_KOHM:
+            return (
+                "{} and {} are only {:.1f} kohm apart from the start terminal. "
+                "Increase spacing, reduce node count, or use a larger host body so each conductive pathway node is reliably distinguishable."
+            ).format(previous_label, label, delta)
+        previous_label = label
+        previous_resistance = current_resistance
+    return None
+
+
+def _get_touch_node_flush_diameter_mm() -> Optional[float]:
+    getter = ric.GetNumber()
+    getter.SetCommandPrompt("Set the conductive pathway node flush diameter in millimeters")
+    getter.SetDefaultNumber(DEFAULT_TOUCH_NODE_FLUSH_DIAMETER_MM)
+    getter.AcceptNothing(True)
+
+    while True:
+        result = getter.Get()
+        if result == ri.GetResult.Cancel:
+            return None
+        if result == ri.GetResult.Nothing:
+            return DEFAULT_TOUCH_NODE_FLUSH_DIAMETER_MM
+        if result != ri.GetResult.Number:
+            continue
+
+        value = getter.Number()
+        if value + 1e-9 < MIN_TOUCH_NODE_FLUSH_DIAMETER_MM:
+            Rhino.RhinoApp.WriteLine("Conductive pathway node flush diameter is too small. It must be at least 0.5 mm.")
+            continue
+        return value
+
+
+def _protected_anchor_cells(
+    anchor_cells: Sequence[GridIndex],
+    anchor_radii: Sequence[float],
+    step: float,
+) -> Tuple[Set[GridIndex], int]:
+    protected: Set[GridIndex] = set()
+    max_radius = 0
+    for cell, radius in zip(anchor_cells, anchor_radii):
+        cell_radius = max(1, int(math.ceil(radius / step)))
+        max_radius = max(max_radius, cell_radius)
+        protected.update(dilate_cells({cell}, cell_radius))
+    return protected, max_radius
+
+
 def _add_output_geometry(
     doc: Rhino.RhinoDoc,
     host_brep: rg.Brep,
@@ -920,7 +1113,8 @@ def _add_output_geometry(
     touch_nodes: Sequence[TouchNodePlacement],
     terminals: Sequence[TerminalPlacement],
     wire_radius: float,
-    node_radius: float,
+    flush_radius: float,
+    node_body_radius: float,
     terminal_radius: float,
     terminal_length: float,
     casing_thickness: float,
@@ -932,7 +1126,13 @@ def _add_output_geometry(
         return False
 
     path_breps = _segment_solids(doc, polyline_points, wire_radius)
-    touch_node_breps = _touch_node_conductive_breps(touch_nodes, host_brep, node_radius, doc.ModelAbsoluteTolerance)
+    touch_node_breps = _touch_node_conductive_breps(
+        touch_nodes,
+        host_brep,
+        flush_radius,
+        node_body_radius,
+        doc.ModelAbsoluteTolerance,
+    )
     terminal_breps: List[rg.Brep] = []
     for terminal in terminals:
         solids = _terminal_conductive_breps(
@@ -955,7 +1155,8 @@ def _add_output_geometry(
     node_casing = _touch_node_casing_breps(
         touch_nodes,
         host_brep,
-        node_radius,
+        flush_radius,
+        node_body_radius,
         casing_thickness,
         doc.ModelAbsoluteTolerance,
     )
@@ -967,7 +1168,7 @@ def _add_output_geometry(
     )
 
     path_added = _add_breps(doc, conductive_path, "GenerateInternalWire_ConductivePath")
-    node_added = _add_breps(doc, conductive_nodes, "GenerateInternalWire_Nodes")
+    node_added = _add_breps(doc, conductive_nodes, "GenerateInternalWire_ConductivePathwayNodes")
     casing_added = _add_breps(doc, casing, "GenerateInternalWire_Casing")
     doc.Views.Redraw()
     return path_added and node_added and casing_added
@@ -981,7 +1182,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     casing_thickness = _mm_to_model(doc, CASING_THICKNESS_MM)
     boundary_clearance = _mm_to_model(doc, BOUNDARY_CLEARANCE_MM)
     path_separation = _mm_to_model(doc, PATH_SEPARATION_MM)
-    node_radius = _mm_to_model(doc, TOUCH_NODE_DIAMETER_MM * 0.5)
     terminal_radius = _mm_to_model(doc, TERMINAL_DIAMETER_MM * 0.5)
     terminal_length = _mm_to_model(doc, TERMINAL_LENGTH_MM)
     route_clearance = wire_radius + casing_thickness + boundary_clearance
@@ -998,9 +1198,26 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
-    step = _auto_step(mesh, doc)
+    flush_node_diameter_mm = _get_touch_node_flush_diameter_mm()
+    if flush_node_diameter_mm is None:
+        return Rhino.Commands.Result.Cancel
 
-    terminals = _collect_terminals(mesh, host_brep, terminal_radius, terminal_length, tolerance)
+    flush_node_radius = _mm_to_model(doc, flush_node_diameter_mm * 0.5)
+    node_body_radius = max(
+        _mm_to_model(doc, TOUCH_NODE_BODY_DIAMETER_MM * 0.5),
+        flush_node_radius,
+    )
+    step = _auto_step(mesh, doc)
+    minimum_leg_length = _minimum_touch_leg_length(doc)
+
+    terminals = _collect_terminals(
+        mesh,
+        host_brep,
+        terminal_radius,
+        terminal_length,
+        route_clearance,
+        tolerance,
+    )
     if terminals is None:
         return Rhino.Commands.Result.Cancel
     start_terminal, end_terminal = terminals
@@ -1008,19 +1225,25 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     touch_nodes = _collect_touch_nodes(
         mesh,
         terminals,
-        node_radius,
+        node_body_radius,
         terminal_radius,
         path_separation,
+        route_clearance,
         tolerance,
     )
     if touch_nodes is None:
         return Rhino.Commands.Result.Cancel
 
-    ordered_touch_nodes = _solve_touch_node_order(start_terminal, touch_nodes, end_terminal)
+    ordered_touch_nodes = _solve_touch_node_order(
+        start_terminal,
+        touch_nodes,
+        end_terminal,
+        minimum_leg_length,
+    )
     ordered_labels = [node.label for node in ordered_touch_nodes]
     if ordered_labels:
         Rhino.RhinoApp.WriteLine(
-            "Optimized touch-node order: {}".format(" -> ".join(ordered_labels))
+            "Optimized touch-node order for distinct readings: {}".format(" -> ".join(ordered_labels))
         )
 
     Rhino.RhinoApp.WriteLine("Building routing grid...")
@@ -1044,10 +1267,13 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             return Rhino.Commands.Result.Failure
         node_cells.append(cell)
 
+    anchor_radii = [terminal_radius] + [node_body_radius for _ in ordered_touch_nodes] + [terminal_radius]
+    reserved_cells, reserved_exemption_radius = _protected_anchor_cells(anchor_cells=node_cells, anchor_radii=anchor_radii, step=step)
+
     spacing_radius = max(0, int(math.ceil((WIRE_DIAMETER_MM + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)))
     node_exemption_radius = max(
         1,
-        int(math.ceil((max(TOUCH_NODE_DIAMETER_MM, TERMINAL_DIAMETER_MM) * 0.5 + WIRE_DIAMETER_MM + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)),
+        int(math.ceil((max(TOUCH_NODE_BODY_DIAMETER_MM, TERMINAL_DIAMETER_MM) * 0.5 + WIRE_DIAMETER_MM + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)),
     )
 
     try:
@@ -1058,17 +1284,29 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             penalty_weight=step,
             blocked_radius=spacing_radius,
             blocked_exemption_radius=node_exemption_radius,
+            reserved_cells=reserved_cells,
+            reserved_exemption_radius=reserved_exemption_radius,
             node_labels=route_labels,
             allow_diagonals=False,
         )
     except RoutingError as error:
         Rhino.RhinoApp.WriteLine(str(error))
         Rhino.RhinoApp.WriteLine(
-            "The pathway between those points is not big enough for 0.5 mm wiring, 0.5 mm casing, and 0.5 mm spacing."
+            "The pathway between those points is not big enough for 0.5 mm wiring, 0.5 mm casing, 0.5 mm spacing, and the selected conductive pathway node flush diameter."
         )
         return Rhino.Commands.Result.Failure
 
     polyline_points = _segments_to_polyline_points(route_points, segments, grid, tolerance)
+    cumulative_lengths = _cumulative_anchor_lengths(polyline_points, route_points, tolerance)
+    touch_lengths = cumulative_lengths[1:-1]
+    sensing_error = _validate_touch_reading_spacing(doc, ordered_labels, touch_lengths)
+    if sensing_error is not None:
+        Rhino.RhinoApp.WriteLine(sensing_error)
+        Rhino.RhinoApp.WriteLine(
+            "The design was rejected so the conductive pathway nodes stay electrically distinguishable when used with Arduino capacitive sensing."
+        )
+        return Rhino.Commands.Result.Failure
+
     if not _add_output_geometry(
         doc,
         host_brep,
@@ -1076,7 +1314,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         ordered_touch_nodes,
         terminals,
         wire_radius,
-        node_radius,
+        flush_node_radius,
+        node_body_radius,
         terminal_radius,
         terminal_length,
         casing_thickness,
@@ -1086,7 +1325,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
-    cumulative_lengths = _cumulative_anchor_lengths(polyline_points, route_points, tolerance)
     total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1])
     Rhino.RhinoApp.WriteLine(
         "Estimated start-to-end conductive resistance at 0.5 mm diameter with ProtoPasta Conductive PLA: {:.1f}-{:.1f} kohm.".format(
@@ -1094,18 +1332,28 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             total_high,
         )
     )
+    Rhino.RhinoApp.WriteLine(
+        "Suggested Arduino send-pin resistor: {} to {}. Start with 1.00 Mohm."
+        .format(
+            _format_resistor_value(SUGGESTED_SERIES_RESISTOR_RANGE_OHM[0]),
+            _format_resistor_value(SUGGESTED_SERIES_RESISTOR_RANGE_OHM[1]),
+        )
+    )
 
     for label, length_value in zip(route_labels[1:-1], cumulative_lengths[1:-1]):
         low, high = _resistance_range_kohm(doc, length_value)
+        nominal = _nominal_resistance_kohm(doc, length_value)
         Rhino.RhinoApp.WriteLine(
-            "{} is approximately {:.1f}-{:.1f} kohm from the start terminal.".format(
+            "{} is approximately {:.1f}-{:.1f} kohm from the start terminal (nominal {:.1f} kohm).".format(
                 label,
                 low,
                 high,
+                nominal,
             )
         )
 
     Rhino.RhinoApp.WriteLine(
-        "Generated fixed 0.5 mm conductive pathing with 0.5 mm casing thickness, 0.5 mm wall clearance, 3 mm touch nodes, and 3 mm x 6 mm terminal connectors."
+        "Generated fixed 0.5 mm conductive pathing with 0.5 mm casing thickness, 0.5 mm wall clearance, a user-set conductive pathway node flush diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
+        .format(flush_node_diameter_mm)
     )
     return Rhino.Commands.Result.Success

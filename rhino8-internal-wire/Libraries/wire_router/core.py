@@ -166,6 +166,8 @@ def route_node_sequence(
     penalty_weight: float = 10.0,
     blocked_radius: int = 0,
     blocked_exemption_radius: int = 0,
+    reserved_cells: Optional[Set[GridIndex]] = None,
+    reserved_exemption_radius: int = 0,
     node_labels: Optional[Sequence[str]] = None,
     allow_diagonals: bool = True,
 ) -> List[List[GridIndex]]:
@@ -178,9 +180,19 @@ def route_node_sequence(
     segments: List[List[GridIndex]] = []
     penalty_cells: Set[GridIndex] = set()
     blocked_cells: Set[GridIndex] = set()
+    reserved = reserved_cells or set()
 
     for segment_index, (start, goal) in enumerate(zip(node_sequence[:-1], node_sequence[1:])):
         segment_valid_cells = set(valid_cells)
+        if reserved:
+            local_reserved = set(reserved)
+            local_reserved.difference_update(
+                dilate_cells({start, goal}, max(0, reserved_exemption_radius))
+            )
+            local_reserved.discard(start)
+            local_reserved.discard(goal)
+            segment_valid_cells.difference_update(local_reserved)
+
         if blocked_cells:
             local_blocked = set(blocked_cells)
             if blocked_exemption_radius > 0:
