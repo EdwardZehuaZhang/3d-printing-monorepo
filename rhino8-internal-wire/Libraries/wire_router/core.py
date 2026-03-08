@@ -102,6 +102,29 @@ def _path_bottleneck_penalty(
     )
 
 
+def _pipe_corridor_radius(roominess: int, bottleneck_threshold: int) -> int:
+    if roominess <= bottleneck_threshold:
+        return 1
+    return min(6, max(2, 1 + ((roominess - bottleneck_threshold + 3) // 4)))
+
+
+def _build_pipe_corridor(
+    pipe_path: Sequence[GridIndex],
+    valid_cells: Set[GridIndex],
+    roominess_map: RoominessMap,
+    bottleneck_threshold: int,
+) -> Set[GridIndex]:
+    corridor: Set[GridIndex] = set()
+    for cell in pipe_path:
+        radius = _pipe_corridor_radius(
+            _roominess(roominess_map, valid_cells, cell),
+            bottleneck_threshold,
+        )
+        corridor.update(candidate for candidate in dilate_cells({cell}, radius) if candidate in valid_cells)
+    corridor.update(pipe_path)
+    return corridor
+
+
 def _path_length(path: Sequence[GridIndex]) -> float:
     if len(path) < 2:
         return 0.0
@@ -271,10 +294,13 @@ def _grow_path_toward_target(
     self_avoid_radius: int,
     roominess_map: RoominessMap,
     bottleneck_threshold: int,
+    growth_valid_cells: Optional[Set[GridIndex]] = None,
 ) -> List[GridIndex]:
     grown = list(path)
     if len(grown) < 2:
         return grown
+
+    candidate_valid_cells = growth_valid_cells or valid_cells
 
     current_length = _path_length(grown)
     if current_length + 1e-9 >= target_length:
@@ -291,8 +317,8 @@ def _grow_path_toward_target(
         edge_indices = sorted(
             range(len(grown) - 1),
             key=lambda index: min(
-                _roominess(roominess_map, valid_cells, grown[index]),
-                _roominess(roominess_map, valid_cells, grown[index + 1]),
+                _roominess(roominess_map, candidate_valid_cells, grown[index]),
+                _roominess(roominess_map, candidate_valid_cells, grown[index + 1]),
             ),
             reverse=True,
         )
@@ -316,7 +342,7 @@ def _grow_path_toward_target(
             ):
                 if not _is_valid_detour_candidate(
                     candidate,
-                    valid_cells,
+                    candidate_valid_cells,
                     local_occupied,
                     self_avoid_radius,
                 ):
@@ -684,20 +710,34 @@ def _segment_candidate_paths(
     self_avoid_radius: int = 0,
     max_candidates: int = 14,
     vertical_move_penalty: float = 0.0,
+    roominess_map: Optional[RoominessMap] = None,
+    bottleneck_threshold: Optional[int] = None,
 ) -> List[List[GridIndex]]:
-    roominess_map = _build_roominess_map(valid_cells)
-    bottleneck_threshold = _bottleneck_threshold(roominess_map)
+    if roominess_map is None:
+        roominess_map = _build_roominess_map(valid_cells)
+    if bottleneck_threshold is None:
+        bottleneck_threshold = _bottleneck_threshold(roominess_map)
     target_first_vertical_penalty = 0.0 if target_length is not None else vertical_move_penalty
 
-    direct_path = astar_path(
+    pipe_path = astar_path(
         valid_cells=valid_cells,
         start=start,
         goal=goal,
         penalty_cells=penalty_cells,
         penalty_weight=penalty_weight,
         allow_diagonals=allow_diagonals,
-        vertical_move_penalty=target_first_vertical_penalty,
+        vertical_move_penalty=vertical_move_penalty,
     )
+    candidate_valid_cells = valid_cells
+    if target_length is not None and not allow_diagonals:
+        candidate_valid_cells = _build_pipe_corridor(
+            pipe_path,
+            valid_cells,
+            roominess_map,
+            bottleneck_threshold,
+        )
+
+    direct_path = pipe_path
 
     candidates: List[List[GridIndex]] = [direct_path]
     if target_length is None:
@@ -705,7 +745,7 @@ def _segment_candidate_paths(
 
     direct_length = _path_length(direct_path)
     candidate_waypoints = _select_detour_waypoints(
-        valid_cells=valid_cells,
+        valid_cells=candidate_valid_cells,
         start=start,
         goal=goal,
         direct_length=direct_length,
@@ -763,7 +803,7 @@ def _segment_candidate_paths(
             try:
                 candidates.append(
                     _route_through_waypoints(
-                        valid_cells=valid_cells,
+                        valid_cells=candidate_valid_cells,
                         waypoint_sequence=(start,) + waypoint_sequence + (goal,),
                         penalty_cells=penalty_cells,
                         penalty_weight=penalty_weight,
@@ -785,6 +825,7 @@ def _segment_candidate_paths(
                 max(0, self_avoid_radius),
                 roominess_map,
                 bottleneck_threshold,
+                growth_valid_cells=candidate_valid_cells,
             )
             for path in unique_candidates
         ]
@@ -1237,6 +1278,8 @@ def route_node_sequence(
 
     segments: List[List[GridIndex]] = []
     reserved = reserved_cells or set()
+    roominess_map = _build_roominess_map(valid_cells)
+    bottleneck_threshold = _bottleneck_threshold(roominess_map)
 
     def _search(
         segment_index: int,
@@ -1288,6 +1331,8 @@ def route_node_sequence(
                 target_length=segment_target_length,
                 self_avoid_radius=max(0, blocked_radius),
                 vertical_move_penalty=vertical_move_penalty,
+                roominess_map=roominess_map,
+                bottleneck_threshold=bottleneck_threshold,
             )
         except RoutingError:
             candidate_paths = []

@@ -337,6 +337,21 @@ class CoreRouterTests(unittest.TestCase):
         self.assertLessEqual(max(layer_band) - min(layer_band), 1)
         self.assertLessEqual(len(layer_band), 2)
 
+    def test_target_length_can_expand_even_with_strong_vertical_penalty(self) -> None:
+        valid_cells = {(x, y, z) for x in range(11) for y in range(7) for z in range(5)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 3, 2), (10, 3, 2)],
+            segment_target_lengths=[26.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            allow_diagonals=False,
+            vertical_move_penalty=6.0,
+        )
+
+        self.assertGreaterEqual(self._segment_length(segments[0]), 26.0)
+
     def test_large_target_uses_repeated_local_serpentine_growth(self) -> None:
         valid_cells = {(x, y, 0) for x in range(14) for y in range(7)}
         segments = route_node_sequence(
