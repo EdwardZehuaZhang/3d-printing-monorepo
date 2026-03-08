@@ -49,6 +49,12 @@ def _distance(a: GridIndex, b: GridIndex) -> float:
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
+def _movement_distance(a: GridIndex, b: GridIndex, allow_diagonals: bool) -> float:
+    if allow_diagonals:
+        return _distance(a, b)
+    return float(abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]))
+
+
 def _path_length(path: Sequence[GridIndex]) -> float:
     if len(path) < 2:
         return 0.0
@@ -103,14 +109,15 @@ def _select_detour_waypoints(
     direct_length: float,
     target_length: float,
     limit: int,
+    allow_diagonals: bool,
 ) -> List[GridIndex]:
     ranked: List[Tuple[Tuple[float, float, float, float], GridIndex]] = []
     for candidate in valid_cells:
         if candidate == start or candidate == goal:
             continue
 
-        start_distance = _distance(start, candidate)
-        goal_distance = _distance(candidate, goal)
+        start_distance = _movement_distance(start, candidate, allow_diagonals)
+        goal_distance = _movement_distance(candidate, goal, allow_diagonals)
         if min(start_distance, goal_distance) < 2.0:
             continue
 
@@ -128,7 +135,35 @@ def _select_detour_waypoints(
         ranked.append((score, candidate))
 
     ranked.sort(key=lambda item: item[0])
-    return [candidate for _, candidate in ranked[:limit]]
+    if len(ranked) <= limit:
+        return [candidate for _, candidate in ranked]
+
+    selected: List[GridIndex] = []
+    selected_set: Set[GridIndex] = set()
+    primary_count = max(4, limit // 3)
+    for _, candidate in ranked[:primary_count]:
+        selected.append(candidate)
+        selected_set.add(candidate)
+
+    pool = [candidate for _, candidate in ranked[: min(len(ranked), limit * 8)]]
+    while len(selected) < limit:
+        best_candidate: Optional[GridIndex] = None
+        best_score: Optional[Tuple[float, float, float]] = None
+        for pool_index, candidate in enumerate(pool):
+            if candidate in selected_set:
+                continue
+            diversity = min(_distance(candidate, existing) for existing in selected)
+            line_distance = _point_to_segment_distance(candidate, start, goal)
+            score = (diversity, line_distance, -float(pool_index))
+            if best_score is None or score > best_score:
+                best_score = score
+                best_candidate = candidate
+        if best_candidate is None:
+            break
+        selected.append(best_candidate)
+        selected_set.add(best_candidate)
+
+    return selected
 
 
 def _route_through_waypoints(
@@ -140,16 +175,24 @@ def _route_through_waypoints(
 ) -> List[GridIndex]:
     combined: List[GridIndex] = []
     consumed_cells: Set[GridIndex] = set()
+    full_sequence = list(waypoint_sequence)
 
-    for start, goal in zip(waypoint_sequence[:-1], waypoint_sequence[1:]):
+    for segment_index, (start, goal) in enumerate(zip(full_sequence[:-1], full_sequence[1:])):
         segment_valid_cells = set(valid_cells)
         if consumed_cells:
             segment_valid_cells.difference_update(consumed_cells)
             segment_valid_cells.add(start)
             segment_valid_cells.add(goal)
 
+        future_waypoints = set(full_sequence[segment_index + 2 :])
+        if future_waypoints:
+            segment_valid_cells.difference_update(future_waypoints)
+            segment_valid_cells.add(start)
+            segment_valid_cells.add(goal)
+
         segment_penalties = set(penalty_cells)
         segment_penalties.update(consumed_cells)
+        segment_penalties.update(future_waypoints)
         segment_penalties.discard(start)
         segment_penalties.discard(goal)
 
@@ -204,6 +247,7 @@ def _route_segment_with_target_length(
         direct_length=direct_length,
         target_length=target_length,
         limit=18,
+        allow_diagonals=allow_diagonals,
     )
 
     for waypoint in candidate_waypoints:
@@ -279,6 +323,31 @@ def _sort_candidate_paths(
     )
 
 
+def _estimate_waypoint_chain_length(
+    start: GridIndex,
+    waypoint_sequence: Sequence[GridIndex],
+    goal: GridIndex,
+    allow_diagonals: bool,
+) -> float:
+    points = [start] + list(waypoint_sequence) + [goal]
+    return sum(
+        _movement_distance(previous, current, allow_diagonals)
+        for previous, current in zip(points[:-1], points[1:])
+    )
+
+
+def _waypoint_chain_spread(
+    waypoint_sequence: Sequence[GridIndex],
+    allow_diagonals: bool,
+) -> float:
+    if len(waypoint_sequence) < 2:
+        return 0.0
+    return min(
+        _movement_distance(previous, current, allow_diagonals)
+        for previous, current in zip(waypoint_sequence[:-1], waypoint_sequence[1:])
+    )
+
+
 def _segment_candidate_paths(
     valid_cells: Set[GridIndex],
     start: GridIndex,
@@ -310,32 +379,49 @@ def _segment_candidate_paths(
         direct_length=direct_length,
         target_length=target_length,
         limit=18,
+        allow_diagonals=allow_diagonals,
     )
 
-    for waypoint in candidate_waypoints:
-        try:
-            candidates.append(
-                _route_through_waypoints(
-                    valid_cells=valid_cells,
-                    waypoint_sequence=(start, waypoint, goal),
-                    penalty_cells=penalty_cells,
-                    penalty_weight=penalty_weight,
-                    allow_diagonals=allow_diagonals,
+    beam: List[Tuple[GridIndex, ...]] = [tuple()]
+    beam_width = 14
+    max_waypoints = 4
+    for _ in range(max_waypoints):
+        expanded: List[Tuple[Tuple[float, bool, float, float], Tuple[GridIndex, ...]]] = []
+        for waypoint_sequence in beam:
+            used = set(waypoint_sequence)
+            for waypoint in candidate_waypoints:
+                if waypoint in used:
+                    continue
+                next_sequence = waypoint_sequence + (waypoint,)
+                estimated_length = _estimate_waypoint_chain_length(
+                    start,
+                    next_sequence,
+                    goal,
+                    allow_diagonals,
                 )
-            )
-        except RoutingError:
-            continue
+                expanded.append(
+                    (
+                        (
+                            abs(estimated_length - target_length),
+                            estimated_length < target_length,
+                            -_waypoint_chain_spread(next_sequence, allow_diagonals),
+                            -estimated_length,
+                        ),
+                        next_sequence,
+                    )
+                )
 
-    pair_candidates = candidate_waypoints[: min(6, len(candidate_waypoints))]
-    for first_waypoint in pair_candidates:
-        for second_waypoint in pair_candidates:
-            if first_waypoint == second_waypoint:
-                continue
+        if not expanded:
+            break
+
+        expanded.sort(key=lambda item: item[0])
+        beam = [sequence for _, sequence in expanded[:beam_width]]
+        for waypoint_sequence in beam:
             try:
                 candidates.append(
                     _route_through_waypoints(
                         valid_cells=valid_cells,
-                        waypoint_sequence=(start, first_waypoint, second_waypoint, goal),
+                        waypoint_sequence=(start,) + waypoint_sequence + (goal,),
                         penalty_cells=penalty_cells,
                         penalty_weight=penalty_weight,
                         allow_diagonals=allow_diagonals,

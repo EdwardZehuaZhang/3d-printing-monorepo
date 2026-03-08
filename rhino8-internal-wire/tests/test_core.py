@@ -258,6 +258,20 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(segments[2][-1], (11, 10, 0))
         self.assertNotIn((9, 10, 0), segments[1][1:-1])
 
+    def test_deeper_waypoint_search_uses_more_open_volume(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(12) for y in range(8)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(1, 1, 0), (10, 6, 0)],
+            segment_target_lengths=[50.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 1)
+        self.assertGreaterEqual(self._segment_length(segments[0]), 50.0)
+
 
 if __name__ == "__main__":
     unittest.main()
