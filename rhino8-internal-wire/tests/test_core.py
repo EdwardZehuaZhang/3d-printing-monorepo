@@ -337,6 +337,22 @@ class CoreRouterTests(unittest.TestCase):
         self.assertLessEqual(max(layer_band) - min(layer_band), 1)
         self.assertLessEqual(len(layer_band), 2)
 
+    def test_large_target_uses_repeated_local_serpentine_growth(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(14) for y in range(7)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 3, 0), (13, 3, 0)],
+            segment_target_lengths=[28.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            allow_diagonals=False,
+        )
+
+        expanded = self._expand_segment(segments[0])
+        self.assertGreaterEqual(self._segment_length(segments[0]), 28.0)
+        self.assertFalse(self._has_nonlocal_close_approach(expanded, radius=1, local_window=3))
+
 
 if __name__ == "__main__":
     unittest.main()

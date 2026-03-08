@@ -91,6 +91,222 @@ def _path_xy_footprint(path: Sequence[GridIndex]) -> int:
     return (max(x_values) - min(x_values) + 1) * (max(y_values) - min(y_values) + 1)
 
 
+def _offset_index(index: GridIndex, offset: GridIndex, scale: int = 1) -> GridIndex:
+    return (
+        index[0] + (offset[0] * scale),
+        index[1] + (offset[1] * scale),
+        index[2] + (offset[2] * scale),
+    )
+
+
+def _negate_offset(offset: GridIndex) -> GridIndex:
+    return (-offset[0], -offset[1], -offset[2])
+
+
+def _nonzero_axis(offset: GridIndex) -> int:
+    for axis, value in enumerate(offset):
+        if value != 0:
+            return axis
+    raise ValueError("Offset has no non-zero axis.")
+
+
+def _orthogonal_offsets(step_offset: GridIndex) -> List[GridIndex]:
+    axis = _nonzero_axis(step_offset)
+    offsets: List[GridIndex] = []
+    for orthogonal_axis in range(3):
+        if orthogonal_axis == axis:
+            continue
+        positive = [0, 0, 0]
+        positive[orthogonal_axis] = 1
+        offsets.append((positive[0], positive[1], positive[2]))
+        offsets.append((-positive[0], -positive[1], -positive[2]))
+    return offsets
+
+
+def _segment_step_offset(start: GridIndex, goal: GridIndex) -> Optional[GridIndex]:
+    dx = goal[0] - start[0]
+    dy = goal[1] - start[1]
+    dz = goal[2] - start[2]
+    if abs(dx) + abs(dy) + abs(dz) != 1:
+        return None
+    return (dx, dy, dz)
+
+
+def _has_nonlocal_close_approach(
+    path: Sequence[GridIndex],
+    radius: int,
+    local_window: int = 3,
+) -> bool:
+    if radius <= 0:
+        return len(set(path)) != len(path)
+
+    for current_index, current in enumerate(path):
+        for previous_index in range(0, max(0, current_index - local_window)):
+            previous = path[previous_index]
+            if max(
+                abs(current[0] - previous[0]),
+                abs(current[1] - previous[1]),
+                abs(current[2] - previous[2]),
+            ) <= radius:
+                return True
+    return False
+
+
+def _candidate_edge_detours(
+    start: GridIndex,
+    goal: GridIndex,
+    max_primary_depth: int,
+    max_secondary_depth: int,
+) -> List[List[GridIndex]]:
+    step_offset = _segment_step_offset(start, goal)
+    if step_offset is None:
+        return []
+
+    candidates: List[List[GridIndex]] = []
+    orthogonal = _orthogonal_offsets(step_offset)
+    for primary_offset in orthogonal:
+        for primary_depth in range(1, max_primary_depth + 1):
+            simple: List[GridIndex] = [start]
+            current = start
+            for _ in range(primary_depth):
+                current = _offset_index(current, primary_offset)
+                simple.append(current)
+            current = _offset_index(current, step_offset)
+            simple.append(current)
+            for _ in range(primary_depth):
+                current = _offset_index(current, _negate_offset(primary_offset))
+                simple.append(current)
+            candidates.append(simple)
+
+            for secondary_offset in orthogonal:
+                if _nonzero_axis(secondary_offset) == _nonzero_axis(primary_offset):
+                    continue
+                for secondary_depth in range(1, max_secondary_depth + 1):
+                    boxed: List[GridIndex] = [start]
+                    current = start
+                    for _ in range(primary_depth):
+                        current = _offset_index(current, primary_offset)
+                        boxed.append(current)
+                    for _ in range(secondary_depth):
+                        current = _offset_index(current, secondary_offset)
+                        boxed.append(current)
+                    current = _offset_index(current, step_offset)
+                    boxed.append(current)
+                    for _ in range(secondary_depth):
+                        current = _offset_index(current, _negate_offset(secondary_offset))
+                        boxed.append(current)
+                    for _ in range(primary_depth):
+                        current = _offset_index(current, _negate_offset(primary_offset))
+                        boxed.append(current)
+                    candidates.append(boxed)
+
+    return candidates
+
+
+def _is_valid_detour_candidate(
+    candidate: Sequence[GridIndex],
+    valid_cells: Set[GridIndex],
+    occupied_cells: Set[GridIndex],
+    self_avoid_radius: int,
+) -> bool:
+    if len(set(candidate)) != len(candidate):
+        return False
+    if any(cell not in valid_cells for cell in candidate):
+        return False
+
+    internal = set(candidate[1:-1])
+    if internal & occupied_cells:
+        return False
+
+    if self_avoid_radius <= 0:
+        return True
+
+    blocked_cells = dilate_cells(occupied_cells, self_avoid_radius)
+    if internal & blocked_cells:
+        return False
+
+    return not _has_nonlocal_close_approach(candidate, self_avoid_radius)
+
+
+def _grow_path_toward_target(
+    path: Sequence[GridIndex],
+    valid_cells: Set[GridIndex],
+    target_length: float,
+    self_avoid_radius: int,
+) -> List[GridIndex]:
+    grown = list(path)
+    if len(grown) < 2:
+        return grown
+
+    current_length = _path_length(grown)
+    if current_length + 1e-9 >= target_length:
+        return grown
+
+    max_iterations = max(32, int(target_length - current_length) * 2)
+    for _ in range(max_iterations):
+        if current_length + 1e-9 >= target_length:
+            break
+
+        edge_indices = sorted(
+            range(len(grown) - 1),
+            key=lambda index: min(
+                _local_roominess(valid_cells, grown[index]),
+                _local_roominess(valid_cells, grown[index + 1]),
+            ),
+            reverse=True,
+        )
+
+        best_replacement: Optional[List[GridIndex]] = None
+        best_score: Optional[Tuple[float, bool, int, int, int, float]] = None
+        for edge_index in edge_indices:
+            start = grown[edge_index]
+            goal = grown[edge_index + 1]
+            if _segment_step_offset(start, goal) is None:
+                continue
+
+            local_exemption = dilate_cells({start, goal}, max(1, self_avoid_radius + 1))
+            local_occupied = {cell for cell in grown if cell not in local_exemption}
+
+            for candidate in _candidate_edge_detours(
+                start,
+                goal,
+                max_primary_depth=6,
+                max_secondary_depth=4,
+            ):
+                if not _is_valid_detour_candidate(
+                    candidate,
+                    valid_cells,
+                    local_occupied,
+                    self_avoid_radius,
+                ):
+                    continue
+
+                expanded_path = grown[:edge_index] + candidate + grown[edge_index + 2 :]
+                if _has_nonlocal_close_approach(expanded_path, self_avoid_radius):
+                    continue
+
+                expanded_length = _path_length(expanded_path)
+                score = (
+                    abs(expanded_length - target_length),
+                    expanded_length < target_length,
+                    _path_vertical_span(expanded_path),
+                    _path_layer_count(expanded_path),
+                    _path_xy_footprint(expanded_path),
+                    -expanded_length,
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_replacement = expanded_path
+
+        if best_replacement is None:
+            break
+
+        grown = best_replacement
+        current_length = _path_length(grown)
+
+    return grown
+
+
 def _point_to_segment_distance(point: GridIndex, start: GridIndex, goal: GridIndex) -> float:
     px, py, pz = (float(value) for value in point)
     sx, sy, sz = (float(value) for value in start)
@@ -487,6 +703,17 @@ def _segment_candidate_paths(
                 continue
 
     unique_candidates = _dedupe_paths(candidates)
+    if target_length is not None and not allow_diagonals:
+        grown_candidates = [
+            _grow_path_toward_target(
+                path,
+                valid_cells,
+                target_length,
+                max(0, self_avoid_radius),
+            )
+            for path in unique_candidates
+        ]
+        unique_candidates = _dedupe_paths(unique_candidates + grown_candidates)
     return _sort_candidate_paths(unique_candidates, target_length)[:max_candidates]
 
 
