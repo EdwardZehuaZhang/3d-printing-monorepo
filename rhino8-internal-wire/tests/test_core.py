@@ -319,6 +319,24 @@ class CoreRouterTests(unittest.TestCase):
         expanded = self._expand_segment(segments[0])
         self.assertFalse(self._has_nonlocal_close_approach(expanded, radius=1, local_window=3))
 
+    def test_target_segment_prefers_same_layer_detour_when_flat_room_exists(self) -> None:
+        valid_cells = {(x, y, z) for x in range(9) for y in range(5) for z in range(3)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 2, 1), (8, 2, 1)],
+            segment_target_lengths=[20.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            allow_diagonals=False,
+            vertical_move_penalty=2.0,
+        )
+
+        expanded = self._expand_segment(segments[0])
+        self.assertGreaterEqual(self._segment_length(segments[0]), 20.0)
+        layer_band = {point[2] for point in expanded}
+        self.assertLessEqual(max(layer_band) - min(layer_band), 1)
+        self.assertLessEqual(len(layer_band), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

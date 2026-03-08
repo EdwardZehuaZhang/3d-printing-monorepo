@@ -38,14 +38,13 @@ MIN_TOUCH_NODE_FLUSH_DIAMETER_MM = 0.5
 TERMINAL_DIAMETER_MM = 3.0
 TERMINAL_LENGTH_MM = 6.0
 MAX_DP_NODES = 10
-REFERENCE_TOUCH_READING_DELTA_KOHM = 50.0
-REFERENCE_TOUCH_READING_DIAMETER_MM = 1.0
-MIN_RECOMMENDED_TOUCH_READING_DELTA_KOHM = 20.0
-MAX_RECOMMENDED_TOUCH_READING_DELTA_KOHM = 250.0
+DEFAULT_TOUCH_READING_DELTA_KOHM = 50.0
 MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
 PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
+PRINT_LAYER_HEIGHT_MM = 0.2
+LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
 
 
 @dataclass(frozen=True)
@@ -151,7 +150,7 @@ def _host_brep_from_objref(objref: Rhino.DocObjects.ObjRef, tolerance: float) ->
 
 def _select_target_geometry() -> Optional[Rhino.DocObjects.ObjRef]:
     go = ric.GetObject()
-    go.SetCommandPrompt("Select one closed object to route inside")
+    go.SetCommandPrompt("Select one closed solid to route the conductive trace inside")
     go.GeometryFilter = (
         rd.ObjectType.Mesh
         | rd.ObjectType.Brep
@@ -570,17 +569,17 @@ def _validate_touch_node(
     tolerance: float,
 ) -> Optional[str]:
     if candidate is None:
-        return "That conductive pathway node sphere diameter is too big for the selected surface location."
+        return "That touch node is too large for the selected surface location."
 
     for node in touch_nodes:
         edge_gap = candidate.center_point.DistanceTo(node.center_point) - (node_radius * 2.0)
         if edge_gap + tolerance < min_gap:
-            return "That conductive pathway node sphere diameter is too big and overlaps another conductive pathway node."
+            return "That touch node is too large and overlaps another touch node."
 
     for terminal in terminals:
         edge_gap = candidate.center_point.DistanceTo(terminal.surface_point) - (node_radius + terminal_radius)
         if edge_gap + tolerance < min_gap:
-            return "That conductive pathway node sphere diameter is too big and overlaps a terminal connector."
+            return "That touch node is too large and overlaps a terminal connector."
     return None
 
 
@@ -694,7 +693,7 @@ def _collect_terminals(
 
     for label in ("Start", "End"):
         gp = _TerminalGetter(mesh, label, terminals, terminal_radius, minimum_clearance, tolerance)
-        gp.SetCommandPrompt("Pick the {} terminal on the object".format(label.lower()))
+        gp.SetCommandPrompt("Pick the {} terminal on the outer surface".format(label.lower()))
         gp.Constrain(mesh, False)
         gp.AddOptionToggle("TerminalMode", gp.protrude_toggle)
 
@@ -719,12 +718,12 @@ def _collect_terminals(
                 tolerance,
             )
             if terminal is None:
-                Rhino.RhinoApp.WriteLine("That terminal does not fit on the selected surface.")
+                Rhino.RhinoApp.WriteLine("That terminal does not fit there. Pick a flatter area or an area with more internal space.")
                 continue
 
             if _terminal_conductive_breps(terminal, host_brep, terminal_radius, terminal_length, tolerance) is None:
                 Rhino.RhinoApp.WriteLine(
-                    "The {} terminal cylinder does not fit on the selected surface. Choose a flatter or larger area.".format(
+                    "The {} terminal does not fit there. Choose a flatter or larger area.".format(
                         label.lower()
                     )
                 )
@@ -757,7 +756,7 @@ def _collect_touch_nodes(
             tolerance,
         )
         gp.SetCommandPrompt(
-            "Pick a touch node. Press Enter when done"
+            "Pick a touch node. Press Enter when you are finished adding touch nodes"
         )
         gp.Constrain(mesh, False)
         gp.AcceptNothing(True)
@@ -1086,6 +1085,24 @@ def _reading_delta_length(doc: Rhino.RhinoDoc, delta_kohm: float, wire_diameter_
     return _mm_to_model(doc, required_mm)
 
 
+def _format_length_mm(length_mm: float) -> str:
+    if length_mm >= 1000.0:
+        return "{:.2f} m".format(length_mm / 1000.0)
+    return "{:.1f} mm".format(length_mm)
+
+
+def _polyline_vertical_span(doc: Rhino.RhinoDoc, points: Sequence[rg.Point3d]) -> float:
+    if not points:
+        return 0.0
+    z_values = [point.Z for point in points]
+    return _model_to_mm(doc, max(z_values) - min(z_values))
+
+
+def _vertical_layer_height_span(points: Sequence[rg.Point3d], doc: Rhino.RhinoDoc) -> int:
+    vertical_span_mm = _polyline_vertical_span(doc, points)
+    return max(1, int(math.ceil(vertical_span_mm / PRINT_LAYER_HEIGHT_MM)))
+
+
 def _format_resistor_value(ohms: float) -> str:
     if ohms >= 1000000.0:
         return "{:.2f} Mohm".format(ohms / 1000000.0)
@@ -1109,7 +1126,7 @@ def _write_touch_step_report(
     heading: str,
 ) -> None:
     if len(touch_node_labels) < 2 or len(touch_segment_lengths) < 1:
-        Rhino.RhinoApp.WriteLine("{} Not enough touch nodes to calculate touch-to-touch resistance steps.".format(heading))
+        Rhino.RhinoApp.WriteLine("{} Add at least two touch nodes to compare their resistance spacing.".format(heading))
         return
 
     Rhino.RhinoApp.WriteLine(heading)
@@ -1131,7 +1148,7 @@ def _write_touch_step_report(
 
 def _get_touch_node_flush_diameter_mm() -> Optional[float]:
     getter = ric.GetNumber()
-    getter.SetCommandPrompt("Set the conductive pathway node sphere diameter in millimeters")
+    getter.SetCommandPrompt("Set the touch node diameter in millimeters")
     getter.SetDefaultNumber(DEFAULT_TOUCH_NODE_FLUSH_DIAMETER_MM)
     getter.AcceptNothing(True)
 
@@ -1146,14 +1163,14 @@ def _get_touch_node_flush_diameter_mm() -> Optional[float]:
 
         value = getter.Number()
         if value + 1e-9 < MIN_TOUCH_NODE_FLUSH_DIAMETER_MM:
-            Rhino.RhinoApp.WriteLine("Conductive pathway node sphere diameter is too small. It must be at least 0.5 mm.")
+            Rhino.RhinoApp.WriteLine("The touch node diameter is too small. It must be at least 0.5 mm.")
             continue
         return value
 
 
 def _get_conductive_path_diameter_mm(maximum_diameter_mm: float) -> Optional[float]:
     getter = ric.GetNumber()
-    getter.SetCommandPrompt("Set the conductive path diameter in millimeters")
+    getter.SetCommandPrompt("Set the conductive trace diameter in millimeters")
     getter.SetDefaultNumber(DEFAULT_WIRE_DIAMETER_MM)
     getter.AcceptNothing(True)
 
@@ -1169,11 +1186,11 @@ def _get_conductive_path_diameter_mm(maximum_diameter_mm: float) -> Optional[flo
             continue
 
         if value + 1e-9 < MIN_WIRE_DIAMETER_MM:
-            Rhino.RhinoApp.WriteLine("Conductive path diameter is too small. It must be at least 0.5 mm.")
+            Rhino.RhinoApp.WriteLine("The conductive trace diameter is too small. It must be at least 0.5 mm.")
             continue
         if value - 1e-9 > maximum_diameter_mm:
             Rhino.RhinoApp.WriteLine(
-                "Conductive path diameter is too large. It cannot exceed the selected conductive pathway node diameter of {:.2f} mm.".format(
+                "The conductive trace diameter is too large. It cannot be larger than the touch node diameter of {:.2f} mm.".format(
                     maximum_diameter_mm
                 )
             )
@@ -1182,20 +1199,14 @@ def _get_conductive_path_diameter_mm(maximum_diameter_mm: float) -> Optional[flo
 
 
 def _recommended_touch_reading_delta_kohm(wire_diameter_mm: float) -> float:
-    scaled = REFERENCE_TOUCH_READING_DELTA_KOHM * (
-        REFERENCE_TOUCH_READING_DIAMETER_MM / wire_diameter_mm
-    ) ** 2
-    bounded = max(
-        MIN_RECOMMENDED_TOUCH_READING_DELTA_KOHM,
-        min(MAX_RECOMMENDED_TOUCH_READING_DELTA_KOHM, scaled),
-    )
-    return round(bounded / 5.0) * 5.0
+    _ = wire_diameter_mm
+    return DEFAULT_TOUCH_READING_DELTA_KOHM
 
 
 def _get_target_touch_reading_delta_kohm(wire_diameter_mm: float) -> Optional[float]:
     recommended_delta_kohm = _recommended_touch_reading_delta_kohm(wire_diameter_mm)
     getter = ric.GetNumber()
-    getter.SetCommandPrompt("Set the desired touch-to-touch resistance between successive nodes in kohm")
+    getter.SetCommandPrompt("Set the target resistance difference between neighboring touch nodes in kohm")
     getter.SetDefaultNumber(recommended_delta_kohm)
     getter.AcceptNothing(True)
 
@@ -1211,7 +1222,7 @@ def _get_target_touch_reading_delta_kohm(wire_diameter_mm: float) -> Optional[fl
         value = getter.Number()
         if value + 1e-9 < MIN_ALLOWED_TOUCH_READING_DELTA_KOHM:
             Rhino.RhinoApp.WriteLine(
-                "Desired touch-to-touch resistance is too small. It must be at least 1.0 kohm."
+                "The target resistance difference is too small. It must be at least 1.0 kohm."
             )
             continue
         return value
@@ -1308,7 +1319,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     host_brep = _host_brep_from_objref(objref, tolerance)
     if mesh is None or host_brep is None:
         Rhino.RhinoApp.WriteLine(
-            "The selected object must be a closed mesh or a solid that can be converted to a closed solid."
+            "The selected object must be a closed mesh or a solid that Rhino can treat as a closed volume."
         )
         return Rhino.Commands.Result.Failure
 
@@ -1330,6 +1341,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     node_radius = _mm_to_model(doc, flush_node_diameter_mm * 0.5)
     step = _auto_step(mesh, doc, wire_diameter_mm)
     target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm, wire_diameter_mm)
+    target_leg_length_mm = _model_to_mm(doc, target_leg_length)
 
     terminals = _collect_terminals(
         mesh,
@@ -1354,11 +1366,11 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if touch_nodes is None:
         return Rhino.Commands.Result.Cancel
 
-    Rhino.RhinoApp.WriteLine("Building routing grid...")
+    Rhino.RhinoApp.WriteLine("Preparing the internal routing grid...")
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
-            "No valid routing cells were found. The object is not large enough for {:.2f} mm conductive pathing while keeping the retained 0.5 mm virtual clearance margin and 0.5 mm wall clearance."
+            "No valid routing space was found. The part is too small for a {:.2f} mm conductive trace while also keeping 0.5 mm clearance from the outer wall and 0.5 mm spacing around the trace."
             .format(wire_diameter_mm)
         )
         return Rhino.Commands.Result.Failure
@@ -1401,7 +1413,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             node_cells.append(cell)
         if mapping_failed:
             Rhino.RhinoApp.WriteLine(
-                "A selected terminal or node could not be mapped into the routing volume. Choose a location with more internal space."
+                "A selected terminal or touch node could not be placed into the usable internal volume. Choose a location with more internal space."
             )
             return Rhino.Commands.Result.Failure
 
@@ -1426,6 +1438,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                 reserved_exemption_radius=reserved_exemption_radius,
                 node_labels=route_labels,
                 allow_diagonals=False,
+                vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
             )
         except RoutingError as error:
             if first_failure_reason is None:
@@ -1443,24 +1456,22 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if selected_candidate is None:
         if first_failure_reason is not None and first_failure_order is not None:
             Rhino.RhinoApp.WriteLine(
-                "No routable node order could fit the selected geometry constraints after checking {} target-ranked candidate orders.".format(
+                "No touch-node order could be routed after checking {} candidate order(s).".format(
                     attempted_orders
                 )
             )
             Rhino.RhinoApp.WriteLine(
-                "The closest resistance-target order was {} and failed because {}".format(
+                "The closest match to the target was {}. It failed because {}".format(
                     " -> ".join(first_failure_order),
                     first_failure_reason.rstrip("."),
                 )
             )
             Rhino.RhinoApp.WriteLine(
-                "This does not necessarily mean the object is too small overall. It means the selected 3D order, the protected zones around terminals and nodes, the {:.2f} mm conductive path diameter, the retained 0.5 mm virtual clearance margin, the 0.5 mm inter-path spacing, and the 0.5 mm wall clearance left no local corridor for at least one required segment.".format(
-                    wire_diameter_mm
-                )
+                "This does not always mean the whole part is too small. It means at least one segment did not have enough local space once the trace diameter, node protection zones, wall clearance, and trace spacing were applied."
             )
         else:
             Rhino.RhinoApp.WriteLine(
-                "No routable node order could be found for the selected geometry and current pathing constraints."
+                "No valid route could be found with the current geometry and spacing rules."
             )
         return Rhino.Commands.Result.Failure
 
@@ -1468,37 +1479,44 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     ordered_labels = [node.label for node in ordered_touch_nodes]
     if ordered_labels:
         Rhino.RhinoApp.WriteLine(
-            "Target touch-to-touch resistance per successive node pair: {:.1f} kohm.".format(
+            "Target resistance difference between neighboring touch nodes: {:.1f} kohm.".format(
                 target_touch_reading_delta_kohm
+            )
+        )
+        Rhino.RhinoApp.WriteLine(
+            "With the current ProtoPasta model, that target needs about {} of conductive trace between each neighboring pair of touch nodes.".format(
+                _format_length_mm(target_leg_length_mm)
             )
         )
         if attempted_orders > 1:
             Rhino.RhinoApp.WriteLine(
-                "Used the closest routable node order after rejecting {} closer target-ranked order(s) that could not fit the routing constraints.".format(
+                "Used the nearest routable touch-node order after rejecting {} closer candidate order(s) that did not fit.".format(
                     attempted_orders - 1
                 )
             )
         Rhino.RhinoApp.WriteLine(
-            "Selected touch-node order: {}".format(" -> ".join(ordered_labels))
+            "Chosen touch-node order: {}".format(" -> ".join(ordered_labels))
         )
         _write_touch_step_report(
             doc,
             ordered_labels,
             selected_candidate.metrics.touch_leg_lengths,
             wire_diameter_mm,
-            "Estimated touch-to-touch resistance steps before routing:",
+            "Estimated resistance difference before routing:",
         )
 
     polyline_points = _segments_to_polyline_points(selected_route_points, selected_segments, grid, tolerance)
     cumulative_lengths = _cumulative_anchor_lengths(polyline_points, selected_route_points, tolerance)
     touch_segment_lengths = _touch_segment_lengths_from_cumulative_lengths(cumulative_lengths)
+    vertical_span_mm = _polyline_vertical_span(doc, polyline_points)
+    vertical_layer_span = _vertical_layer_height_span(polyline_points, doc)
     if ordered_labels:
         _write_touch_step_report(
             doc,
             ordered_labels,
             touch_segment_lengths,
             wire_diameter_mm,
-            "Actual touch-to-touch resistance steps after routing:",
+            "Estimated resistance difference from the final routed trace:",
         )
 
     if not _add_output_geometry(
@@ -1513,35 +1531,42 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         terminal_length,
     ):
         Rhino.RhinoApp.WriteLine(
-            "Failed to add the conductive path or conductive pathway node solids to the document."
+            "The route was calculated, but Rhino could not add the conductive trace or touch-node solids to the document."
         )
         return Rhino.Commands.Result.Failure
 
     total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1], wire_diameter_mm)
     Rhino.RhinoApp.WriteLine(
-        "Estimated start-to-end conductive resistance at {:.2f} mm diameter with ProtoPasta Conductive PLA: {:.1f}-{:.1f} kohm.".format(
+        "Estimated total resistance from the start terminal to the end terminal at {:.2f} mm trace diameter: {:.1f}-{:.1f} kohm.".format(
             wire_diameter_mm,
             total_low,
             total_high,
         )
     )
     Rhino.RhinoApp.WriteLine(
-        "Suggested Arduino send-pin resistor: {} to {}. Start with 1.00 Mohm."
+        "Recommended Arduino series resistor: {} to {}. A good starting value is 1.00 Mohm."
         .format(
             _format_resistor_value(SUGGESTED_SERIES_RESISTOR_RANGE_OHM[0]),
             _format_resistor_value(SUGGESTED_SERIES_RESISTOR_RANGE_OHM[1]),
         )
     )
     Rhino.RhinoApp.WriteLine(
-        "Distinct-touch targeting aimed for {:.1f} kohm per touch-to-touch step at {:.2f} mm path diameter. Start and end terminal legs were excluded from the order search, and the final reported values show the nearest routable result."
+        "The touch-node order search aimed for {:.1f} kohm between neighboring touch nodes at a {:.2f} mm trace diameter. The short terminal lead-in and lead-out segments were not included in that target."
         .format(
             target_touch_reading_delta_kohm,
             wire_diameter_mm,
         )
     )
+    Rhino.RhinoApp.WriteLine(
+        "The final route spans about {:.1f} mm vertically, which is about {} print layers at 0.2 mm layer height when the shape allows it."
+        .format(
+            vertical_span_mm,
+            vertical_layer_span,
+        )
+    )
 
     Rhino.RhinoApp.WriteLine(
-        "Generated {:.2f} mm conductive pathing with a retained 0.5 mm virtual clearance margin, 0.5 mm wall clearance, a user-set conductive pathway node sphere diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
+        "Created a {:.2f} mm conductive trace with {:.2f} mm touch nodes, 3 mm x 6 mm terminal connectors, 0.5 mm wall clearance, and 0.5 mm trace spacing."
         .format(wire_diameter_mm, flush_node_diameter_mm)
     )
     return Rhino.Commands.Result.Success

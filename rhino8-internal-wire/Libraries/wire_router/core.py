@@ -72,6 +72,25 @@ def _path_length(path: Sequence[GridIndex]) -> float:
     return sum(_distance(start, end) for start, end in zip(path[:-1], path[1:]))
 
 
+def _path_vertical_span(path: Sequence[GridIndex]) -> int:
+    if not path:
+        return 0
+    z_values = [point[2] for point in path]
+    return max(z_values) - min(z_values)
+
+
+def _path_layer_count(path: Sequence[GridIndex]) -> int:
+    return len({point[2] for point in path})
+
+
+def _path_xy_footprint(path: Sequence[GridIndex]) -> int:
+    if not path:
+        return 0
+    x_values = [point[0] for point in path]
+    y_values = [point[1] for point in path]
+    return (max(x_values) - min(x_values) + 1) * (max(y_values) - min(y_values) + 1)
+
+
 def _point_to_segment_distance(point: GridIndex, start: GridIndex, goal: GridIndex) -> float:
     px, py, pz = (float(value) for value in point)
     sx, sy, sz = (float(value) for value in start)
@@ -138,8 +157,10 @@ def _select_detour_waypoints(
 
         line_distance = _point_to_segment_distance(candidate, start, goal)
         roominess = _local_roominess(valid_cells, candidate)
+        midplane_offset = abs((candidate[2] * 2) - (start[2] + goal[2]))
         score = (
             abs(total_distance - target_length),
+            midplane_offset,
             -roominess,
             -line_distance,
             -min(start_distance, goal_distance),
@@ -187,6 +208,7 @@ def _route_through_waypoints(
     penalty_weight: float,
     allow_diagonals: bool,
     self_avoid_radius: int,
+    vertical_move_penalty: float,
 ) -> List[GridIndex]:
     combined: List[GridIndex] = []
     consumed_cells: Set[GridIndex] = set()
@@ -219,6 +241,7 @@ def _route_through_waypoints(
             penalty_cells=segment_penalties,
             penalty_weight=penalty_weight,
             allow_diagonals=allow_diagonals,
+            vertical_move_penalty=vertical_move_penalty,
         )
 
         if combined:
@@ -238,6 +261,7 @@ def _route_segment_with_target_length(
     penalty_weight: float,
     allow_diagonals: bool,
     target_length: Optional[float],
+    vertical_move_penalty: float = 0.0,
 ) -> List[GridIndex]:
     direct_path = astar_path(
         valid_cells=valid_cells,
@@ -246,6 +270,7 @@ def _route_segment_with_target_length(
         penalty_cells=penalty_cells,
         penalty_weight=penalty_weight,
         allow_diagonals=allow_diagonals,
+        vertical_move_penalty=vertical_move_penalty,
     )
     if target_length is None:
         return direct_path
@@ -275,6 +300,7 @@ def _route_segment_with_target_length(
                 penalty_weight=penalty_weight,
                 allow_diagonals=allow_diagonals,
                 self_avoid_radius=0,
+                vertical_move_penalty=vertical_move_penalty,
             )
         except RoutingError:
             continue
@@ -300,6 +326,7 @@ def _route_segment_with_target_length(
                     penalty_weight=penalty_weight,
                     allow_diagonals=allow_diagonals,
                     self_avoid_radius=0,
+                    vertical_move_penalty=vertical_move_penalty,
                 )
             except RoutingError:
                 continue
@@ -336,6 +363,9 @@ def _sort_candidate_paths(
         key=lambda path: (
             abs(_path_length(path) - target_length),
             _path_length(path) < target_length,
+            _path_vertical_span(path),
+            _path_layer_count(path),
+            _path_xy_footprint(path),
             -_path_length(path),
         ),
     )
@@ -376,6 +406,7 @@ def _segment_candidate_paths(
     target_length: Optional[float],
     self_avoid_radius: int = 0,
     max_candidates: int = 14,
+    vertical_move_penalty: float = 0.0,
 ) -> List[List[GridIndex]]:
     direct_path = astar_path(
         valid_cells=valid_cells,
@@ -384,6 +415,7 @@ def _segment_candidate_paths(
         penalty_cells=penalty_cells,
         penalty_weight=penalty_weight,
         allow_diagonals=allow_diagonals,
+        vertical_move_penalty=vertical_move_penalty,
     )
 
     candidates: List[List[GridIndex]] = [direct_path]
@@ -423,6 +455,9 @@ def _segment_candidate_paths(
                         (
                             abs(estimated_length - target_length),
                             estimated_length < target_length,
+                            _path_vertical_span((start,) + next_sequence + (goal,)),
+                            _path_layer_count((start,) + next_sequence + (goal,)),
+                            _path_xy_footprint((start,) + next_sequence + (goal,)),
                             -_waypoint_chain_spread(next_sequence, allow_diagonals),
                             -estimated_length,
                         ),
@@ -445,6 +480,7 @@ def _segment_candidate_paths(
                         penalty_weight=penalty_weight,
                         allow_diagonals=allow_diagonals,
                         self_avoid_radius=self_avoid_radius,
+                        vertical_move_penalty=vertical_move_penalty,
                     )
                 )
             except RoutingError:
@@ -494,6 +530,7 @@ def astar_path(
     penalty_cells: Optional[Set[GridIndex]] = None,
     penalty_weight: float = 0.0,
     allow_diagonals: bool = True,
+    vertical_move_penalty: float = 0.0,
 ) -> List[GridIndex]:
     if start not in valid_cells:
         raise RoutingError(f"Start cell {start} is not inside the valid routing grid.")
@@ -526,6 +563,8 @@ def astar_path(
                 continue
 
             tentative = current_cost + move_cost
+            if vertical_move_penalty > 0.0 and offset[2] != 0:
+                tentative += vertical_move_penalty * abs(offset[2])
             if neighbor in penalties:
                 tentative += penalty_weight
 
@@ -877,6 +916,7 @@ def route_node_sequence(
     reserved_exemption_radius: int = 0,
     node_labels: Optional[Sequence[str]] = None,
     allow_diagonals: bool = True,
+    vertical_move_penalty: float = 0.0,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
@@ -939,6 +979,7 @@ def route_node_sequence(
                 allow_diagonals=allow_diagonals,
                 target_length=segment_target_length,
                 self_avoid_radius=max(0, blocked_radius),
+                vertical_move_penalty=vertical_move_penalty,
             )
         except RoutingError:
             candidate_paths = []
