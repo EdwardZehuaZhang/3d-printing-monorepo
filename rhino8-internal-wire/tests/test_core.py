@@ -1,0 +1,51 @@
+from pathlib import Path
+import sys
+import unittest
+
+LIBRARIES = Path(__file__).resolve().parents[1] / "Libraries"
+if str(LIBRARIES) not in sys.path:
+    sys.path.insert(0, str(LIBRARIES))
+
+from wire_router.core import GridSpec, route_node_sequence
+
+
+class CoreRouterTests(unittest.TestCase):
+    def test_routes_around_block(self) -> None:
+        valid_cells = {
+            (x, y, 0)
+            for x in range(5)
+            for y in range(5)
+            if (x, y, 0) != (2, 2, 0)
+        }
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 0, 0), (4, 4, 0)],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 1)
+        self.assertNotIn((2, 2, 0), segments[0])
+        self.assertEqual(segments[0][0], (0, 0, 0))
+        self.assertEqual(segments[0][-1], (4, 4, 0))
+
+    def test_routes_multiple_segments(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(6) for y in range(3)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 1, 0), (2, 1, 0), (5, 1, 0)],
+            penalty_radius=1,
+            penalty_weight=5.0,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0][0], (0, 1, 0))
+        self.assertEqual(segments[0][-1], (2, 1, 0))
+        self.assertEqual(segments[1][0], (2, 1, 0))
+        self.assertEqual(segments[1][-1], (5, 1, 0))
+
+
+if __name__ == "__main__":
+    unittest.main()
