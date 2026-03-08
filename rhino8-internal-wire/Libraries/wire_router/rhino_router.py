@@ -1216,6 +1216,18 @@ def _protected_anchor_cells(
     return protected, max_radius
 
 
+def _segment_target_lengths(
+    route_points: Sequence[rg.Point3d],
+    target_touch_leg_length: float,
+) -> List[Optional[float]]:
+    targets: List[Optional[float]] = [None for _ in range(max(0, len(route_points) - 1))]
+    for segment_index in range(1, max(1, len(route_points) - 2)):
+        if segment_index >= len(targets) - 1:
+            break
+        targets[segment_index] = target_touch_leg_length
+    return targets
+
+
 def _add_output_geometry(
     doc: Rhino.RhinoDoc,
     host_brep: rg.Brep,
@@ -1331,7 +1343,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
-            "No valid routing cells were found. The object is not large enough for {:.2f} mm conductive pathing with the retained 0.5 mm casing-equivalent clearance margin and 0.5 mm wall clearance."
+            "No valid routing cells were found. The object is not large enough for {:.2f} mm conductive pathing while keeping the retained 0.5 mm virtual clearance margin and 0.5 mm wall clearance."
             .format(wire_diameter_mm)
         )
         return Rhino.Commands.Result.Failure
@@ -1362,6 +1374,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         ordered_touch_nodes = list(candidate.ordered_nodes)
         route_points = [start_terminal.anchor_point] + [node.anchor_point for node in ordered_touch_nodes] + [end_terminal.anchor_point]
         route_labels = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
+        segment_target_lengths = _segment_target_lengths(route_points, target_leg_length)
 
         node_cells: List[GridIndex] = []
         mapping_failed = False
@@ -1389,6 +1402,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             segments = route_node_sequence(
                 valid_cells=valid_cells,
                 node_sequence=node_cells,
+                segment_target_lengths=segment_target_lengths,
                 penalty_radius=0,
                 penalty_weight=step,
                 blocked_radius=spacing_radius,
@@ -1425,7 +1439,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                 )
             )
             Rhino.RhinoApp.WriteLine(
-                "This does not necessarily mean the rectangle is too small overall. It means the selected 3D order, the protected zones around terminals and nodes, the {:.2f} mm conductive path diameter, the retained 0.5 mm casing-equivalent clearance margin, the 0.5 mm inter-path spacing, and the 0.5 mm wall clearance left no local corridor for at least one required segment.".format(
+                "This does not necessarily mean the object is too small overall. It means the selected 3D order, the protected zones around terminals and nodes, the {:.2f} mm conductive path diameter, the retained 0.5 mm virtual clearance margin, the 0.5 mm inter-path spacing, and the 0.5 mm wall clearance left no local corridor for at least one required segment.".format(
                     wire_diameter_mm
                 )
             )
@@ -1512,7 +1526,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     )
 
     Rhino.RhinoApp.WriteLine(
-        "Generated {:.2f} mm conductive pathing with a retained 0.5 mm casing-equivalent clearance margin, 0.5 mm wall clearance, a user-set conductive pathway node sphere diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
+        "Generated {:.2f} mm conductive pathing with a retained 0.5 mm virtual clearance margin, 0.5 mm wall clearance, a user-set conductive pathway node sphere diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
         .format(wire_diameter_mm, flush_node_diameter_mm)
     )
     return Rhino.Commands.Result.Success

@@ -16,6 +16,13 @@ from wire_router.core import (
 
 
 class CoreRouterTests(unittest.TestCase):
+    @staticmethod
+    def _segment_length(segment: list[tuple[int, int, int]]) -> float:
+        total = 0.0
+        for start, end in zip(segment[:-1], segment[1:]):
+            total += abs(end[0] - start[0]) + abs(end[1] - start[1]) + abs(end[2] - start[2])
+        return total
+
     def test_path_optimizer_prefers_shortest_total_route(self) -> None:
         order = optimize_node_order_for_path(
             start_distances=[1.0, 7.0, 7.0],
@@ -196,6 +203,37 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(len(segments), 2)
         self.assertNotIn((3, 1, 0), segments[0][1:-1])
         self.assertEqual(segments[1][-1], (3, 1, 0))
+
+    def test_target_length_routing_uses_free_space_for_detour(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(6) for y in range(4)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 0, 0), (5, 0, 0)],
+            segment_target_lengths=[9.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0][0], (0, 0, 0))
+        self.assertEqual(segments[0][-1], (5, 0, 0))
+        self.assertGreaterEqual(self._segment_length(segments[0]), 9.0)
+
+    def test_target_length_only_applies_to_marked_segments(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(6) for y in range(4)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 0, 0), (2, 0, 0), (5, 0, 0)],
+            segment_target_lengths=[None, 9.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(self._segment_length(segments[0]), 2.0)
+        self.assertGreaterEqual(self._segment_length(segments[1]), 9.0)
 
 
 if __name__ == "__main__":

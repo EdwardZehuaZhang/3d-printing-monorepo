@@ -49,6 +49,207 @@ def _distance(a: GridIndex, b: GridIndex) -> float:
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
+def _path_length(path: Sequence[GridIndex]) -> float:
+    if len(path) < 2:
+        return 0.0
+    return sum(_distance(start, end) for start, end in zip(path[:-1], path[1:]))
+
+
+def _point_to_segment_distance(point: GridIndex, start: GridIndex, goal: GridIndex) -> float:
+    px, py, pz = (float(value) for value in point)
+    sx, sy, sz = (float(value) for value in start)
+    gx, gy, gz = (float(value) for value in goal)
+
+    vx = gx - sx
+    vy = gy - sy
+    vz = gz - sz
+    wx = px - sx
+    wy = py - sy
+    wz = pz - sz
+
+    length_sq = (vx * vx) + (vy * vy) + (vz * vz)
+    if length_sq <= 1e-9:
+        return _distance(point, start)
+
+    projection = ((wx * vx) + (wy * vy) + (wz * vz)) / length_sq
+    projection = max(0.0, min(1.0, projection))
+    closest_x = sx + (vx * projection)
+    closest_y = sy + (vy * projection)
+    closest_z = sz + (vz * projection)
+    dx = px - closest_x
+    dy = py - closest_y
+    dz = pz - closest_z
+    return math.sqrt((dx * dx) + (dy * dy) + (dz * dz))
+
+
+def _is_better_target_path(
+    candidate_length: float,
+    existing_length: float,
+    target_length: float,
+) -> bool:
+    candidate_error = abs(candidate_length - target_length)
+    existing_error = abs(existing_length - target_length)
+    if candidate_error + 1e-9 < existing_error:
+        return True
+    if existing_error + 1e-9 < candidate_error:
+        return False
+    return candidate_length > existing_length + 1e-9
+
+
+def _select_detour_waypoints(
+    valid_cells: Set[GridIndex],
+    start: GridIndex,
+    goal: GridIndex,
+    direct_length: float,
+    target_length: float,
+    limit: int,
+) -> List[GridIndex]:
+    ranked: List[Tuple[Tuple[float, float, float, float], GridIndex]] = []
+    for candidate in valid_cells:
+        if candidate == start or candidate == goal:
+            continue
+
+        start_distance = _distance(start, candidate)
+        goal_distance = _distance(candidate, goal)
+        if min(start_distance, goal_distance) < 2.0:
+            continue
+
+        total_distance = start_distance + goal_distance
+        if total_distance <= direct_length + 2.0:
+            continue
+
+        line_distance = _point_to_segment_distance(candidate, start, goal)
+        score = (
+            abs(total_distance - target_length),
+            -line_distance,
+            -min(start_distance, goal_distance),
+            -total_distance,
+        )
+        ranked.append((score, candidate))
+
+    ranked.sort(key=lambda item: item[0])
+    return [candidate for _, candidate in ranked[:limit]]
+
+
+def _route_through_waypoints(
+    valid_cells: Set[GridIndex],
+    waypoint_sequence: Sequence[GridIndex],
+    penalty_cells: Set[GridIndex],
+    penalty_weight: float,
+    allow_diagonals: bool,
+) -> List[GridIndex]:
+    combined: List[GridIndex] = []
+    consumed_cells: Set[GridIndex] = set()
+
+    for start, goal in zip(waypoint_sequence[:-1], waypoint_sequence[1:]):
+        segment_valid_cells = set(valid_cells)
+        if consumed_cells:
+            segment_valid_cells.difference_update(consumed_cells)
+            segment_valid_cells.add(start)
+            segment_valid_cells.add(goal)
+
+        segment_penalties = set(penalty_cells)
+        segment_penalties.update(consumed_cells)
+        segment_penalties.discard(start)
+        segment_penalties.discard(goal)
+
+        segment = astar_path(
+            valid_cells=segment_valid_cells,
+            start=start,
+            goal=goal,
+            penalty_cells=segment_penalties,
+            penalty_weight=penalty_weight,
+            allow_diagonals=allow_diagonals,
+        )
+
+        if combined:
+            combined.extend(segment[1:])
+        else:
+            combined.extend(segment)
+        consumed_cells.update(segment[1:-1])
+
+    return combined
+
+
+def _route_segment_with_target_length(
+    valid_cells: Set[GridIndex],
+    start: GridIndex,
+    goal: GridIndex,
+    penalty_cells: Set[GridIndex],
+    penalty_weight: float,
+    allow_diagonals: bool,
+    target_length: Optional[float],
+) -> List[GridIndex]:
+    direct_path = astar_path(
+        valid_cells=valid_cells,
+        start=start,
+        goal=goal,
+        penalty_cells=penalty_cells,
+        penalty_weight=penalty_weight,
+        allow_diagonals=allow_diagonals,
+    )
+    if target_length is None:
+        return direct_path
+
+    direct_length = _path_length(direct_path)
+    if direct_length + 1e-9 >= target_length:
+        return direct_path
+
+    best_path = direct_path
+    best_length = direct_length
+    candidate_waypoints = _select_detour_waypoints(
+        valid_cells=valid_cells,
+        start=start,
+        goal=goal,
+        direct_length=direct_length,
+        target_length=target_length,
+        limit=18,
+    )
+
+    for waypoint in candidate_waypoints:
+        try:
+            candidate_path = _route_through_waypoints(
+                valid_cells=valid_cells,
+                waypoint_sequence=(start, waypoint, goal),
+                penalty_cells=penalty_cells,
+                penalty_weight=penalty_weight,
+                allow_diagonals=allow_diagonals,
+            )
+        except RoutingError:
+            continue
+
+        candidate_length = _path_length(candidate_path)
+        if _is_better_target_path(candidate_length, best_length, target_length):
+            best_path = candidate_path
+            best_length = candidate_length
+
+    if best_length + 1e-9 >= target_length:
+        return best_path
+
+    pair_candidates = candidate_waypoints[: min(6, len(candidate_waypoints))]
+    for first_waypoint in pair_candidates:
+        for second_waypoint in pair_candidates:
+            if first_waypoint == second_waypoint:
+                continue
+            try:
+                candidate_path = _route_through_waypoints(
+                    valid_cells=valid_cells,
+                    waypoint_sequence=(start, first_waypoint, second_waypoint, goal),
+                    penalty_cells=penalty_cells,
+                    penalty_weight=penalty_weight,
+                    allow_diagonals=allow_diagonals,
+                )
+            except RoutingError:
+                continue
+
+            candidate_length = _path_length(candidate_path)
+            if _is_better_target_path(candidate_length, best_length, target_length):
+                best_path = candidate_path
+                best_length = candidate_length
+
+    return best_path
+
+
 def _neighbor_offsets(allow_diagonals: bool) -> Iterator[Tuple[GridIndex, float]]:
     if allow_diagonals:
         for dx in (-1, 0, 1):
@@ -463,6 +664,7 @@ def _reconstruct_order(
 def route_node_sequence(
     valid_cells: Set[GridIndex],
     node_sequence: Sequence[GridIndex],
+    segment_target_lengths: Optional[Sequence[Optional[float]]] = None,
     penalty_radius: int = 1,
     penalty_weight: float = 10.0,
     blocked_radius: int = 0,
@@ -474,6 +676,9 @@ def route_node_sequence(
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
+
+    if segment_target_lengths is not None and len(segment_target_lengths) != (len(node_sequence) - 1):
+        raise RoutingError("Segment target lengths must match the routed segment count.")
 
     if node_labels is not None and len(node_labels) != len(node_sequence):
         raise RoutingError("Node labels must match the routed node sequence length.")
@@ -508,14 +713,19 @@ def route_node_sequence(
         local_penalties.discard(start)
         local_penalties.discard(goal)
 
+        segment_target_length = None
+        if segment_target_lengths is not None:
+            segment_target_length = segment_target_lengths[segment_index]
+
         try:
-            routed_segment = astar_path(
+            routed_segment = _route_segment_with_target_length(
                 valid_cells=segment_valid_cells,
                 start=start,
                 goal=goal,
                 penalty_cells=local_penalties,
                 penalty_weight=penalty_weight,
                 allow_diagonals=allow_diagonals,
+                target_length=segment_target_length,
             )
         except RoutingError:
             if node_labels is not None:

@@ -11,6 +11,7 @@ This folder contains a Rhino 8 script-plugin MVP that generates a wire path insi
 - builds an interior routing grid automatically
 - ranks possible node orders by how close their touch-to-touch resistance steps are to the user-selected target value
 - tries target-close orders until it finds the nearest routable order that fits the geometry constraints
+- actively lengthens touch-to-touch routed legs through available interior volume when the direct route is too short for the requested resistance target
 - routes one continuous conductive path from start to end through all touch nodes in that selected order
 - adds separate conductive path and conductive pathway node solids back into Rhino
 
@@ -138,7 +139,7 @@ The command now uses fixed fabrication rules instead of prompting for
 `VoxelSize`, `Clearance`, or legacy `WireRadius` settings:
 
 - conductive path diameter: user-defined per command run, but never smaller than `0.5 mm` and never larger than the selected conductive pathway node diameter
-- retained casing-equivalent clearance margin around conductive paths: `0.5 mm`
+- retained virtual clearance margin around conductive paths: `0.5 mm`
 - minimum clearance from that retained margin to the host-object wall: `0.5 mm`
 - minimum conductive path spacing from other conductive paths: `0.5 mm`
 - conductive pathway node sphere diameter: user-defined per command run, but never smaller than `0.5 mm`
@@ -206,14 +207,15 @@ Routing rules:
 - conductive path diameter must be at least 0.5 mm
 - conductive path diameter cannot exceed the selected conductive pathway node diameter
 - if a chosen conductive path diameter is geometrically too large and would force overlaps with nodes or pathways, routing fails and the command reports that the pathway is not big enough
-- no casing geometry is generated, but a virtual 0.5 mm casing-equivalent clearance margin is still enforced in the routing logic
+- no casing geometry is generated, but a virtual 0.5 mm clearance margin is still enforced in the routing logic
 - conductive paths stay at least 0.5 mm away from other conductive paths where the geometry allows
 - conductive paths reserve protected space around every terminal and every conductive pathway node so the route cannot cut through another anchor
-- the retained casing-equivalent margin stays at least 0.5 mm away from the host-object wall
+- the retained virtual clearance margin stays at least 0.5 mm away from the host-object wall
 - if a path between two successive optimized nodes cannot fit, the command reports that the pathway between those nodes is not big enough
 - the user chooses the desired touch-to-touch resistance between successive conductive pathway nodes in kohm for each run
 - only touch-node-to-touch-node resistance steps are used to rank node orders; the start terminal leg and end terminal leg are excluded from that scoring rule
 - the router searches for the node order whose estimated touch-to-touch steps are closest to the requested value and then tries nearby alternatives until it finds a routable order
+- once an order is chosen, the router tries to spend free interior space on the touch-to-touch legs so the actual routed resistance can move closer to the requested value instead of always collapsing to the shortest corridor
 - if the routed result does not exactly match the requested touch-to-touch resistance, the command still succeeds and reports the actual touch-to-touch values and total start-to-end resistance
 - if no candidate order can be routed, the command explains that the blocking issue is a local corridor problem caused by path diameter, clearance, spacing, and protected node or terminal zones, not necessarily the overall object size
 - routing uses orthogonal grid motion to encourage a zig-zag style path instead of the shortest straight line
