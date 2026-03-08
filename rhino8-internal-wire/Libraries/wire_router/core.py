@@ -520,7 +520,7 @@ def route_node_sequence(
         except RoutingError:
             if node_labels is not None:
                 raise RoutingError(
-                    "Pathway between {} and {} is not big enough for the standardized conductive path and casing.".format(
+                    "Pathway between {} and {} could not fit the current routing constraints.".format(
                         node_labels[segment_index],
                         node_labels[segment_index + 1],
                     )

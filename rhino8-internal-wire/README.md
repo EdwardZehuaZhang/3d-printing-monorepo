@@ -9,8 +9,9 @@ This folder contains a Rhino 8 script-plugin MVP that generates a wire path insi
 - lets the user pick touch nodes on the object with live preview
 - trims touch nodes flush to the object boundary
 - builds an interior routing grid automatically
-- runs a logic check between shortest-path node ordering and resistance-separation-aware ordering before choosing the final node sequence
-- routes one continuous conductive path from start to end through all touch nodes in the chosen optimized order
+- ranks possible node orders by how close their touch-to-touch resistance steps are to the user-selected target value
+- tries target-close orders until it finds the nearest routable order that fits the geometry constraints
+- routes one continuous conductive path from start to end through all touch nodes in that selected order
 - adds separate conductive path and conductive pathway node solids back into Rhino
 
 ## Current scope
@@ -57,16 +58,15 @@ First-use workflow inside Rhino:
 2. Select one closed solid, closed mesh, extrusion, or SubD.
 3. Enter the conductive pathway node sphere diameter in millimeters.
 4. Enter the conductive path diameter in millimeters.
-5. Enter the minimum conductive pathway node reading separation in kohm.
-6. Enter the touch-node ordering mode: `threshold-first`, `shortest-path-first`, or `maximize-separation`.
-7. Pick the `Start` terminal.
-8. Set that terminal to `Flush` or `Protrude`.
-9. Pick the `End` terminal.
-10. Set that terminal to `Flush` or `Protrude`.
-11. Pick conductive pathway nodes on the surface.
-12. Press Enter when all nodes are placed.
-13. Inspect the generated conductive path and conductive nodes.
-14. Check the Rhino command history for the order logic check, estimated resistance, and per-node resistance spacing.
+5. Enter the desired touch-to-touch resistance between successive nodes in kohm.
+6. Pick the `Start` terminal.
+7. Set that terminal to `Flush` or `Protrude`.
+8. Pick the `End` terminal.
+9. Set that terminal to `Flush` or `Protrude`.
+10. Pick conductive pathway nodes on the surface.
+11. Press Enter when all nodes are placed.
+12. Inspect the generated conductive path and conductive nodes.
+13. Check the Rhino command history for the selected order, the estimated touch-to-touch resistance steps before routing, the actual touch-to-touch resistance steps after routing, and the total start-to-end resistance.
 
 ## Important publish behavior
 
@@ -158,10 +158,9 @@ It reports:
 - estimated total start-to-end resistance for the generated path
 - estimated touch-to-touch resistance steps before routing for the chosen node order
 - actual touch-to-touch resistance steps after routing for the final routed path
-- a logic-check comparison between the shortest-anchor node order and the spacing-aware node order when those two disagree
-- the active ordering mode and, when strategies differ, a comparison across all three available order strategies
+- whether the closest target-ranked node order was routable or whether a nearby alternative had to be used
 - a suggested Arduino send-pin resistor range of `470 kohm` to `2.2 Mohm`, with `1 Mohm` as the starting point
-- a design-rule failure if successive touch nodes are below the user-selected nominal separation threshold, excluding the start-to-first-node and last-node-to-end terminal legs
+- a detailed routing failure explanation when no node order can fit the geometry constraints
 
 ## Use the command
 
@@ -169,15 +168,14 @@ It reports:
 2. Select one closed target object.
 3. Enter the conductive pathway node sphere diameter in millimeters.
 4. Enter the conductive path diameter in millimeters.
-5. Enter the minimum conductive pathway node reading separation threshold in kohm.
-6. Enter the ordering mode: `threshold-first`, `shortest-path-first`, or `maximize-separation`.
-7. Pick the `Start` terminal on the object.
-8. Choose whether that terminal is `Flush` or `Protrude`.
-9. Pick the `End` terminal on the object.
-10. Choose whether that terminal is `Flush` or `Protrude`.
-11. Pick touch nodes on the object surface.
-12. Watch the live node preview while placing each touch node.
-13. Press Enter after the last touch node.
+5. Enter the desired touch-to-touch resistance threshold in kohm.
+6. Pick the `Start` terminal on the object.
+7. Choose whether that terminal is `Flush` or `Protrude`.
+8. Pick the `End` terminal on the object.
+9. Choose whether that terminal is `Flush` or `Protrude`.
+10. Pick touch nodes on the object surface.
+11. Watch the live node preview while placing each touch node.
+12. Press Enter after the last touch node.
 
 The command adds:
 
@@ -213,21 +211,19 @@ Routing rules:
 - conductive paths reserve protected space around every terminal and every conductive pathway node so the route cannot cut through another anchor
 - the retained casing-equivalent margin stays at least 0.5 mm away from the host-object wall
 - if a path between two successive optimized nodes cannot fit, the command reports that the pathway between those nodes is not big enough
-- the user chooses the minimum acceptable nominal separation between successive conductive pathway nodes in kohm for each run
-- only touch-node-to-touch-node resistance steps are checked against that threshold; the start terminal leg and end terminal leg are excluded from the spacing rule
-- `threshold-first` compares all candidate orders and chooses the shortest one that still satisfies the selected resistance threshold when possible
-- `shortest-path-first` always uses the geometrically shortest candidate order, even if another mode would create a larger resistance gap
-- `maximize-separation` chooses the candidate order with the largest minimum per-node resistance step and only breaks ties using shorter total path length
-- the optimizer targets a value above that chosen threshold so quick prototype iterations can use a lower threshold and final runs can use a higher threshold
-- if the final routed layout drops below the chosen threshold, the command rejects the layout
+- the user chooses the desired touch-to-touch resistance between successive conductive pathway nodes in kohm for each run
+- only touch-node-to-touch-node resistance steps are used to rank node orders; the start terminal leg and end terminal leg are excluded from that scoring rule
+- the router searches for the node order whose estimated touch-to-touch steps are closest to the requested value and then tries nearby alternatives until it finds a routable order
+- if the routed result does not exactly match the requested touch-to-touch resistance, the command still succeeds and reports the actual touch-to-touch values and total start-to-end resistance
+- if no candidate order can be routed, the command explains that the blocking issue is a local corridor problem caused by path diameter, clearance, spacing, and protected node or terminal zones, not necessarily the overall object size
 - routing uses orthogonal grid motion to encourage a zig-zag style path instead of the shortest straight line
 
 ## Tuning guidance
 
 - Larger host geometries allow longer zig-zag conductive paths and more separation between touch nodes.
 - Tight corners, thin walls, and narrow necks are the main reasons routing fails.
-- Lower the reading-separation threshold for quick prototype exploration when you mainly want a route candidate.
-- Raise the reading-separation threshold when physical testing shows nodes are being confused by noise or inconsistent touches.
+- Lower the desired touch-to-touch resistance when you mainly want a route candidate quickly.
+- Raise the desired touch-to-touch resistance when physical testing shows nodes are being confused by noise or inconsistent touches.
 - If the command reports that a pathway is not big enough, move the touch nodes farther apart or use a larger host body.
 
 ## Suggested next upgrades
