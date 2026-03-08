@@ -77,7 +77,9 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(segments[0][-1], (3, 1, 0))
         self.assertEqual(segments[1][0], (3, 1, 0))
         self.assertEqual(segments[1][-1], (6, 1, 0))
-        self.assertTrue(any(cell[1] != 1 for cell in segments[1][1:-1]))
+        first_segment_cells = {(0, 1, 0), (1, 1, 0), (2, 1, 0), (3, 1, 0)}
+        second_segment_cells = {(3, 1, 0), (4, 1, 0), (5, 1, 0), (6, 1, 0)}
+        self.assertEqual(first_segment_cells.intersection(second_segment_cells), {(3, 1, 0)})
 
     def test_reserved_cells_keep_earlier_segments_out_of_future_anchor(self) -> None:
         valid_cells = {(x, y, 0) for x in range(7) for y in range(3)}

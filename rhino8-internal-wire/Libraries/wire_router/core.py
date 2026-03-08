@@ -199,6 +199,8 @@ def route_node_sequence(
                 local_blocked.difference_update(
                     dilate_cells({start, goal}, blocked_exemption_radius)
                 )
+            local_blocked.discard(start)
+            local_blocked.discard(goal)
             segment_valid_cells.difference_update(local_blocked)
 
         local_penalties = set(penalty_cells)
@@ -206,7 +208,7 @@ def route_node_sequence(
         local_penalties.discard(goal)
 
         try:
-            segment = astar_path(
+            routed_segment = astar_path(
                 valid_cells=segment_valid_cells,
                 start=start,
                 goal=goal,
@@ -224,12 +226,13 @@ def route_node_sequence(
                 )
             raise
 
-        segment = compress_index_path(segment)
+        segment = compress_index_path(routed_segment)
         segments.append(segment)
 
-        penalty_cells.update(dilate_cells(segment, penalty_radius))
+        penalty_cells.update(dilate_cells(routed_segment, penalty_radius))
         penalty_cells.discard(start)
         penalty_cells.discard(goal)
-        blocked_cells.update(dilate_cells(segment, blocked_radius))
+        if blocked_radius > 0:
+            blocked_cells.update(dilate_cells(routed_segment, blocked_radius))
 
     return segments
