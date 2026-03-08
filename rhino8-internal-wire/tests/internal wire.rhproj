@@ -1,0 +1,28 @@
+{
+  "host": {
+    "name": "Rhino3D",
+    "version": "8.24.25281\u002B15001",
+    "os": "windows",
+    "arch": "x64"
+  },
+  "id": "17b2b8e4-030d-4607-ace4-9004a6203486",
+  "identity": {
+    "name": "",
+    "version": "0.1"
+  },
+  "settings": {
+    "buildPath": "build/",
+    "buildTarget": {
+      "host": {
+        "name": "Rhino3D",
+        "version": "8"
+      },
+      "title": "Rhino3D (8.*)",
+      "slug": "rh8"
+    },
+    "publishTarget": {
+      "title": "McNeel Yak Server"
+    }
+  },
+  "codes": []
+}
