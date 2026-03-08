@@ -867,20 +867,6 @@ def _best_metrics_by_threshold(
     )[0]
 
 
-def _best_metrics_by_separation(
-    doc: Rhino.RhinoDoc,
-    candidates: Sequence[Tuple[str, NodeOrderMetrics]],
-    wire_diameter_mm: float,
-) -> str:
-    return max(
-        candidates,
-        key=lambda item: (
-            _minimum_leg_delta_kohm(doc, item[1], wire_diameter_mm),
-            -item[1].total_path_length,
-        ),
-    )[0]
-
-
 def _ordering_mode_label(mode: str) -> str:
     if mode == ORDER_MODE_THRESHOLD_FIRST:
         return "threshold-first"
@@ -905,7 +891,7 @@ def _choose_touch_node_order(
         empty_metrics = NodeOrderMetrics(order=(), total_path_length=0.0, touch_leg_lengths=(), end_leg_length=0.0)
         return TouchNodeOrderDecision(
             ordered_nodes=(),
-            selected_strategy=ORDER_MODE_SHORTEST_PATH_FIRST,
+            selected_strategy=ordering_mode,
             path_nodes=(),
             threshold_nodes=(),
             max_spacing_nodes=(),
@@ -954,7 +940,7 @@ def _choose_touch_node_order(
             wire_diameter_mm,
         )
     elif ordering_mode == ORDER_MODE_MAXIMIZE_SEPARATION:
-        selected_strategy = _best_metrics_by_separation(doc, candidates, wire_diameter_mm)
+        selected_strategy = ORDER_MODE_MAXIMIZE_SEPARATION
     else:
         selected_strategy = ORDER_MODE_SHORTEST_PATH_FIRST
 
@@ -1413,19 +1399,24 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             order_decision.max_spacing_metrics.order,
         }) > 1:
             Rhino.RhinoApp.WriteLine(
-                "Order logic check: shortest-path-first gives {:.1f} kohm minimum step, threshold-first gives {:.1f} kohm, and maximize-separation gives {:.1f} kohm.".format(
+                "Order logic check before routing: shortest-path-first estimates {:.1f} kohm minimum step, threshold-first estimates {:.1f} kohm, and maximize-separation estimates {:.1f} kohm.".format(
                     path_min_delta,
                     threshold_min_delta,
                     max_spacing_min_delta,
                 )
             )
-            Rhino.RhinoApp.WriteLine(
-                "Using {} mode. Selected order source: {}."
-                .format(
-                    _ordering_mode_label(ordering_mode),
-                    _ordering_mode_label(order_decision.selected_strategy),
+            if ordering_mode == ORDER_MODE_THRESHOLD_FIRST:
+                Rhino.RhinoApp.WriteLine(
+                    "Using {} mode. Selected order source: {}."
+                    .format(
+                        _ordering_mode_label(ordering_mode),
+                        _ordering_mode_label(order_decision.selected_strategy),
+                    )
                 )
-            )
+            else:
+                Rhino.RhinoApp.WriteLine(
+                    "Using {} mode.".format(_ordering_mode_label(ordering_mode))
+                )
         else:
             Rhino.RhinoApp.WriteLine(
                 "Using {} mode. All three ordering strategies converged to the same node order at the selected {:.1f} kohm threshold.".format(
