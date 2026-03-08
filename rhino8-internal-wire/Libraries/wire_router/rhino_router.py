@@ -27,7 +27,8 @@ MIN_TOUCH_NODE_FLUSH_DIAMETER_MM = 0.5
 TERMINAL_DIAMETER_MM = 3.0
 TERMINAL_LENGTH_MM = 6.0
 MAX_DP_NODES = 10
-MIN_TOUCH_READING_DELTA_KOHM = 6.0
+DEFAULT_MIN_TOUCH_READING_DELTA_KOHM = 10.0
+MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
 PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
@@ -491,7 +492,7 @@ class _TouchNodeGetter(ric.GetPoint):
             return
 
         color = System.Drawing.Color.OrangeRed if error is not None else System.Drawing.Color.LimeGreen
-    e.Display.DrawSphere(rg.Sphere(preview.center_point, self._node_radius), color)
+        e.Display.DrawSphere(rg.Sphere(preview.center_point, self._node_radius), color)
 
 
 class _TerminalGetter(ric.GetPoint):
@@ -787,14 +788,18 @@ def _solve_touch_node_order(
     start: TerminalPlacement,
     touch_nodes: Sequence[TouchNodePlacement],
     end: TerminalPlacement,
-    minimum_leg_length: float,
+    target_leg_length: float,
 ) -> List[TouchNodePlacement]:
     if not touch_nodes:
         return []
 
     def leg_cost(distance: float) -> float:
-        shortfall = max(0.0, minimum_leg_length - distance)
-        return distance + (shortfall * 6.0)
+        if distance < target_leg_length:
+            shortfall = target_leg_length - distance
+            return shortfall * 8.0
+
+        overshoot = distance - target_leg_length
+        return overshoot * 0.35
 
     if len(touch_nodes) > MAX_DP_NODES:
         remaining = list(touch_nodes)
@@ -986,15 +991,19 @@ def _nominal_resistance_kohm(doc: Rhino.RhinoDoc, length_in_model_units: float) 
     return (low + high) * 0.5
 
 
-def _minimum_touch_leg_length(doc: Rhino.RhinoDoc) -> float:
+def _reading_delta_length(doc: Rhino.RhinoDoc, delta_kohm: float) -> float:
     mean_kohm_per_100mm = (
         (PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] + PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1])
         * 0.5
         * (PROTO_PASTA_BASE_DIAMETER_MM / WIRE_DIAMETER_MM) ** 2
     )
     mean_kohm_per_mm = mean_kohm_per_100mm / 100.0
-    required_mm = MIN_TOUCH_READING_DELTA_KOHM / mean_kohm_per_mm
+    required_mm = delta_kohm / mean_kohm_per_mm
     return _mm_to_model(doc, required_mm)
+
+
+def _target_touch_reading_delta_kohm(minimum_delta_kohm: float) -> float:
+    return max(minimum_delta_kohm + 4.0, minimum_delta_kohm * 1.35)
 
 
 def _format_resistor_value(ohms: float) -> str:
@@ -1007,6 +1016,7 @@ def _validate_touch_reading_spacing(
     doc: Rhino.RhinoDoc,
     touch_node_labels: Sequence[str],
     touch_lengths: Sequence[float],
+    minimum_delta_kohm: float,
 ) -> Optional[str]:
     if len(touch_lengths) < 2:
         return None
@@ -1016,11 +1026,11 @@ def _validate_touch_reading_spacing(
     for label, length_value in zip(touch_node_labels[1:], touch_lengths[1:]):
         current_resistance = _nominal_resistance_kohm(doc, length_value)
         delta = current_resistance - previous_resistance
-        if delta + 1e-9 < MIN_TOUCH_READING_DELTA_KOHM:
+        if delta + 1e-9 < minimum_delta_kohm:
             return (
                 "{} and {} are only {:.1f} kohm apart from the start terminal. "
-                "Increase spacing, reduce node count, or use a larger host body so each conductive pathway node is reliably distinguishable."
-            ).format(previous_label, label, delta)
+                "This is below the selected minimum threshold of {:.1f} kohm. Increase spacing, reduce node count, lower the threshold for quick iteration, or use a larger host body."
+            ).format(previous_label, label, delta, minimum_delta_kohm)
         previous_label = label
         previous_resistance = current_resistance
     return None
@@ -1044,6 +1054,30 @@ def _get_touch_node_flush_diameter_mm() -> Optional[float]:
         value = getter.Number()
         if value + 1e-9 < MIN_TOUCH_NODE_FLUSH_DIAMETER_MM:
             Rhino.RhinoApp.WriteLine("Conductive pathway node sphere diameter is too small. It must be at least 0.5 mm.")
+            continue
+        return value
+
+
+def _get_min_touch_reading_delta_kohm() -> Optional[float]:
+    getter = ric.GetNumber()
+    getter.SetCommandPrompt("Set the minimum conductive pathway node reading separation in kohm")
+    getter.SetDefaultNumber(DEFAULT_MIN_TOUCH_READING_DELTA_KOHM)
+    getter.AcceptNothing(True)
+
+    while True:
+        result = getter.Get()
+        if result == ri.GetResult.Cancel:
+            return None
+        if result == ri.GetResult.Nothing:
+            return DEFAULT_MIN_TOUCH_READING_DELTA_KOHM
+        if result != ri.GetResult.Number:
+            continue
+
+        value = getter.Number()
+        if value + 1e-9 < MIN_ALLOWED_TOUCH_READING_DELTA_KOHM:
+            Rhino.RhinoApp.WriteLine(
+                "Minimum conductive pathway node reading separation is too small. It must be at least 1.0 kohm."
+            )
             continue
         return value
 
@@ -1148,9 +1182,16 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if flush_node_diameter_mm is None:
         return Rhino.Commands.Result.Cancel
 
+    min_touch_reading_delta_kohm = _get_min_touch_reading_delta_kohm()
+    if min_touch_reading_delta_kohm is None:
+        return Rhino.Commands.Result.Cancel
+
     node_radius = _mm_to_model(doc, flush_node_diameter_mm * 0.5)
     step = _auto_step(mesh, doc)
-    minimum_leg_length = _minimum_touch_leg_length(doc)
+    target_touch_reading_delta_kohm = _target_touch_reading_delta_kohm(
+        min_touch_reading_delta_kohm
+    )
+    target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm)
 
     terminals = _collect_terminals(
         mesh,
@@ -1179,7 +1220,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         start_terminal,
         touch_nodes,
         end_terminal,
-        minimum_leg_length,
+        target_leg_length,
     )
     ordered_labels = [node.label for node in ordered_touch_nodes]
     if ordered_labels:
@@ -1240,7 +1281,12 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     polyline_points = _segments_to_polyline_points(route_points, segments, grid, tolerance)
     cumulative_lengths = _cumulative_anchor_lengths(polyline_points, route_points, tolerance)
     touch_lengths = cumulative_lengths[1:-1]
-    sensing_error = _validate_touch_reading_spacing(doc, ordered_labels, touch_lengths)
+    sensing_error = _validate_touch_reading_spacing(
+        doc,
+        ordered_labels,
+        touch_lengths,
+        min_touch_reading_delta_kohm,
+    )
     if sensing_error is not None:
         Rhino.RhinoApp.WriteLine(sensing_error)
         Rhino.RhinoApp.WriteLine(
@@ -1277,6 +1323,13 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         .format(
             _format_resistor_value(SUGGESTED_SERIES_RESISTOR_RANGE_OHM[0]),
             _format_resistor_value(SUGGESTED_SERIES_RESISTOR_RANGE_OHM[1]),
+        )
+    )
+    Rhino.RhinoApp.WriteLine(
+        "Distinct-touch targeting uses a nominal {:.1f} kohm step per successive conductive pathway node and rejects anything below the selected {:.1f} kohm threshold."
+        .format(
+            target_touch_reading_delta_kohm,
+            min_touch_reading_delta_kohm,
         )
     )
 

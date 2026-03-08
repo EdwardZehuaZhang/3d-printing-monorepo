@@ -28,17 +28,42 @@ It does **not** yet do surface-only routing on open geometry.
 - [Libraries/wire_router/core.py](Libraries/wire_router/core.py) — pure Python A* grid router
 - [Libraries/wire_router/rhino_router.py](Libraries/wire_router/rhino_router.py) — RhinoCommon integration
 
-## Load into Rhino 8
+## Quick Start In Rhino 8
+
+Prerequisites:
+
+- Rhino 8 installed
+- this repository available on your computer
+
+Try the plugin locally on your machine:
 
 1. Open Rhino 8.
 2. Run `ScriptEditor`.
-3. Create a new project (`File > Create Project`).
-4. Add [Commands/GenerateInternalWire.py](Commands/GenerateInternalWire.py) under `Commands/`.
-5. Add [Libraries/wire_router](Libraries/wire_router) under `Libraries/` as a Python library.
-6. Save the project.
-7. For editor testing, run the command from Script Editor after saving the project.
-8. For Rhino command-line use, publish the project to build the plugin artifacts.
-9. Install or load the generated plugin output before calling `GenerateInternalWire` in Rhino.
+3. Choose `File > Create Project`.
+4. Fill in the required project metadata such as author, then save the project.
+5. In the Script Editor project tree, add [Commands/GenerateInternalWire.py](Commands/GenerateInternalWire.py) into the `Commands` folder.
+6. In the Script Editor project tree, add the folder [Libraries/wire_router](Libraries/wire_router) as a Python library under `Libraries`.
+7. Save the project.
+8. Use Script Editor run/debug for quick iteration while editing the source.
+9. When you want the command available from the Rhino command line, publish the project with `Publish Project > Build Package`.
+10. After publish completes, install the generated `.rhp` with `PlugInManager > Install...`.
+11. If Rhino asks, load the plugin.
+12. Run `GenerateInternalWire` in Rhino.
+
+First-use workflow inside Rhino:
+
+1. Start `GenerateInternalWire`.
+2. Select one closed solid, closed mesh, extrusion, or SubD.
+3. Enter the conductive pathway node sphere diameter in millimeters.
+4. Enter the minimum conductive pathway node reading separation in kohm.
+5. Pick the `Start` terminal.
+6. Set that terminal to `Flush` or `Protrude`.
+7. Pick the `End` terminal.
+8. Set that terminal to `Flush` or `Protrude`.
+9. Pick conductive pathway nodes on the surface.
+10. Press Enter when all nodes are placed.
+11. Inspect the generated conductive path, conductive nodes, and conductive-path casing.
+12. Check the Rhino command history for estimated resistance and per-node resistance spacing.
 
 ## Important publish behavior
 
@@ -131,20 +156,21 @@ It reports:
 - estimated total start-to-end resistance for the generated path
 - estimated resistance from the start terminal to each touch node along the final route
 - a suggested Arduino send-pin resistor range of `470 kohm` to `2.2 Mohm`, with `1 Mohm` as the starting point
-- a design-rule failure if successive touch nodes are too electrically close to distinguish reliably
+- a design-rule failure if successive touch nodes are below the user-selected nominal separation threshold
 
 ## Use the command
 
 1. Start `GenerateInternalWire`.
 2. Select one closed target object.
 3. Enter the conductive pathway node sphere diameter in millimeters.
-4. Pick the `Start` terminal on the object.
-5. Choose whether that terminal is `Flush` or `Protrude`.
-6. Pick the `End` terminal on the object.
-7. Choose whether that terminal is `Flush` or `Protrude`.
-8. Pick touch nodes on the object surface.
-9. Watch the live node preview while placing each touch node.
-10. Press Enter after the last touch node.
+4. Enter the minimum conductive pathway node reading separation threshold in kohm.
+5. Pick the `Start` terminal on the object.
+6. Choose whether that terminal is `Flush` or `Protrude`.
+7. Pick the `End` terminal on the object.
+8. Choose whether that terminal is `Flush` or `Protrude`.
+9. Pick touch nodes on the object surface.
+10. Watch the live node preview while placing each touch node.
+11. Press Enter after the last touch node.
 
 The command adds:
 
@@ -178,13 +204,17 @@ Routing rules:
 - conductive paths reserve protected space around every terminal and every conductive pathway node so the route cannot cut through another anchor
 - path casing stays at least 0.5 mm away from the host-object wall
 - if a path between two successive optimized nodes cannot fit, the command reports that the pathway between those nodes is not big enough
-- if successive conductive pathway nodes end up too close in nominal resistance, the command rejects the layout instead of generating an ambiguous sensor
+- the user chooses the minimum acceptable nominal separation between successive conductive pathway nodes in kohm for each run
+- the optimizer targets a value above that chosen threshold so quick prototype iterations can use a lower threshold and final runs can use a higher threshold
+- if the final routed layout drops below the chosen threshold, the command rejects the layout
 - routing uses orthogonal grid motion to encourage a zig-zag style path instead of the shortest straight line
 
 ## Tuning guidance
 
 - Larger host geometries allow longer zig-zag conductive paths and more separation between touch nodes.
 - Tight corners, thin walls, and narrow necks are the main reasons routing fails.
+- Lower the reading-separation threshold for quick prototype exploration when you mainly want a route candidate.
+- Raise the reading-separation threshold when physical testing shows nodes are being confused by noise or inconsistent touches.
 - If the command reports that a pathway is not big enough, move the touch nodes farther apart or use a larger host body.
 
 ## Suggested next upgrades
