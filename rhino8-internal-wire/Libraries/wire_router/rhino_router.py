@@ -297,7 +297,9 @@ def _add_output_geometry(
     if not curve.IsValid:
         return False
 
-    curve_id = doc.Objects.AddCurve(curve)
+    curve_attributes = rd.ObjectAttributes()
+    curve_attributes.Name = "GenerateInternalWire_Centerline"
+    curve_id = doc.Objects.AddCurve(curve, curve_attributes)
     if curve_id == System.Guid.Empty:
         return False
 
@@ -311,8 +313,10 @@ def _add_output_geometry(
         doc.ModelAngleToleranceRadians,
     )
     if pipes:
+        pipe_attributes = rd.ObjectAttributes()
+        pipe_attributes.Name = "GenerateInternalWire_ConductivePath"
         for pipe in pipes:
-            doc.Objects.AddBrep(pipe)
+            doc.Objects.AddBrep(pipe, pipe_attributes)
 
     doc.Views.Redraw()
     return True
@@ -361,11 +365,14 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         node_cells.append(cell)
 
     try:
+        # Multi-node routes are a single continuous wire. Penalizing a dilated
+        # neighborhood around earlier segments makes later segments fail or kink
+        # badly in narrow volumes, so only apply a soft penalty to exact reused cells.
         segments = route_node_sequence(
             valid_cells=valid_cells,
             node_sequence=node_cells,
-            penalty_radius=max(1, int(math.ceil(max(clearance, wire_radius) / step))),
-            penalty_weight=step * 12.0,
+            penalty_radius=0,
+            penalty_weight=step * 2.0,
             allow_diagonals=True,
         )
     except RoutingError as error:
@@ -384,5 +391,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         "Generated wire through {} nodes using {} routed segment(s).".format(
             len(node_points), len(segments)
         )
+    )
+    Rhino.RhinoApp.WriteLine(
+        "The pipe named GenerateInternalWire_ConductivePath is the generated conductive-path volume; the selected solid is not modified."
     )
     return Rhino.Commands.Result.Success

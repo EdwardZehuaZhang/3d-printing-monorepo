@@ -46,6 +46,20 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(segments[1][0], (2, 1, 0))
         self.assertEqual(segments[1][-1], (5, 1, 0))
 
+    def test_reuses_narrow_corridor_for_later_nodes(self) -> None:
+        valid_cells = {(x, 0, 0) for x in range(5)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 0, 0), (4, 0, 0), (1, 0, 0)],
+            penalty_radius=0,
+            penalty_weight=2.0,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0], [(0, 0, 0), (4, 0, 0)])
+        self.assertEqual(segments[1], [(4, 0, 0), (1, 0, 0)])
+
 
 if __name__ == "__main__":
     unittest.main()

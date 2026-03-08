@@ -7,8 +7,13 @@
   },
   "id": "17b2b8e4-030d-4607-ace4-9004a6203486",
   "identity": {
-    "name": "",
-    "version": "0.1"
+    "name": "internal wire",
+    "version": "0.1.1",
+    "publisher": {
+      "email": "augustineelliotten@gmail.com",
+      "name": "Augustine"
+    },
+    "description": "test of 3d printed condictive wiring"
   },
   "settings": {
     "buildPath": "build/",
@@ -24,5 +29,27 @@
       "title": "McNeel Yak Server"
     }
   },
-  "codes": []
+  "codes": [
+    {
+      "id": "df96dfd5-d06f-40f4-8ba8-b745b3b4ea38",
+      "language": {
+        "id": "mcneel.pythonnet.python",
+        "version": "3.9.10"
+      },
+      "title": "GenerateInternalWire",
+      "uri": "file:///C:/Users/augus/Documents/github/3d-printing-monorepo/rhino8-internal-wire/Commands/GenerateInternalWire.py"
+    }
+  ],
+  "libraries": [
+    {
+      "type": "uri",
+      "library": {
+        "base": "file:///C:/Users/augus/Documents/github/3d-printing-monorepo/rhino8-internal-wire/Libraries/wire_router/",
+        "language": {
+          "id": "*.*.python",
+          "version": "3.*.*"
+        }
+      }
+    }
+  ]
 }
