@@ -250,6 +250,104 @@ def _route_segment_with_target_length(
     return best_path
 
 
+def _dedupe_paths(paths: Sequence[Sequence[GridIndex]]) -> List[List[GridIndex]]:
+    unique: List[List[GridIndex]] = []
+    seen: Set[Tuple[GridIndex, ...]] = set()
+    for path in paths:
+        key = tuple(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(list(path))
+    return unique
+
+
+def _sort_candidate_paths(
+    paths: Sequence[Sequence[GridIndex]],
+    target_length: Optional[float],
+) -> List[List[GridIndex]]:
+    if target_length is None:
+        return sorted((list(path) for path in paths), key=_path_length)
+
+    return sorted(
+        (list(path) for path in paths),
+        key=lambda path: (
+            abs(_path_length(path) - target_length),
+            _path_length(path) < target_length,
+            -_path_length(path),
+        ),
+    )
+
+
+def _segment_candidate_paths(
+    valid_cells: Set[GridIndex],
+    start: GridIndex,
+    goal: GridIndex,
+    penalty_cells: Set[GridIndex],
+    penalty_weight: float,
+    allow_diagonals: bool,
+    target_length: Optional[float],
+    max_candidates: int = 14,
+) -> List[List[GridIndex]]:
+    direct_path = astar_path(
+        valid_cells=valid_cells,
+        start=start,
+        goal=goal,
+        penalty_cells=penalty_cells,
+        penalty_weight=penalty_weight,
+        allow_diagonals=allow_diagonals,
+    )
+
+    candidates: List[List[GridIndex]] = [direct_path]
+    if target_length is None:
+        return candidates
+
+    direct_length = _path_length(direct_path)
+    candidate_waypoints = _select_detour_waypoints(
+        valid_cells=valid_cells,
+        start=start,
+        goal=goal,
+        direct_length=direct_length,
+        target_length=target_length,
+        limit=18,
+    )
+
+    for waypoint in candidate_waypoints:
+        try:
+            candidates.append(
+                _route_through_waypoints(
+                    valid_cells=valid_cells,
+                    waypoint_sequence=(start, waypoint, goal),
+                    penalty_cells=penalty_cells,
+                    penalty_weight=penalty_weight,
+                    allow_diagonals=allow_diagonals,
+                )
+            )
+        except RoutingError:
+            continue
+
+    pair_candidates = candidate_waypoints[: min(6, len(candidate_waypoints))]
+    for first_waypoint in pair_candidates:
+        for second_waypoint in pair_candidates:
+            if first_waypoint == second_waypoint:
+                continue
+            try:
+                candidates.append(
+                    _route_through_waypoints(
+                        valid_cells=valid_cells,
+                        waypoint_sequence=(start, first_waypoint, second_waypoint, goal),
+                        penalty_cells=penalty_cells,
+                        penalty_weight=penalty_weight,
+                        allow_diagonals=allow_diagonals,
+                    )
+                )
+            except RoutingError:
+                continue
+
+    unique_candidates = _dedupe_paths(candidates)
+    return _sort_candidate_paths(unique_candidates, target_length)[:max_candidates]
+
+
 def _neighbor_offsets(allow_diagonals: bool) -> Iterator[Tuple[GridIndex, float]]:
     if allow_diagonals:
         for dx in (-1, 0, 1):
@@ -684,11 +782,19 @@ def route_node_sequence(
         raise RoutingError("Node labels must match the routed node sequence length.")
 
     segments: List[List[GridIndex]] = []
-    penalty_cells: Set[GridIndex] = set()
-    blocked_cells: Set[GridIndex] = set()
     reserved = reserved_cells or set()
 
-    for segment_index, (start, goal) in enumerate(zip(node_sequence[:-1], node_sequence[1:])):
+    def _search(
+        segment_index: int,
+        current_penalty_cells: Set[GridIndex],
+        current_blocked_cells: Set[GridIndex],
+        current_segments: List[List[GridIndex]],
+    ) -> List[List[GridIndex]]:
+        if segment_index >= len(node_sequence) - 1:
+            return list(current_segments)
+
+        start = node_sequence[segment_index]
+        goal = node_sequence[segment_index + 1]
         segment_valid_cells = set(valid_cells)
         if reserved:
             local_reserved = set(reserved)
@@ -699,8 +805,8 @@ def route_node_sequence(
             local_reserved.discard(goal)
             segment_valid_cells.difference_update(local_reserved)
 
-        if blocked_cells:
-            local_blocked = set(blocked_cells)
+        if current_blocked_cells:
+            local_blocked = set(current_blocked_cells)
             if blocked_exemption_radius > 0:
                 local_blocked.difference_update(
                     dilate_cells({start, goal}, blocked_exemption_radius)
@@ -709,7 +815,7 @@ def route_node_sequence(
             local_blocked.discard(goal)
             segment_valid_cells.difference_update(local_blocked)
 
-        local_penalties = set(penalty_cells)
+        local_penalties = set(current_penalty_cells)
         local_penalties.discard(start)
         local_penalties.discard(goal)
 
@@ -718,7 +824,7 @@ def route_node_sequence(
             segment_target_length = segment_target_lengths[segment_index]
 
         try:
-            routed_segment = _route_segment_with_target_length(
+            candidate_paths = _segment_candidate_paths(
                 valid_cells=segment_valid_cells,
                 start=start,
                 goal=goal,
@@ -728,22 +834,41 @@ def route_node_sequence(
                 target_length=segment_target_length,
             )
         except RoutingError:
-            if node_labels is not None:
-                raise RoutingError(
-                    "Pathway between {} and {} could not fit the current routing constraints.".format(
-                        node_labels[segment_index],
-                        node_labels[segment_index + 1],
-                    )
+            candidate_paths = []
+
+        last_error: Optional[RoutingError] = None
+        for routed_segment in candidate_paths:
+            next_penalty_cells = set(current_penalty_cells)
+            next_penalty_cells.update(dilate_cells(routed_segment, penalty_radius))
+            next_penalty_cells.discard(start)
+            next_penalty_cells.discard(goal)
+
+            next_blocked_cells = set(current_blocked_cells)
+            if blocked_radius > 0:
+                next_blocked_cells.update(dilate_cells(routed_segment, blocked_radius))
+
+            try:
+                return _search(
+                    segment_index + 1,
+                    next_penalty_cells,
+                    next_blocked_cells,
+                    current_segments + [compress_index_path(routed_segment)],
                 )
-            raise
+            except RoutingError as error:
+                last_error = error
 
-        segment = compress_index_path(routed_segment)
-        segments.append(segment)
+        if last_error is not None:
+            raise last_error
 
-        penalty_cells.update(dilate_cells(routed_segment, penalty_radius))
-        penalty_cells.discard(start)
-        penalty_cells.discard(goal)
-        if blocked_radius > 0:
-            blocked_cells.update(dilate_cells(routed_segment, blocked_radius))
+        if node_labels is not None:
+            raise RoutingError(
+                "Pathway between {} and {} could not fit the current routing constraints.".format(
+                    node_labels[segment_index],
+                    node_labels[segment_index + 1],
+                )
+            )
+        raise RoutingError(
+            "No route found between {} and {}.".format(start, goal)
+        )
 
-    return segments
+    return _search(0, set(), set(), segments)

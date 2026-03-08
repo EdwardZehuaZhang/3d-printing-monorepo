@@ -235,6 +235,29 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(self._segment_length(segments[0]), 2.0)
         self.assertGreaterEqual(self._segment_length(segments[1]), 9.0)
 
+    def test_target_leg_falls_back_when_detour_blocks_later_segment(self) -> None:
+        valid_cells = (
+            {(x, 5, 0) for x in range(12)}
+            | {(x, 0, 0) for x in range(1, 10)}
+            | {(x, 10, 0) for x in range(1, 12)}
+            | {(9, y, 0) for y in range(5, 11)}
+        )
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 5, 0), (1, 5, 0), (9, 5, 0), (11, 10, 0)],
+            segment_target_lengths=[None, 20.0, None],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            blocked_exemption_radius=1,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(self._segment_length(segments[1]), 8.0)
+        self.assertEqual(segments[2][-1], (11, 10, 0))
+        self.assertNotIn((9, 10, 0), segments[1][1:-1])
+
 
 if __name__ == "__main__":
     unittest.main()
