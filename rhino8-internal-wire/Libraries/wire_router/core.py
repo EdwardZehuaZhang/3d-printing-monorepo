@@ -23,6 +23,7 @@ class GridSpec:
 class NodeOrderMetrics:
     order: Tuple[int, ...]
     total_path_length: float
+    start_leg_length: float
     touch_leg_lengths: Tuple[float, ...]
     end_leg_length: float
 
@@ -181,10 +182,17 @@ def evaluate_node_order(
 ) -> NodeOrderMetrics:
     ordered = tuple(order)
     if not ordered:
-        return NodeOrderMetrics(order=(), total_path_length=0.0, touch_leg_lengths=(), end_leg_length=0.0)
+        return NodeOrderMetrics(
+            order=(),
+            total_path_length=0.0,
+            start_leg_length=0.0,
+            touch_leg_lengths=(),
+            end_leg_length=0.0,
+        )
 
-    touch_leg_lengths: List[float] = [start_distances[ordered[0]]]
-    total_path_length = touch_leg_lengths[0]
+    start_leg_length = start_distances[ordered[0]]
+    total_path_length = start_leg_length
+    touch_leg_lengths: List[float] = []
 
     for previous, current in zip(ordered[:-1], ordered[1:]):
         leg_length = pair_distances[previous][current]
@@ -196,6 +204,7 @@ def evaluate_node_order(
     return NodeOrderMetrics(
         order=ordered,
         total_path_length=total_path_length,
+        start_leg_length=start_leg_length,
         touch_leg_lengths=tuple(touch_leg_lengths),
         end_leg_length=end_leg_length,
     )
@@ -287,14 +296,14 @@ def optimize_node_order_for_target_leg_length(
         last_index: Optional[int] = None
         while remaining:
             if last_index is None:
-                next_index = min(
+                next_index = max(
                     remaining,
-                    key=lambda index: leg_cost(start_distances[index]) + (end_distances[index] * 0.1),
+                    key=lambda index: _average_pair_distance(index, remaining, pair_distances),
                 )
             else:
                 next_index = min(
                     remaining,
-                    key=lambda index: leg_cost(pair_distances[last_index][index]) + (end_distances[index] * 0.1),
+                    key=lambda index: leg_cost(pair_distances[last_index][index]),
                 )
             ordered.append(next_index)
             remaining.remove(next_index)
@@ -306,7 +315,7 @@ def optimize_node_order_for_target_leg_length(
 
     for index in range(node_count):
         mask = 1 << index
-        dp[(mask, index)] = leg_cost(start_distances[index])
+        dp[(mask, index)] = 0.0
         parent[(mask, index)] = None
 
     for mask in range(1, 1 << node_count):
@@ -327,7 +336,7 @@ def optimize_node_order_for_target_leg_length(
     full_mask = (1 << node_count) - 1
     best_last = min(
         range(node_count),
-        key=lambda index: dp[(full_mask, index)] + end_distances[index],
+        key=lambda index: (dp[(full_mask, index)], start_distances[index] + end_distances[index]),
     )
     return _reconstruct_order(parent, full_mask, best_last)
 
@@ -350,12 +359,15 @@ def optimize_node_order_for_maximum_spacing(
             if last_index is None:
                 next_index = max(
                     remaining,
-                    key=lambda index: (start_distances[index], -end_distances[index]),
+                    key=lambda index: (
+                        _minimum_pair_distance(index, remaining, pair_distances),
+                        _average_pair_distance(index, remaining, pair_distances),
+                    ),
                 )
             else:
                 next_index = max(
                     remaining,
-                    key=lambda index: (pair_distances[last_index][index], -end_distances[index]),
+                    key=lambda index: pair_distances[last_index][index],
                 )
             ordered.append(next_index)
             remaining.remove(next_index)
@@ -367,7 +379,7 @@ def optimize_node_order_for_maximum_spacing(
 
     for index in range(node_count):
         mask = 1 << index
-        score_dp[(mask, index)] = (start_distances[index], start_distances[index])
+        score_dp[(mask, index)] = (float("inf"), 0.0)
         parent[(mask, index)] = None
 
     for mask in range(1, 1 << node_count):
@@ -396,10 +408,29 @@ def optimize_node_order_for_maximum_spacing(
         range(node_count),
         key=lambda index: (
             score_dp[(full_mask, index)][0],
-            -score_dp[(full_mask, index)][1] - end_distances[index],
+            -score_dp[(full_mask, index)][1],
+            -(start_distances[index] + end_distances[index]),
         ),
     )
     return _reconstruct_order(parent, full_mask, best_last)
+
+
+def _average_pair_distance(
+    index: int, remaining: Sequence[int], pair_distances: Sequence[Sequence[float]]
+) -> float:
+    others = [other for other in remaining if other != index]
+    if not others:
+        return 0.0
+    return sum(pair_distances[index][other] for other in others) / float(len(others))
+
+
+def _minimum_pair_distance(
+    index: int, remaining: Sequence[int], pair_distances: Sequence[Sequence[float]]
+) -> float:
+    others = [other for other in remaining if other != index]
+    if not others:
+        return float("inf")
+    return min(pair_distances[index][other] for other in others)
 
 
 def _is_better_spacing_score(

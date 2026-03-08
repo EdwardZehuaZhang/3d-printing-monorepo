@@ -39,7 +39,9 @@ class CoreRouterTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(metrics.touch_leg_lengths, (1.0, 1.0, 6.0))
+        self.assertEqual(metrics.start_leg_length, 1.0)
+        self.assertEqual(metrics.touch_leg_lengths, (1.0, 6.0))
+        self.assertEqual(metrics.end_leg_length, 1.0)
         self.assertEqual(metrics.total_path_length, 9.0)
 
     def test_spacing_optimizer_can_reject_shortest_path_shape(self) -> None:

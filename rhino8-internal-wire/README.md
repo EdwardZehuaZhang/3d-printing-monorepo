@@ -156,11 +156,12 @@ Conductive PLA, scaled from the published `2.0-3.5 kohm per 10 cm` value for
 It reports:
 
 - estimated total start-to-end resistance for the generated path
-- estimated resistance from the start terminal to each touch node along the final route
+- estimated touch-to-touch resistance steps before routing for the chosen node order
+- actual touch-to-touch resistance steps after routing for the final routed path
 - a logic-check comparison between the shortest-anchor node order and the spacing-aware node order when those two disagree
 - the active ordering mode and, when strategies differ, a comparison across all three available order strategies
 - a suggested Arduino send-pin resistor range of `470 kohm` to `2.2 Mohm`, with `1 Mohm` as the starting point
-- a design-rule failure if successive touch nodes are below the user-selected nominal separation threshold
+- a design-rule failure if successive touch nodes are below the user-selected nominal separation threshold, excluding the start-to-first-node and last-node-to-end terminal legs
 
 ## Use the command
 
@@ -213,6 +214,7 @@ Routing rules:
 - the retained casing-equivalent margin stays at least 0.5 mm away from the host-object wall
 - if a path between two successive optimized nodes cannot fit, the command reports that the pathway between those nodes is not big enough
 - the user chooses the minimum acceptable nominal separation between successive conductive pathway nodes in kohm for each run
+- only touch-node-to-touch-node resistance steps are checked against that threshold; the start terminal leg and end terminal leg are excluded from the spacing rule
 - `threshold-first` compares all candidate orders and chooses the shortest one that still satisfies the selected resistance threshold when possible
 - `shortest-path-first` always uses the geometrically shortest candidate order, even if another mode would create a larger resistance gap
 - `maximize-separation` chooses the candidate order with the largest minimum per-node resistance step and only breaks ties using shorter total path length

@@ -840,7 +840,7 @@ def _minimum_leg_delta_kohm(
     doc: Rhino.RhinoDoc, metrics: NodeOrderMetrics, wire_diameter_mm: float
 ) -> float:
     if not metrics.touch_leg_lengths:
-        return 0.0
+        return float("inf")
     return min(_nominal_resistance_kohm(doc, leg_length, wire_diameter_mm) for leg_length in metrics.touch_leg_lengths)
 
 
@@ -1114,26 +1114,60 @@ def _format_resistor_value(ohms: float) -> str:
 def _validate_touch_reading_spacing(
     doc: Rhino.RhinoDoc,
     touch_node_labels: Sequence[str],
-    touch_lengths: Sequence[float],
+    touch_segment_lengths: Sequence[float],
     minimum_delta_kohm: float,
     wire_diameter_mm: float,
 ) -> Optional[str]:
-    if len(touch_lengths) < 2:
+    if len(touch_segment_lengths) < 1:
         return None
 
-    previous_label = touch_node_labels[0]
-    previous_resistance = _nominal_resistance_kohm(doc, touch_lengths[0], wire_diameter_mm)
-    for label, length_value in zip(touch_node_labels[1:], touch_lengths[1:]):
-        current_resistance = _nominal_resistance_kohm(doc, length_value, wire_diameter_mm)
-        delta = current_resistance - previous_resistance
+    for previous_label, label, segment_length in zip(
+        touch_node_labels[:-1], touch_node_labels[1:], touch_segment_lengths
+    ):
+        delta = _nominal_resistance_kohm(doc, segment_length, wire_diameter_mm)
         if delta + 1e-9 < minimum_delta_kohm:
             return (
-                "{} and {} are only {:.1f} kohm apart from the start terminal. "
+                "{} and {} are only {:.1f} kohm apart along the conductive pathway. "
                 "This is below the selected minimum threshold of {:.1f} kohm. Increase spacing, reduce node count, lower the threshold for quick iteration, or use a larger host body."
             ).format(previous_label, label, delta, minimum_delta_kohm)
-        previous_label = label
-        previous_resistance = current_resistance
     return None
+
+
+def _touch_segment_lengths_from_cumulative_lengths(
+    cumulative_lengths: Sequence[float],
+) -> List[float]:
+    return [
+        current - previous
+        for previous, current in zip(cumulative_lengths[1:-2], cumulative_lengths[2:-1])
+    ]
+
+
+def _write_touch_step_report(
+    doc: Rhino.RhinoDoc,
+    touch_node_labels: Sequence[str],
+    touch_segment_lengths: Sequence[float],
+    wire_diameter_mm: float,
+    heading: str,
+) -> None:
+    if len(touch_node_labels) < 2 or len(touch_segment_lengths) < 1:
+        Rhino.RhinoApp.WriteLine("{} Not enough touch nodes to calculate touch-to-touch resistance steps.".format(heading))
+        return
+
+    Rhino.RhinoApp.WriteLine(heading)
+    for previous_label, label, segment_length in zip(
+        touch_node_labels[:-1], touch_node_labels[1:], touch_segment_lengths
+    ):
+        low, high = _resistance_range_kohm(doc, segment_length, wire_diameter_mm)
+        nominal = _nominal_resistance_kohm(doc, segment_length, wire_diameter_mm)
+        Rhino.RhinoApp.WriteLine(
+            "{} -> {}: {:.1f}-{:.1f} kohm (nominal {:.1f} kohm).".format(
+                previous_label,
+                label,
+                low,
+                high,
+                nominal,
+            )
+        )
 
 
 def _get_touch_node_flush_diameter_mm() -> Optional[float]:
@@ -1388,6 +1422,16 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     )
     ordered_touch_nodes = list(order_decision.ordered_nodes)
     ordered_labels = [node.label for node in ordered_touch_nodes]
+    if ordering_mode == ORDER_MODE_THRESHOLD_FIRST:
+        selected_metrics = {
+            ORDER_MODE_SHORTEST_PATH_FIRST: order_decision.path_metrics,
+            ORDER_MODE_THRESHOLD_FIRST: order_decision.threshold_metrics,
+            ORDER_MODE_MAXIMIZE_SEPARATION: order_decision.max_spacing_metrics,
+        }[order_decision.selected_strategy]
+    elif ordering_mode == ORDER_MODE_MAXIMIZE_SEPARATION:
+        selected_metrics = order_decision.max_spacing_metrics
+    else:
+        selected_metrics = order_decision.path_metrics
 
     if ordered_labels:
         path_min_delta = _minimum_leg_delta_kohm(doc, order_decision.path_metrics, wire_diameter_mm)
@@ -1399,7 +1443,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             order_decision.max_spacing_metrics.order,
         }) > 1:
             Rhino.RhinoApp.WriteLine(
-                "Order logic check before routing: shortest-path-first estimates {:.1f} kohm minimum step, threshold-first estimates {:.1f} kohm, and maximize-separation estimates {:.1f} kohm.".format(
+                "Order logic check before routing: shortest-path-first estimates {:.1f} kohm minimum touch-to-touch step, threshold-first estimates {:.1f} kohm, and maximize-separation estimates {:.1f} kohm. Start and end terminal legs are excluded from this comparison.".format(
                     path_min_delta,
                     threshold_min_delta,
                     max_spacing_min_delta,
@@ -1427,6 +1471,13 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if ordered_labels:
         Rhino.RhinoApp.WriteLine(
             "Optimized touch-node order for distinct readings: {}".format(" -> ".join(ordered_labels))
+        )
+        _write_touch_step_report(
+            doc,
+            ordered_labels,
+            selected_metrics.touch_leg_lengths,
+            wire_diameter_mm,
+            "Estimated touch-to-touch resistance steps before routing:",
         )
 
     Rhino.RhinoApp.WriteLine("Building routing grid...")
@@ -1483,11 +1534,19 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
 
     polyline_points = _segments_to_polyline_points(route_points, segments, grid, tolerance)
     cumulative_lengths = _cumulative_anchor_lengths(polyline_points, route_points, tolerance)
-    touch_lengths = cumulative_lengths[1:-1]
+    touch_segment_lengths = _touch_segment_lengths_from_cumulative_lengths(cumulative_lengths)
+    if ordered_labels:
+        _write_touch_step_report(
+            doc,
+            ordered_labels,
+            touch_segment_lengths,
+            wire_diameter_mm,
+            "Actual touch-to-touch resistance steps after routing:",
+        )
     sensing_error = _validate_touch_reading_spacing(
         doc,
         ordered_labels,
-        touch_lengths,
+        touch_segment_lengths,
         min_touch_reading_delta_kohm,
         wire_diameter_mm,
     )
@@ -1530,25 +1589,13 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
     )
     Rhino.RhinoApp.WriteLine(
-        "Distinct-touch targeting uses a nominal {:.1f} kohm step per successive conductive pathway node at {:.2f} mm path diameter and rejects anything below the selected {:.1f} kohm threshold."
+        "Distinct-touch targeting uses a nominal {:.1f} kohm touch-to-touch step at {:.2f} mm path diameter and rejects anything below the selected {:.1f} kohm threshold. Start and end terminal legs are not counted in that rule."
         .format(
             target_touch_reading_delta_kohm,
             wire_diameter_mm,
             min_touch_reading_delta_kohm,
         )
     )
-
-    for label, length_value in zip(route_labels[1:-1], cumulative_lengths[1:-1]):
-        low, high = _resistance_range_kohm(doc, length_value, wire_diameter_mm)
-        nominal = _nominal_resistance_kohm(doc, length_value, wire_diameter_mm)
-        Rhino.RhinoApp.WriteLine(
-            "{} is approximately {:.1f}-{:.1f} kohm from the start terminal (nominal {:.1f} kohm).".format(
-                label,
-                low,
-                high,
-                nominal,
-            )
-        )
 
     Rhino.RhinoApp.WriteLine(
         "Generated {:.2f} mm conductive pathing with a retained 0.5 mm casing-equivalent clearance margin, 0.5 mm wall clearance, a user-set conductive pathway node sphere diameter of {:.2f} mm, and 3 mm x 6 mm terminal connectors."
