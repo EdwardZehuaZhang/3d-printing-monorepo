@@ -125,6 +125,245 @@ def _build_pipe_corridor(
     return corridor
 
 
+def _axis_walk(
+    start: GridIndex, goal: GridIndex, valid_cells: Set[GridIndex]
+) -> Optional[List[GridIndex]]:
+    """Walk from *start* to *goal* stepping one axis at a time.
+
+    Returns cells **excluding** *start* but **including** *goal*, or ``None``
+    if any intermediate cell is not in *valid_cells*.
+    """
+    result: List[GridIndex] = []
+    current = [start[0], start[1], start[2]]
+    target = [goal[0], goal[1], goal[2]]
+    for axis in range(3):
+        if current[axis] == target[axis]:
+            continue
+        step_dir = 1 if target[axis] > current[axis] else -1
+        while current[axis] != target[axis]:
+            current[axis] += step_dir
+            cell = (current[0], current[1], current[2])
+            if cell not in valid_cells:
+                return None
+            result.append(cell)
+    return result
+
+
+def _build_fill_corridor(
+    pipe_path: Sequence[GridIndex],
+    valid_cells: Set[GridIndex],
+    target_length: float,
+    self_avoid_radius: int,
+) -> Set[GridIndex]:
+    """Build a corridor around the pipe wide enough for a serpentine fill."""
+    row_spacing = max(1, self_avoid_radius + 1)
+    pipe_length = max(1.0, _path_length(pipe_path))
+    needed_r_sq = target_length * row_spacing * row_spacing / (4.0 * pipe_length)
+    radius = max(4, int(math.ceil(math.sqrt(max(1.0, needed_r_sq)) * 1.8)))
+
+    pipe_xs = [p[0] for p in pipe_path]
+    pipe_ys = [p[1] for p in pipe_path]
+    pipe_zs = [p[2] for p in pipe_path]
+    min_x = min(pipe_xs) - radius
+    max_x = max(pipe_xs) + radius
+    min_y = min(pipe_ys) - radius
+    max_y = max(pipe_ys) + radius
+    min_z = min(pipe_zs) - radius
+    max_z = max(pipe_zs) + radius
+    return {
+        cell for cell in valid_cells
+        if min_x <= cell[0] <= max_x
+        and min_y <= cell[1] <= max_y
+        and min_z <= cell[2] <= max_z
+    }
+
+
+def _generate_serpentine_fill(
+    corridor: Set[GridIndex],
+    valid_cells: Set[GridIndex],
+    start: GridIndex,
+    goal: GridIndex,
+    target_length: float,
+    self_avoid_radius: int,
+) -> Optional[List[GridIndex]]:
+    """Fill *corridor* with a dense serpentine path to reach *target_length*.
+
+    Directly inspired by ``trace_filling`` from the 3dp-singlewire-sensing
+    research paper: sweep layer-by-layer, row-by-row, alternating direction,
+    connected by axis-aligned transitions between rows and layers.
+    """
+    if len(corridor) < 4:
+        return None
+
+    row_spacing = max(1, self_avoid_radius + 1)
+    layer_spacing = max(1, self_avoid_radius + 1)
+
+    # Choose sweep axes: sweep along the longest corridor dimension,
+    # layer through the shortest, rows in the middle.
+    coords = list(zip(*corridor))  # ([x …], [y …], [z …])
+    axis_ranges = []
+    for axis in range(3):
+        vals = coords[axis]
+        axis_ranges.append((max(vals) - min(vals), axis))
+    axis_ranges.sort(key=lambda r: r[0])
+    layer_axis = axis_ranges[0][1]  # thinnest
+    row_axis = axis_ranges[1][1]
+    sweep_axis = axis_ranges[2][1]  # longest
+
+    # Group corridor cells by (layer, row) → list of sweep values.
+    layer_rows: Dict[int, Dict[int, List[int]]] = {}
+    for cell in corridor:
+        lv = cell[layer_axis]
+        rv = cell[row_axis]
+        sv = cell[sweep_axis]
+        layer_rows.setdefault(lv, {}).setdefault(rv, []).append(sv)
+
+    # Select layers with spacing, ordered from start toward goal.
+    all_layers = sorted(layer_rows.keys())
+    if start[layer_axis] > goal[layer_axis]:
+        all_layers = list(reversed(all_layers))
+    selected_layers: List[int] = []
+    for lv in all_layers:
+        if not selected_layers or abs(lv - selected_layers[-1]) >= layer_spacing:
+            selected_layers.append(lv)
+
+    # Build ordered cell sequence (the abstract serpentine schedule).
+    ordered: List[GridIndex] = []
+    flip_row = False
+    flip_sweep = False
+
+    for lv in selected_layers:
+        rows = layer_rows[lv]
+        row_vals = sorted(rows.keys(), reverse=flip_row)
+
+        selected_rv: List[int] = []
+        for rv in row_vals:
+            if not selected_rv or abs(rv - selected_rv[-1]) >= row_spacing:
+                selected_rv.append(rv)
+
+        for rv in selected_rv:
+            svs = sorted(rows[rv], reverse=flip_sweep)
+            flip_sweep = not flip_sweep
+            for sv in svs:
+                cell_list = [0, 0, 0]
+                cell_list[layer_axis] = lv
+                cell_list[row_axis] = rv
+                cell_list[sweep_axis] = sv
+                ordered.append((cell_list[0], cell_list[1], cell_list[2]))
+
+        flip_row = not flip_row
+
+    if not ordered:
+        return None
+
+    # Exclude cells within self_avoid_radius of start/goal so the
+    # prefix/suffix connectors do not create close-approach violations
+    # against the serpentine body.
+    endpoint_buffer = dilate_cells({start, goal}, max(0, self_avoid_radius))
+    endpoint_buffer.discard(start)
+    endpoint_buffer.discard(goal)
+    ordered = [c for c in ordered if c not in endpoint_buffer]
+
+    if not ordered:
+        return None
+
+    # Choose the orientation (flip_row / flip_sweep combination) that
+    # places ordered[0] closest to *start*, keeping the prefix short.
+    # The ordered list was generated with a specific flip state but we
+    # can cheaply try the three other permutations.
+    def _reorder(try_flip_row: bool, try_flip_sweep: bool) -> List[GridIndex]:
+        buf: List[GridIndex] = []
+        fr = try_flip_row
+        fs = try_flip_sweep
+        for lv in selected_layers:
+            rows = layer_rows[lv]
+            rv_all = sorted(rows.keys(), reverse=fr)
+            sel: List[int] = []
+            for rv in rv_all:
+                if not sel or abs(rv - sel[-1]) >= row_spacing:
+                    sel.append(rv)
+            for rv in sel:
+                svs = sorted(rows[rv], reverse=fs)
+                fs = not fs
+                for sv in svs:
+                    cl = [0, 0, 0]
+                    cl[layer_axis] = lv
+                    cl[row_axis] = rv
+                    cl[sweep_axis] = sv
+                    buf.append((cl[0], cl[1], cl[2]))
+            fr = not fr
+        return [c for c in buf if c not in endpoint_buffer]
+
+    best_ordered = ordered
+    best_dist = _distance(start, ordered[0]) if ordered else float("inf")
+    for fr in (False, True):
+        for fs in (False, True):
+            trial = _reorder(fr, fs)
+            if trial:
+                d = _distance(start, trial[0])
+                if d < best_dist:
+                    best_dist = d
+                    best_ordered = trial
+    ordered = best_ordered
+
+    if not ordered:
+        return None
+
+    # ---- Build a connected grid path ----
+    path: List[GridIndex] = []
+
+    # 1) Route from *start* to the first serpentine cell.
+    if start == ordered[0]:
+        path.append(start)
+    else:
+        try:
+            prefix = astar_path(valid_cells, start, ordered[0])
+            path.extend(prefix)
+        except RoutingError:
+            return None
+
+    # 2) Walk through the serpentine schedule.
+    for cell in ordered:
+        if cell == path[-1]:
+            continue
+
+        last = path[-1]
+        md = abs(cell[0] - last[0]) + abs(cell[1] - last[1]) + abs(cell[2] - last[2])
+
+        if md == 1:
+            path.append(cell)
+        else:
+            walk = _axis_walk(last, cell, valid_cells)
+            if walk is not None:
+                path.extend(walk)
+            else:
+                try:
+                    micro = astar_path(valid_cells, last, cell)
+                    path.extend(micro[1:])
+                except RoutingError:
+                    continue
+
+        # Early stop once the serpentine has generated enough length.
+        est_remaining = _distance(path[-1], goal)
+        if (len(path) - 1) + est_remaining >= target_length:
+            break
+
+    # 3) Route from the serpentine exit to *goal*.
+    if path[-1] != goal:
+        try:
+            suffix = astar_path(valid_cells, path[-1], goal)
+            path.extend(suffix[1:])
+        except RoutingError:
+            return None
+
+    # Remove consecutive duplicates introduced by transition overlaps.
+    deduped: List[GridIndex] = [path[0]]
+    for cell in path[1:]:
+        if cell != deduped[-1]:
+            deduped.append(cell)
+    return deduped
+
+
 def _path_length(path: Sequence[GridIndex]) -> float:
     if len(path) < 2:
         return 0.0
@@ -744,6 +983,30 @@ def _segment_candidate_paths(
         return candidates
 
     direct_length = _path_length(direct_path)
+
+    # ---- Serpentine fill (primary strategy for large targets) ----
+    # Inspired by trace_filling from 3dp-singlewire-sensing.
+    if not allow_diagonals and target_length > direct_length * 1.5:
+        fill_corridor = _build_fill_corridor(
+            pipe_path, valid_cells, target_length, self_avoid_radius,
+        )
+        serpentine = _generate_serpentine_fill(
+            fill_corridor, valid_cells, start, goal, target_length, self_avoid_radius,
+        )
+        if serpentine is not None:
+            candidates.append(serpentine)
+            serpentine_length = _path_length(serpentine)
+            if serpentine_length >= target_length * 0.85:
+                # Serpentine reached the target — skip the expensive beam search.
+                unique = _dedupe_paths(candidates)
+                return _sort_candidate_paths(
+                    unique,
+                    target_length,
+                    roominess_map=roominess_map,
+                    valid_cells=valid_cells,
+                    bottleneck_threshold=bottleneck_threshold,
+                )[:max_candidates]
+
     candidate_waypoints = _select_detour_waypoints(
         valid_cells=candidate_valid_cells,
         start=start,
