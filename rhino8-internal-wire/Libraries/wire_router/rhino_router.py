@@ -46,7 +46,7 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_TAG = "2026-03-09 serpentine-fill-v1"
+ROUTER_BUILD_TAG = "2026-03-09 trace-spacing-fix-v1"
 
 
 @dataclass(frozen=True)
@@ -1380,7 +1380,9 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         target_leg_length,
     )
 
-    spacing_radius = max(0, int(math.ceil((wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)))
+    # Add 1 extra cell beyond the minimum center-to-center distance so that
+    # pipe geometry at bends does not merge with adjacent parallel traces.
+    spacing_radius = max(1, int(math.ceil((wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)) + 1)
     node_exemption_radius = max(
         1,
         int(math.ceil((max(flush_node_diameter_mm, TERMINAL_DIAMETER_MM) * 0.5 + wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)),

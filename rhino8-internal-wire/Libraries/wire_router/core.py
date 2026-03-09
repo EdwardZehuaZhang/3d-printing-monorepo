@@ -195,8 +195,10 @@ def _generate_serpentine_fill(
     if len(corridor) < 4:
         return None
 
-    row_spacing = max(1, self_avoid_radius + 1)
-    layer_spacing = max(1, self_avoid_radius + 1)
+    # +2 gives one full cell of clearance beyond the blocked radius,
+    # which prevents pipe geometry at bends from overlapping adjacent rows.
+    row_spacing = max(2, self_avoid_radius + 2)
+    layer_spacing = max(2, self_avoid_radius + 2)
 
     # Choose sweep axes: sweep along the longest corridor dimension,
     # layer through the shortest, rows in the middle.
