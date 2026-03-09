@@ -1128,24 +1128,18 @@ def _write_touch_step_report(
     heading: str,
 ) -> None:
     if len(touch_node_labels) < 2 or len(touch_segment_lengths) < 1:
-        Rhino.RhinoApp.WriteLine("{} Add at least two touch nodes to compare their resistance spacing.".format(heading))
         return
 
-    Rhino.RhinoApp.WriteLine(heading)
-    for previous_label, label, segment_length in zip(
-        touch_node_labels[:-1], touch_node_labels[1:], touch_segment_lengths
-    ):
-        low, high = _resistance_range_kohm(doc, segment_length, wire_diameter_mm)
-        nominal = _nominal_resistance_kohm(doc, segment_length, wire_diameter_mm)
-        Rhino.RhinoApp.WriteLine(
-            "{} -> {}: {:.1f}-{:.1f} kohm (nominal {:.1f} kohm).".format(
-                previous_label,
-                label,
-                low,
-                high,
-                nominal,
-            )
+    nominals = [
+        _nominal_resistance_kohm(doc, seg, wire_diameter_mm)
+        for seg in touch_segment_lengths
+    ]
+    avg_nominal = sum(nominals) / len(nominals)
+    Rhino.RhinoApp.WriteLine(
+        "Average resistance between touch nodes: {:.1f} kohm ({} pairs).".format(
+            avg_nominal, len(nominals)
         )
+    )
 
 
 def _get_touch_node_flush_diameter_mm() -> Optional[float]:
@@ -1369,7 +1363,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if touch_nodes is None:
         return Rhino.Commands.Result.Cancel
 
-    Rhino.RhinoApp.WriteLine("Preparing the internal routing grid...")
+    Rhino.RhinoApp.WriteLine("Routing...")
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
@@ -1378,7 +1372,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
-    Rhino.RhinoApp.WriteLine("Ranking touch-node orders against the requested resistance target...")
+    Rhino.RhinoApp.WriteLine("Ranking touch-node orders...")
     order_candidates = _target_order_candidates(
         start_terminal,
         touch_nodes,
@@ -1430,9 +1424,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
 
         attempted_orders += 1
         try:
-            Rhino.RhinoApp.WriteLine(
-                "Trying touch-node order {}...".format(" -> ".join(label for label in route_labels[1:-1]))
-            )
             segments = route_node_sequence(
                 valid_cells=valid_cells,
                 node_sequence=node_cells,
@@ -1484,33 +1475,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
 
     ordered_touch_nodes = selected_touch_nodes
     ordered_labels = [node.label for node in ordered_touch_nodes]
-    if ordered_labels:
-        Rhino.RhinoApp.WriteLine(
-            "Target resistance difference between neighboring touch nodes: {:.1f} kohm.".format(
-                target_touch_reading_delta_kohm
-            )
-        )
-        Rhino.RhinoApp.WriteLine(
-            "With the current ProtoPasta model, that target needs about {} of conductive trace between each neighboring pair of touch nodes.".format(
-                _format_length_mm(target_leg_length_mm)
-            )
-        )
-        if attempted_orders > 1:
-            Rhino.RhinoApp.WriteLine(
-                "Used the nearest routable touch-node order after rejecting {} closer candidate order(s) that did not fit.".format(
-                    attempted_orders - 1
-                )
-            )
-        Rhino.RhinoApp.WriteLine(
-            "Chosen touch-node order: {}".format(" -> ".join(ordered_labels))
-        )
-        _write_touch_step_report(
-            doc,
-            ordered_labels,
-            selected_candidate.metrics.touch_leg_lengths,
-            wire_diameter_mm,
-            "Estimated resistance difference before routing:",
-        )
 
     polyline_points = _segments_to_polyline_points(selected_route_points, selected_segments, grid, tolerance)
     cumulative_lengths = _cumulative_anchor_lengths(polyline_points, selected_route_points, tolerance)
@@ -1523,7 +1487,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             ordered_labels,
             touch_segment_lengths,
             wire_diameter_mm,
-            "Estimated resistance difference from the final routed trace:",
+            "Resistance between touch nodes:",
         )
 
     if not _add_output_geometry(
@@ -1544,36 +1508,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
 
     total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1], wire_diameter_mm)
     Rhino.RhinoApp.WriteLine(
-        "Estimated total resistance from the start terminal to the end terminal at {:.2f} mm trace diameter: {:.1f}-{:.1f} kohm.".format(
-            wire_diameter_mm,
-            total_low,
-            total_high,
-        )
-    )
-    Rhino.RhinoApp.WriteLine(
-        "Recommended Arduino series resistor: {} to {}. A good starting value is 1.00 Mohm."
-        .format(
-            _format_resistor_value(SUGGESTED_SERIES_RESISTOR_RANGE_OHM[0]),
-            _format_resistor_value(SUGGESTED_SERIES_RESISTOR_RANGE_OHM[1]),
-        )
-    )
-    Rhino.RhinoApp.WriteLine(
-        "The touch-node order search aimed for {:.1f} kohm between neighboring touch nodes at a {:.2f} mm trace diameter. The short terminal lead-in and lead-out segments were not included in that target."
-        .format(
-            target_touch_reading_delta_kohm,
-            wire_diameter_mm,
-        )
-    )
-    Rhino.RhinoApp.WriteLine(
-        "The final route spans about {:.1f} mm vertically, which is about {} print layers at 0.2 mm layer height when the shape allows it."
-        .format(
-            vertical_span_mm,
-            vertical_layer_span,
-        )
-    )
-
-    Rhino.RhinoApp.WriteLine(
-        "Created a {:.2f} mm conductive trace with {:.2f} mm touch nodes, 3 mm x 6 mm terminal connectors, 0.5 mm wall clearance, and 0.5 mm trace spacing."
-        .format(wire_diameter_mm, flush_node_diameter_mm)
+        "Total resistance: {:.1f}-{:.1f} kohm.".format(total_low, total_high)
     )
     return Rhino.Commands.Result.Success
