@@ -168,7 +168,9 @@ def _build_fill_corridor(
     self_avoid_radius: int,
 ) -> Set[GridIndex]:
     """Build a corridor around the pipe wide enough for a serpentine fill."""
-    row_spacing = max(1, self_avoid_radius + 1)
+    # Use the same spacing as _generate_serpentine_fill so the radius
+    # estimate is consistent with the actual row/layer layout.
+    row_spacing = max(2, self_avoid_radius + 2)
     pipe_length = max(1.0, _path_length(pipe_path))
     needed_r_sq = target_length * row_spacing * row_spacing / (4.0 * pipe_length)
     radius = max(4, int(math.ceil(math.sqrt(max(1.0, needed_r_sq)) * 1.8)))
@@ -182,12 +184,14 @@ def _build_fill_corridor(
     max_y = max(pipe_ys) + radius
     min_z = min(pipe_zs) - radius
     max_z = max(pipe_zs) + radius
-    return {
+    corridor = {
         cell for cell in valid_cells
         if min_x <= cell[0] <= max_x
         and min_y <= cell[1] <= max_y
         and min_z <= cell[2] <= max_z
     }
+
+    return corridor
 
 
 def _generate_serpentine_fill(
@@ -326,13 +330,42 @@ def _generate_serpentine_fill(
     # ---- Build a connected grid path ----
     path: List[GridIndex] = []
 
+    # Block only the *prefix* connector (start → first serpentine cell)
+    # so the suffix A* doesn't route back through it.  Row-to-row
+    # transitions are NOT blocked because the serpentine schedule's
+    # row_spacing (>= self_avoid_radius + 2) already guarantees that
+    # adjacent sweep rows have sufficient physical clearance.
+    prefix_blocked: Set[GridIndex] = set()
+
+    def _suffix_valid() -> Set[GridIndex]:
+        """Valid cells for the suffix A*: exclude the prefix zone."""
+        if not prefix_blocked:
+            return valid_cells
+        tv = valid_cells - prefix_blocked
+        tv.add(start)
+        tv.add(goal)
+        return tv
+
+    # Running length counter — avoids O(n²) from recomputing
+    # _path_length(path) inside the loop.
+    running_length = 0.0
+
+    def _extend_and_track(new_cells: Sequence[GridIndex]) -> None:
+        nonlocal running_length
+        for cell in new_cells:
+            if path:
+                running_length += _distance(path[-1], cell)
+            path.append(cell)
+
     # 1) Route from *start* to the first serpentine cell.
     if start == ordered[0]:
         path.append(start)
     else:
         try:
             prefix = astar_path(valid_cells, start, ordered[0])
-            path.extend(prefix)
+            _extend_and_track(prefix)
+            if self_avoid_radius > 0:
+                prefix_blocked = dilate_cells(set(prefix), self_avoid_radius)
         except RoutingError:
             return None
 
@@ -342,37 +375,52 @@ def _generate_serpentine_fill(
             continue
 
         snapshot = len(path)
+        snapshot_length = running_length
         last = path[-1]
         md = abs(cell[0] - last[0]) + abs(cell[1] - last[1]) + abs(cell[2] - last[2])
 
         if md == 1:
+            running_length += 1.0
             path.append(cell)
         else:
             walk = _axis_walk(last, cell, valid_cells)
             if walk is not None:
-                path.extend(walk)
+                _extend_and_track(walk)
             else:
                 try:
                     micro = astar_path(valid_cells, last, cell)
-                    path.extend(micro[1:])
+                    _extend_and_track(micro[1:])
                 except RoutingError:
                     # Rollback any partial approach toward the unreachable
                     # cell so the path is not stranded at a dead-end.
                     del path[snapshot:]
+                    running_length = snapshot_length
                     continue
 
         # Early stop once the serpentine has generated enough length.
         est_remaining = _distance(path[-1], goal)
-        if (len(path) - 1) + est_remaining >= target_length:
+        if running_length + est_remaining >= target_length:
             break
 
     # 3) Route from the serpentine exit to *goal*.
     if path[-1] != goal:
+        # Avoid the serpentine body so the suffix doesn't create
+        # reversals that _remove_path_reversals would collapse.
+        body = set(path)
+        suffix_cells = valid_cells - body
+        suffix_cells -= prefix_blocked
+        suffix_cells.add(path[-1])
+        suffix_cells.add(goal)
         try:
-            suffix = astar_path(valid_cells, path[-1], goal)
-            path.extend(suffix[1:])
+            suffix = astar_path(suffix_cells, path[-1], goal)
         except RoutingError:
-            return None
+            # Fall back to the prefix-only filter if the body-avoiding
+            # route is impossible (e.g. dense fills).
+            try:
+                suffix = astar_path(_suffix_valid(), path[-1], goal)
+            except RoutingError:
+                return None
+        path.extend(suffix[1:])
 
     # Remove consecutive duplicates introduced by transition overlaps.
     deduped: List[GridIndex] = [path[0]]
@@ -383,6 +431,14 @@ def _generate_serpentine_fill(
     deduped = _remove_path_reversals(deduped)
     deduped = _repair_path_continuity(deduped, valid_cells)
     deduped = _remove_path_reversals(deduped)
+
+    # Serpentine spacing correctness is guaranteed by row_spacing and
+    # layer_spacing (both >= self_avoid_radius + 2).  Do NOT apply
+    # _has_nonlocal_close_approach here — the tight U-turns between
+    # sweep rows are intentional and the geometry clearance is handled
+    # by the schedule's spacing parameters, not by Chebyshev-distance
+    # self-avoidance (which is designed for waypoint/growth paths).
+
     return deduped
 
 
@@ -1061,17 +1117,21 @@ def _sort_candidate_paths(
     roominess_lookup = roominess_map or {}
     valid = valid_cells or set()
 
-    return sorted(
-        (list(path) for path in paths),
-        key=lambda path: (
-            max(0.0, target_length - _path_length(path)),
-            max(0.0, _path_length(path) - target_length),
+    def _sort_key(path: List[GridIndex]) -> Tuple[float, float, int, int, int, int, float]:
+        length = _path_length(path)
+        return (
+            max(0.0, target_length - length),
+            max(0.0, length - target_length),
             _path_bottleneck_penalty(path, roominess_lookup, valid, bottleneck_threshold),
             _path_vertical_span(path),
             _path_layer_count(path),
             _path_xy_footprint(path),
-            -_path_length(path),
-        ),
+            -length,
+        )
+
+    return sorted(
+        (list(path) for path in paths),
+        key=_sort_key,
     )
 
 

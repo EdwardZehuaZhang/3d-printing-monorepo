@@ -46,7 +46,7 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_TAG = "2026-03-11 fix-spacing-radius-and-node-exemption"
+ROUTER_BUILD_TAG = "2026-03-11 fix-serpentine-fill-and-unit-conversion"
 
 
 @dataclass(frozen=True)
@@ -1431,7 +1431,12 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         ordered_touch_nodes = list(candidate.ordered_nodes)
         route_points = [start_terminal.anchor_point] + [node.anchor_point for node in ordered_touch_nodes] + [end_terminal.anchor_point]
         route_labels = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
-        segment_target_lengths = _segment_target_lengths(route_points, target_leg_length)
+        # Convert target_leg_length from model units (mm) to grid-cell
+        # units so that _path_length() comparisons inside core.py are
+        # consistent — _path_length() returns Euclidean distance
+        # in grid-index space where each step equals 1.0.
+        target_leg_length_cells = target_leg_length / step
+        segment_target_lengths = _segment_target_lengths(route_points, target_leg_length_cells)
 
         node_cells: List[GridIndex] = []
         mapping_failed = False
