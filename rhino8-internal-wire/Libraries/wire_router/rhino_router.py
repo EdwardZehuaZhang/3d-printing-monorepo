@@ -32,7 +32,7 @@ DEFAULT_WIRE_DIAMETER_MM = 0.5
 MIN_WIRE_DIAMETER_MM = 0.5
 CASING_THICKNESS_MM = 0.5
 BOUNDARY_CLEARANCE_MM = 0.5
-PATH_SEPARATION_MM = 0.5
+PATH_SEPARATION_MM = 1.0
 DEFAULT_TOUCH_NODE_FLUSH_DIAMETER_MM = 10.0
 MIN_TOUCH_NODE_FLUSH_DIAMETER_MM = 0.5
 TERMINAL_DIAMETER_MM = 3.0
@@ -46,7 +46,7 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_TAG = "2026-03-09 trace-spacing-fix-v1"
+ROUTER_BUILD_TAG = "2026-03-11 spacing-1mm-approach-direction"
 
 
 @dataclass(frozen=True)
@@ -1367,8 +1367,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
-            "No valid routing space was found. The part is too small for a {:.2f} mm conductive trace while also keeping 0.5 mm clearance from the outer wall and 0.5 mm spacing around the trace."
-            .format(wire_diameter_mm)
+            "No valid routing space was found. The part is too small for a {:.2f} mm conductive trace while also keeping {:.1f} mm clearance from the outer wall and {:.1f} mm spacing around the trace."
+            .format(wire_diameter_mm, BOUNDARY_CLEARANCE_MM, PATH_SEPARATION_MM)
         )
         return Rhino.Commands.Result.Failure
 

@@ -522,6 +522,75 @@ def _has_nonlocal_close_approach(
     return False
 
 
+def _cross_segment_near_approach(
+    seg_a: Sequence[GridIndex],
+    seg_b: Sequence[GridIndex],
+    radius: int,
+    shared_node: GridIndex,
+    node_adjacency: int = 1,
+) -> bool:
+    """Return True if *seg_b* comes within *radius* cells of *seg_a*
+    (Chebyshev distance), ignoring cells within *node_adjacency* of the
+    *shared_node* where the two segments meet.
+
+    This catches the case where two consecutive segments approach or leave
+    a node from the same direction, overlapping just outside the node
+    exemption zone.
+    """
+    if radius <= 0:
+        return False
+
+    node_zone = dilate_cells({shared_node}, node_adjacency)
+    a_cells = {cell for cell in seg_a if cell not in node_zone}
+    if not a_cells:
+        return False
+    blocked = dilate_cells(a_cells, radius)
+
+    for cell in seg_b:
+        if cell in node_zone:
+            continue
+        if cell in blocked:
+            return True
+    return False
+
+
+def _approach_direction(
+    path: Sequence[GridIndex],
+    from_end: bool,
+    depth: int = 3,
+) -> Optional[GridIndex]:
+    """Return a unit-step direction vector describing how *path* approaches
+    the start (from_end=False) or end (from_end=True) of the path.
+
+    Averages up to *depth* step directions then quantises to the dominant
+    axis.  Returns ``None`` if the path is too short.
+    """
+    if len(path) < 2:
+        return None
+
+    if from_end:
+        segment = list(reversed(path[-min(depth + 1, len(path)):]))
+    else:
+        segment = list(path[:min(depth + 1, len(path))])
+
+    dx, dy, dz = 0, 0, 0
+    for a, b in zip(segment[:-1], segment[1:]):
+        dx += b[0] - a[0]
+        dy += b[1] - a[1]
+        dz += b[2] - a[2]
+
+    # Quantise to the dominant axis (unit step).
+    adx, ady, adz = abs(dx), abs(dy), abs(dz)
+    dominant = max(adx, ady, adz)
+    if dominant == 0:
+        return None
+    if adx == dominant:
+        return (1 if dx > 0 else -1, 0, 0)
+    if ady == dominant:
+        return (0, 1 if dy > 0 else -1, 0)
+    return (0, 0, 1 if dz > 0 else -1)
+
+
 def _candidate_edge_detours(
     start: GridIndex,
     goal: GridIndex,
@@ -1625,6 +1694,7 @@ def route_node_sequence(
         current_penalty_cells: Set[GridIndex],
         current_blocked_cells: Set[GridIndex],
         current_segments: List[List[GridIndex]],
+        approach_directions: Dict[GridIndex, GridIndex],
     ) -> List[List[GridIndex]]:
         if segment_index >= len(node_sequence) - 1:
             return list(current_segments)
@@ -1655,6 +1725,21 @@ def route_node_sequence(
         local_penalties.discard(start)
         local_penalties.discard(goal)
 
+        # Soft approach-direction penalty: discourage departing from
+        # *start* in the same direction a previous segment arrived.
+        prev_dir = approach_directions.get(start)
+        if prev_dir is not None:
+            # Penalise cells in the direction the previous segment came from
+            # (i.e. the reversed arrival direction).  This nudges A* to
+            # leave the node in a different direction.
+            for depth in range(1, max(2, blocked_radius + 1)):
+                penalised = (
+                    start[0] + prev_dir[0] * depth,
+                    start[1] + prev_dir[1] * depth,
+                    start[2] + prev_dir[2] * depth,
+                )
+                local_penalties.add(penalised)
+
         segment_target_length = None
         if segment_target_lengths is not None:
             segment_target_length = segment_target_lengths[segment_index]
@@ -1678,6 +1763,19 @@ def route_node_sequence(
 
         last_error: Optional[RoutingError] = None
         for routed_segment in candidate_paths:
+            # Cross-segment overlap check: verify the new segment does
+            # not run parallel to the previous segment near the shared
+            # node.  The blocked_exemption_radius is deliberately NOT
+            # used here — only a tiny 1-cell zone around the shared node
+            # is exempt so that near-node overlaps are caught.
+            if blocked_radius > 0 and current_segments:
+                prev_seg = current_segments[-1]
+                shared = start
+                if _cross_segment_near_approach(
+                    prev_seg, routed_segment, blocked_radius, shared,
+                ):
+                    continue
+
             next_penalty_cells = set(current_penalty_cells)
             next_penalty_cells.update(dilate_cells(routed_segment, penalty_radius))
             next_penalty_cells.discard(start)
@@ -1687,12 +1785,20 @@ def route_node_sequence(
             if blocked_radius > 0:
                 next_blocked_cells.update(dilate_cells(routed_segment, blocked_radius))
 
+            # Record how this segment arrives at *goal* so the next
+            # segment can prefer a different departure direction.
+            next_approach = dict(approach_directions)
+            arrival_dir = _approach_direction(routed_segment, from_end=True)
+            if arrival_dir is not None:
+                next_approach[goal] = arrival_dir
+
             try:
                 return _search(
                     segment_index + 1,
                     next_penalty_cells,
                     next_blocked_cells,
                     current_segments + [compress_index_path(routed_segment)],
+                    next_approach,
                 )
             except RoutingError as error:
                 last_error = error
@@ -1711,4 +1817,4 @@ def route_node_sequence(
             "No route found between {} and {}.".format(start, goal)
         )
 
-    return _search(0, set(), set(), segments)
+    return _search(0, set(), set(), segments, {})

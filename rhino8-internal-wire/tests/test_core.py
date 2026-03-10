@@ -14,6 +14,9 @@ from wire_router.core import (
     route_node_sequence,
     _remove_path_reversals,
     _repair_path_continuity,
+    _cross_segment_near_approach,
+    _approach_direction,
+    dilate_cells,
 )
 
 
@@ -489,6 +492,80 @@ class CoreRouterTests(unittest.TestCase):
                 len(set(expanded)),
                 f"Segment {idx} contains duplicate cells (overlap).",
             )
+
+
+    # ---- cross-segment near-approach ----
+
+    def test_cross_segment_detects_parallel_overlap(self) -> None:
+        """Two segments running side by side through a shared node should overlap."""
+        #  seg_a: (0,0,0) -> (3,0,0) -> (5,0,0)  (arrives at shared node (5,0,0))
+        #  seg_b: (5,0,0) -> (3,0,0) -> (0,0,0)  (leaves shared node (5,0,0) backwards)
+        seg_a = [(0,0,0), (1,0,0), (2,0,0), (3,0,0), (4,0,0), (5,0,0)]
+        seg_b = [(5,0,0), (4,0,0), (3,0,0), (2,0,0), (1,0,0), (0,0,0)]
+        self.assertTrue(
+            _cross_segment_near_approach(seg_a, seg_b, radius=1, shared_node=(5,0,0)),
+            "Should detect overlap when segments run along the same line.",
+        )
+
+    def test_cross_segment_allows_perpendicular_departure(self) -> None:
+        """Segments departing at right angles should not overlap."""
+        seg_a = [(0,0,0), (1,0,0), (2,0,0), (3,0,0), (4,0,0), (5,0,0)]
+        # seg_b leaves (5,0,0) upward (perpendicular)
+        seg_b = [(5,0,0), (5,1,0), (5,2,0), (5,3,0)]
+        self.assertFalse(
+            _cross_segment_near_approach(seg_a, seg_b, radius=1, shared_node=(5,0,0)),
+            "Perpendicular departure should not trigger overlap.",
+        )
+
+    def test_cross_segment_no_false_positive_with_zero_radius(self) -> None:
+        seg_a = [(0,0,0), (1,0,0), (2,0,0)]
+        seg_b = [(2,0,0), (2,1,0), (2,2,0)]
+        self.assertFalse(
+            _cross_segment_near_approach(seg_a, seg_b, radius=0, shared_node=(2,0,0)),
+        )
+
+    # ---- approach direction ----
+
+    def test_approach_direction_from_end(self) -> None:
+        path = [(0,0,0), (1,0,0), (2,0,0), (3,0,0)]
+        direction = _approach_direction(path, from_end=True)
+        # Path heads in +x; from_end=True reverses the tail, so the
+        # direction vector points backwards from the endpoint: (-1, 0, 0).
+        self.assertEqual(direction, (-1, 0, 0))
+
+    def test_approach_direction_from_start(self) -> None:
+        path = [(0,0,0), (0,1,0), (0,2,0)]
+        direction = _approach_direction(path, from_end=False)
+        # From start, the path heads in +y.
+        self.assertEqual(direction, (0, 1, 0))
+
+    def test_approach_direction_too_short(self) -> None:
+        self.assertIsNone(_approach_direction([(0,0,0)], from_end=True))
+
+    # ---- cross-segment check in route_node_sequence ----
+
+    def test_multi_segment_no_near_approach_at_shared_node(self) -> None:
+        """Consecutive segments should not overlap near their shared node."""
+        valid_cells = {(x, y, 0) for x in range(12) for y in range(6)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 3, 0), (5, 3, 0), (11, 3, 0)],
+            segment_target_lengths=[12.0, 12.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=2,
+            blocked_exemption_radius=2,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 2)
+        seg_a = self._expand_segment(segments[0])
+        seg_b = self._expand_segment(segments[1])
+        shared = (5, 3, 0)
+        self.assertFalse(
+            _cross_segment_near_approach(seg_a, seg_b, radius=2, shared_node=shared),
+            "Consecutive segments overlap near their shared node.",
+        )
 
 
 if __name__ == "__main__":
