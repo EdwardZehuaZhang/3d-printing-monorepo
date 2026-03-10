@@ -1155,10 +1155,10 @@ def _write_touch_step_report(
         _nominal_resistance_kohm(doc, seg, wire_diameter_mm)
         for seg in touch_segment_lengths
     ]
-    avg_nominal = sum(nominals) / len(nominals)
+    min_nominal = min(nominals)
     Rhino.RhinoApp.WriteLine(
-        "Average resistance between touch nodes: {:.1f} kohm ({} pairs).".format(
-            avg_nominal, len(nominals)
+        "Minimum resistance between touch nodes: {:.1f} kohm ({} pairs).".format(
+            min_nominal, len(nominals)
         )
     )
 
