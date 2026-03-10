@@ -329,6 +329,7 @@ def _generate_serpentine_fill(
         if cell == path[-1]:
             continue
 
+        snapshot = len(path)
         last = path[-1]
         md = abs(cell[0] - last[0]) + abs(cell[1] - last[1]) + abs(cell[2] - last[2])
 
@@ -343,6 +344,9 @@ def _generate_serpentine_fill(
                     micro = astar_path(valid_cells, last, cell)
                     path.extend(micro[1:])
                 except RoutingError:
+                    # Rollback any partial approach toward the unreachable
+                    # cell so the path is not stranded at a dead-end.
+                    del path[snapshot:]
                     continue
 
         # Early stop once the serpentine has generated enough length.
@@ -363,7 +367,73 @@ def _generate_serpentine_fill(
     for cell in path[1:]:
         if cell != deduped[-1]:
             deduped.append(cell)
+
+    deduped = _remove_path_reversals(deduped)
+    deduped = _repair_path_continuity(deduped, valid_cells)
+    deduped = _remove_path_reversals(deduped)
     return deduped
+
+
+def _remove_path_reversals(path: List[GridIndex]) -> List[GridIndex]:
+    """Remove loops where the path revisits an earlier cell.
+
+    When cell ``path[j]`` equals ``path[i]`` (with ``j > i``), the sub-path
+    ``path[i+1 : j]`` is a loop/spur.  We keep the first visit and skip to
+    the second, effectively short-circuiting the reversal.
+    """
+    if len(path) <= 2:
+        return list(path)
+
+    cleaned: List[GridIndex] = []
+    seen: Dict[GridIndex, int] = {}
+    index = 0
+    while index < len(path):
+        cell = path[index]
+        if cell in seen:
+            # Trim back to the first occurrence and continue from here.
+            trim_to = seen[cell]
+            cleaned = cleaned[: trim_to + 1]
+            # Rebuild the lookup to match the trimmed list.
+            seen = {c: i for i, c in enumerate(cleaned)}
+        else:
+            cleaned.append(cell)
+            seen[cell] = len(cleaned) - 1
+        index += 1
+    return cleaned
+
+
+def _repair_path_continuity(
+    path: List[GridIndex],
+    valid_cells: Set[GridIndex],
+) -> List[GridIndex]:
+    """Ensure every consecutive cell pair is grid-adjacent (Manhattan dist 1).
+
+    Non-adjacent gaps are repaired with a short A* micro-path.  If a gap
+    cannot be bridged the segment is kept as-is (the caller may still use
+    the longer straight connector).
+    """
+    if len(path) < 2:
+        return list(path)
+
+    repaired: List[GridIndex] = [path[0]]
+    for cell in path[1:]:
+        prev = repaired[-1]
+        md = abs(cell[0] - prev[0]) + abs(cell[1] - prev[1]) + abs(cell[2] - prev[2])
+        if md <= 1:
+            if cell != prev:
+                repaired.append(cell)
+            continue
+        # Non-adjacent — try to bridge.
+        walk = _axis_walk(prev, cell, valid_cells)
+        if walk is not None:
+            repaired.extend(walk)
+        else:
+            try:
+                bridge = astar_path(valid_cells, prev, cell)
+                repaired.extend(bridge[1:])
+            except RoutingError:
+                repaired.append(cell)
+    return repaired
 
 
 def _path_length(path: Sequence[GridIndex]) -> float:
@@ -787,6 +857,7 @@ def _route_through_waypoints(
             combined.extend(segment)
         consumed_cells.update(segment[1:-1])
 
+    combined = _remove_path_reversals(combined)
     return combined
 
 
@@ -1080,7 +1151,9 @@ def _segment_candidate_paths(
             except RoutingError:
                 continue
 
-    unique_candidates = _dedupe_paths(candidates)
+    # Clean every candidate: remove self-overlapping loops, then dedupe.
+    cleaned_candidates = [_remove_path_reversals(path) for path in candidates]
+    unique_candidates = _dedupe_paths(cleaned_candidates)
     if target_length is not None and not allow_diagonals:
         grown_candidates = [
             _grow_path_toward_target(
@@ -1094,7 +1167,8 @@ def _segment_candidate_paths(
             )
             for path in unique_candidates
         ]
-        unique_candidates = _dedupe_paths(unique_candidates + grown_candidates)
+        grown_cleaned = [_remove_path_reversals(path) for path in grown_candidates]
+        unique_candidates = _dedupe_paths(unique_candidates + grown_cleaned)
     return _sort_candidate_paths(
         unique_candidates,
         target_length,

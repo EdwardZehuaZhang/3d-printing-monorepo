@@ -12,6 +12,8 @@ from wire_router.core import (
     optimize_node_order_for_path,
     optimize_node_order_for_target_leg_length,
     route_node_sequence,
+    _remove_path_reversals,
+    _repair_path_continuity,
 )
 
 
@@ -405,6 +407,88 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(len(segments), 2)
         self.assertGreaterEqual(self._segment_length(segments[0]), 40.0)
         self.assertGreaterEqual(self._segment_length(segments[1]), 40.0)
+
+    # ---- reversal removal ----
+
+    def test_remove_path_reversals_simple_loop(self) -> None:
+        """A→B→C→B→D should become A→B→D."""
+        path = [(0, 0, 0), (1, 0, 0), (2, 0, 0), (1, 0, 0), (1, 1, 0)]
+        result = _remove_path_reversals(path)
+        self.assertEqual(result, [(0, 0, 0), (1, 0, 0), (1, 1, 0)])
+
+    def test_remove_path_reversals_no_loop(self) -> None:
+        path = [(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)]
+        self.assertEqual(_remove_path_reversals(path), path)
+
+    def test_remove_path_reversals_nested_loops(self) -> None:
+        """A→B→C→D→C→B→E should collapse to A→B→E."""
+        path = [(0,0,0), (1,0,0), (2,0,0), (3,0,0), (2,0,0), (1,0,0), (1,1,0)]
+        result = _remove_path_reversals(path)
+        self.assertEqual(result, [(0,0,0), (1,0,0), (1,1,0)])
+
+    # ---- continuity repair ----
+
+    def test_repair_continuity_adjacent(self) -> None:
+        """Already-continuous path is unchanged."""
+        path = [(0,0,0), (1,0,0), (2,0,0)]
+        valid = {(x,0,0) for x in range(5)}
+        self.assertEqual(_repair_path_continuity(path, valid), path)
+
+    def test_repair_continuity_gap(self) -> None:
+        """Gap between (0,0,0) and (3,0,0) is filled."""
+        path = [(0,0,0), (3,0,0)]
+        valid = {(x,0,0) for x in range(5)}
+        result = _repair_path_continuity(path, valid)
+        # Every consecutive pair must be Manhattan-adjacent.
+        for a, b in zip(result[:-1], result[1:]):
+            self.assertEqual(
+                abs(a[0]-b[0]) + abs(a[1]-b[1]) + abs(a[2]-b[2]),
+                1,
+            )
+        self.assertEqual(result[0], (0,0,0))
+        self.assertEqual(result[-1], (3,0,0))
+
+    # ---- serpentine fill has no duplicate cells ----
+
+    def test_serpentine_segment_has_no_duplicate_cells(self) -> None:
+        """Routed serpentine path should never revisit a cell."""
+        valid_cells = {(x, y, 0) for x in range(14) for y in range(7)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 3, 0), (13, 3, 0)],
+            segment_target_lengths=[28.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            allow_diagonals=False,
+        )
+        expanded = self._expand_segment(segments[0])
+        self.assertEqual(
+            len(expanded),
+            len(set(expanded)),
+            "Serpentine path contains duplicate cells (overlap).",
+        )
+
+    def test_multi_segment_no_self_overlap(self) -> None:
+        """Each segment should be free of self-overlapping cells."""
+        valid_cells = {(x, y, 0) for x in range(30) for y in range(11)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 5, 0), (14, 5, 0), (29, 5, 0)],
+            segment_target_lengths=[40.0, 40.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            blocked_exemption_radius=1,
+            allow_diagonals=False,
+        )
+        for idx, seg in enumerate(segments):
+            expanded = self._expand_segment(seg)
+            self.assertEqual(
+                len(expanded),
+                len(set(expanded)),
+                f"Segment {idx} contains duplicate cells (overlap).",
+            )
 
 
 if __name__ == "__main__":
