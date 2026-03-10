@@ -901,6 +901,8 @@ def _route_through_waypoints(
     allow_diagonals: bool,
     self_avoid_radius: int,
     vertical_move_penalty: float,
+    boundary_penalty_cells: Optional[Set[GridIndex]] = None,
+    boundary_penalty_weight: float = 0.0,
 ) -> List[GridIndex]:
     combined: List[GridIndex] = []
     consumed_cells: Set[GridIndex] = set()
@@ -934,6 +936,8 @@ def _route_through_waypoints(
             penalty_weight=penalty_weight,
             allow_diagonals=allow_diagonals,
             vertical_move_penalty=vertical_move_penalty,
+            boundary_penalty_cells=boundary_penalty_cells,
+            boundary_penalty_weight=boundary_penalty_weight,
         )
 
         if combined:
@@ -1109,6 +1113,8 @@ def _segment_candidate_paths(
     vertical_move_penalty: float = 0.0,
     roominess_map: Optional[RoominessMap] = None,
     bottleneck_threshold: Optional[int] = None,
+    boundary_penalty_cells: Optional[Set[GridIndex]] = None,
+    boundary_penalty_weight: float = 0.0,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1124,6 +1130,8 @@ def _segment_candidate_paths(
         penalty_weight=penalty_weight,
         allow_diagonals=allow_diagonals,
         vertical_move_penalty=vertical_move_penalty,
+        boundary_penalty_cells=boundary_penalty_cells,
+        boundary_penalty_weight=boundary_penalty_weight,
     )
     candidate_valid_cells = valid_cells
     if target_length is not None and not allow_diagonals:
@@ -1231,6 +1239,8 @@ def _segment_candidate_paths(
                         allow_diagonals=allow_diagonals,
                         self_avoid_radius=self_avoid_radius,
                         vertical_move_penalty=target_first_vertical_penalty,
+                        boundary_penalty_cells=boundary_penalty_cells,
+                        boundary_penalty_weight=boundary_penalty_weight,
                     )
                 )
             except RoutingError:
@@ -1306,6 +1316,8 @@ def astar_path(
     penalty_weight: float = 0.0,
     allow_diagonals: bool = True,
     vertical_move_penalty: float = 0.0,
+    boundary_penalty_cells: Optional[Set[GridIndex]] = None,
+    boundary_penalty_weight: float = 0.0,
 ) -> List[GridIndex]:
     if start not in valid_cells:
         raise RoutingError(f"Start cell {start} is not inside the valid routing grid.")
@@ -1315,6 +1327,7 @@ def astar_path(
         return [start]
 
     penalties = penalty_cells or set()
+    boundary_penalties = boundary_penalty_cells or set()
     frontier: List[Tuple[float, int, GridIndex]] = []
     heapq.heappush(frontier, (0.0, 0, start))
 
@@ -1342,6 +1355,8 @@ def astar_path(
                 tentative += vertical_move_penalty * abs(offset[2])
             if neighbor in penalties:
                 tentative += penalty_weight
+            if boundary_penalties and neighbor in boundary_penalties:
+                tentative += boundary_penalty_weight
 
             if tentative >= g_score.get(neighbor, float("inf")):
                 continue
@@ -1706,6 +1721,17 @@ def route_node_sequence(
     roominess_map = _build_roominess_map(valid_cells)
     bottleneck_threshold = _bottleneck_threshold(roominess_map)
 
+    # Pre-compute boundary-penalty cells: cells near the geometry boundary
+    # (low roominess) get a soft A* cost penalty so paths prefer the
+    # interior.  This leaves more room for serpentine fills and reduces
+    # the chance of cross-segment overlaps near tight boundary regions.
+    boundary_penalty_cells: Optional[Set[GridIndex]] = None
+    if bottleneck_threshold > 0:
+        boundary_penalty_cells = frozenset(
+            cell for cell, roominess in roominess_map.items()
+            if roominess < bottleneck_threshold
+        )
+
     def _search(
         segment_index: int,
         current_penalty_cells: Set[GridIndex],
@@ -1774,9 +1800,31 @@ def route_node_sequence(
                 vertical_move_penalty=vertical_move_penalty,
                 roominess_map=roominess_map,
                 bottleneck_threshold=bottleneck_threshold,
+                boundary_penalty_cells=boundary_penalty_cells,
+                boundary_penalty_weight=0.2,
             )
         except RoutingError:
             candidate_paths = []
+
+        # Pre-compute blocked zone from non-adjacent prior segments
+        # (segments that share no start/goal node with the current one).
+        # The blocked_exemption_radius around start/goal allows A* to
+        # route through previously-blocked territory near those nodes,
+        # but this can cause a path to overlap with a non-adjacent
+        # earlier segment.  This set catches that case cheaply.
+        non_adjacent_blocked: Optional[Set[GridIndex]] = None
+        if blocked_radius > 0 and len(current_segments) >= 2:
+            non_adj_cells: Set[GridIndex] = set()
+            for prev_idx in range(len(current_segments) - 1):
+                non_adj_cells.update(current_segments[prev_idx])
+            non_adj_cells.discard(start)
+            non_adj_cells.discard(goal)
+            if non_adj_cells:
+                non_adjacent_blocked = dilate_cells(non_adj_cells, blocked_radius)
+                # Tight exemption: only exempt cells within 1 cell of
+                # start/goal so routes can still approach their endpoints.
+                node_exempt = dilate_cells({start, goal}, 1)
+                non_adjacent_blocked.difference_update(node_exempt)
 
         last_error: Optional[RoutingError] = None
         for routed_segment in candidate_paths:
@@ -1791,6 +1839,13 @@ def route_node_sequence(
                 if _cross_segment_near_approach(
                     prev_seg, routed_segment, blocked_radius, shared,
                 ):
+                    continue
+
+            # Non-adjacent segment overlap check: reject candidates that
+            # wander through the exemption zone into territory blocked by
+            # segments that do not directly connect to start or goal.
+            if non_adjacent_blocked is not None:
+                if any(cell in non_adjacent_blocked for cell in routed_segment):
                     continue
 
             next_penalty_cells = set(current_penalty_cells)

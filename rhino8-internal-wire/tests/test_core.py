@@ -12,6 +12,7 @@ from wire_router.core import (
     optimize_node_order_for_path,
     optimize_node_order_for_target_leg_length,
     route_node_sequence,
+    astar_path,
     _remove_path_reversals,
     _repair_path_continuity,
     _cross_segment_near_approach,
@@ -565,6 +566,65 @@ class CoreRouterTests(unittest.TestCase):
         self.assertFalse(
             _cross_segment_near_approach(seg_a, seg_b, radius=2, shared_node=shared),
             "Consecutive segments overlap near their shared node.",
+        )
+
+    def test_non_adjacent_segments_maintain_spacing(self) -> None:
+        """Non-adjacent segments must not encroach within blocked_radius."""
+        valid_cells = {(x, y, 0) for x in range(25) for y in range(10)}
+        blocked_radius = 1
+        node_seq = [(0, 5, 0), (6, 5, 0), (12, 5, 0), (18, 5, 0), (24, 5, 0)]
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=node_seq,
+            segment_target_lengths=[None, 18.0, 18.0, None],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=blocked_radius,
+            blocked_exemption_radius=2,
+            allow_diagonals=False,
+        )
+        self.assertEqual(len(segments), 4)
+        # Non-adjacent segment pairs must not come within blocked_radius
+        # of each other (shared endpoints are exempt).
+        endpoints = {c for s in segments for c in (s[0], s[-1])}
+        for i in range(len(segments)):
+            expanded_i = set(self._expand_segment(segments[i]))
+            for j in range(i + 2, len(segments)):
+                expanded_j = set(self._expand_segment(segments[j]))
+                check_i = expanded_i - endpoints
+                check_j = expanded_j - endpoints
+                overlap = check_j & dilate_cells(check_i, blocked_radius)
+                self.assertFalse(
+                    overlap,
+                    f"Segments {i} and {j} violate spacing (cells: {overlap}).",
+                )
+
+    def test_boundary_penalty_in_astar(self) -> None:
+        """astar_path with boundary_penalty_cells avoids penalised cells."""
+        valid_cells = {(x, y, 0) for x in range(10) for y in range(5)}
+        # Mark the direct row y=0 as boundary-penalty cells.
+        boundary = {(x, 0, 0) for x in range(10)}
+        # Without penalty: direct path along y=0 (shortest).
+        direct = astar_path(
+            valid_cells=valid_cells,
+            start=(0, 0, 0),
+            goal=(9, 0, 0),
+            allow_diagonals=False,
+        )
+        self.assertTrue(all(c[1] == 0 for c in direct))
+        # With heavy boundary penalty, path should detour to avoid y=0.
+        detoured = astar_path(
+            valid_cells=valid_cells,
+            start=(0, 0, 0),
+            goal=(9, 0, 0),
+            allow_diagonals=False,
+            boundary_penalty_cells=boundary,
+            boundary_penalty_weight=5.0,
+        )
+        interior_cells = [c for c in detoured if c[1] > 0]
+        self.assertTrue(
+            len(interior_cells) > 0,
+            "With heavy boundary penalty, path should move to interior rows.",
         )
 
 

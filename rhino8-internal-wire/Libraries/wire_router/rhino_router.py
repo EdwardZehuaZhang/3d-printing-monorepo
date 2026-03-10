@@ -46,7 +46,7 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_TAG = "2026-03-11 spacing-1mm-approach-direction"
+ROUTER_BUILD_TAG = "2026-03-11 non-adjacent-overlap-check-boundary-penalty"
 
 
 @dataclass(frozen=True)
