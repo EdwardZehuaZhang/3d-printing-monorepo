@@ -813,13 +813,34 @@ def _build_valid_grid(
     grid = GridSpec(origin=origin, step=step)
 
     valid_cells: Set[GridIndex] = set()
+    # Pre-compute z coordinates to avoid repeated multiplication.
+    z_coords = [origin[2] + iz * step for iz in range(z_count)]
+    # Column probe indices: sample a few z-levels to quickly reject
+    # columns that lie entirely outside the mesh (e.g. the donut hole).
+    probe_set: Set[int] = {0}
+    if z_count > 1:
+        probe_set.add(z_count - 1)
+    if z_count > 2:
+        probe_set.add(z_count // 2)
+    if z_count > 4:
+        probe_set.add(z_count // 4)
+        probe_set.add(3 * z_count // 4)
+
     for ix in range(x_count):
         x = origin[0] + ix * step
         for iy in range(y_count):
             y = origin[1] + iy * step
+            # Quick column rejection: if no probe point is inside, skip.
+            column_has_interior = False
+            for pz in probe_set:
+                if mesh.IsPointInside(rg.Point3d(x, y, z_coords[pz]), tolerance, False):
+                    column_has_interior = True
+                    break
+            if not column_has_interior:
+                continue
+
             for iz in range(z_count):
-                z = origin[2] + iz * step
-                point = rg.Point3d(x, y, z)
+                point = rg.Point3d(x, y, z_coords[iz])
                 if not mesh.IsPointInside(point, tolerance, False):
                     continue
                 if _mesh_distance(mesh, point) + tolerance < route_clearance:

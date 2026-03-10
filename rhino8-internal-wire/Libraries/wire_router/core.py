@@ -14,6 +14,9 @@ class RoutingError(RuntimeError):
     """Raised when a valid route cannot be found."""
 
 
+_DILATION_OFFSET_CACHE: Dict[int, Tuple[Tuple[int, int, int], ...]] = {}
+
+
 @dataclass(frozen=True)
 class GridSpec:
     origin: FloatPoint
@@ -56,15 +59,24 @@ def _movement_distance(a: GridIndex, b: GridIndex, allow_diagonals: bool) -> flo
     return float(abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]))
 
 
+def _dilation_offsets(radius: int) -> Tuple[Tuple[int, int, int], ...]:
+    """Return cached offset tuples for the given Chebyshev radius."""
+    if radius in _DILATION_OFFSET_CACHE:
+        return _DILATION_OFFSET_CACHE[radius]
+    offsets = tuple(
+        (dx, dy, dz)
+        for dx in range(-radius, radius + 1)
+        for dy in range(-radius, radius + 1)
+        for dz in range(-radius, radius + 1)
+    )
+    _DILATION_OFFSET_CACHE[radius] = offsets
+    return offsets
+
+
 def _local_roominess(valid_cells: Set[GridIndex], center: GridIndex, radius: int = 2) -> int:
-    roominess = 0
-    for dx in range(-radius, radius + 1):
-        for dy in range(-radius, radius + 1):
-            for dz in range(-radius, radius + 1):
-                candidate = (center[0] + dx, center[1] + dy, center[2] + dz)
-                if candidate in valid_cells:
-                    roominess += 1
-    return roominess
+    offsets = _dilation_offsets(radius)
+    cx, cy, cz = center
+    return sum(1 for dx, dy, dz in offsets if (cx + dx, cy + dy, cz + dz) in valid_cells)
 
 
 def _build_roominess_map(valid_cells: Set[GridIndex], radius: int = 2) -> RoominessMap:
@@ -510,15 +522,16 @@ def _has_nonlocal_close_approach(
     if radius <= 0:
         return len(set(path)) != len(path)
 
-    for current_index, current in enumerate(path):
-        for previous_index in range(0, max(0, current_index - local_window)):
-            previous = path[previous_index]
-            if max(
-                abs(current[0] - previous[0]),
-                abs(current[1] - previous[1]),
-                abs(current[2] - previous[2]),
-            ) <= radius:
+    # Spatial-dict approach: O(n * r^3) instead of O(n^2).
+    offsets = _dilation_offsets(radius)
+    earliest: Dict[GridIndex, int] = {}
+    for i, cell in enumerate(path):
+        for dx, dy, dz in offsets:
+            nb = (cell[0] + dx, cell[1] + dy, cell[2] + dz)
+            if nb in earliest and i - earliest[nb] > local_window:
                 return True
+        if cell not in earliest:
+            earliest[cell] = i
     return False
 
 
@@ -647,6 +660,7 @@ def _is_valid_detour_candidate(
     valid_cells: Set[GridIndex],
     occupied_cells: Set[GridIndex],
     self_avoid_radius: int,
+    precomputed_blocked: Optional[Set[GridIndex]] = None,
 ) -> bool:
     if len(set(candidate)) != len(candidate):
         return False
@@ -660,7 +674,7 @@ def _is_valid_detour_candidate(
     if self_avoid_radius <= 0:
         return True
 
-    blocked_cells = dilate_cells(occupied_cells, self_avoid_radius)
+    blocked_cells = precomputed_blocked if precomputed_blocked is not None else dilate_cells(occupied_cells, self_avoid_radius)
     if internal & blocked_cells:
         return False
 
@@ -687,8 +701,8 @@ def _grow_path_toward_target(
         return grown
 
     max_iterations = min(
-        max(32, int(target_length - current_length) * 2),
-        max(32, len(valid_cells) * 2),
+        max(16, int(target_length - current_length)),
+        max(16, len(valid_cells)),
     )
     for _ in range(max_iterations):
         if current_length + 1e-9 >= target_length:
@@ -701,7 +715,7 @@ def _grow_path_toward_target(
                 _roominess(roominess_map, candidate_valid_cells, grown[index + 1]),
             ),
             reverse=True,
-        )
+        )[:40]
 
         best_replacement: Optional[List[GridIndex]] = None
         best_score: Optional[Tuple[float, bool, int, int, int, float]] = None
@@ -713,18 +727,20 @@ def _grow_path_toward_target(
 
             local_exemption = dilate_cells({start, goal}, max(1, self_avoid_radius + 1))
             local_occupied = {cell for cell in grown if cell not in local_exemption}
+            edge_blocked = dilate_cells(local_occupied, self_avoid_radius) if self_avoid_radius > 0 else set()
 
             for candidate in _candidate_edge_detours(
                 start,
                 goal,
-                max_primary_depth=6,
-                max_secondary_depth=4,
+                max_primary_depth=4,
+                max_secondary_depth=3,
             ):
                 if not _is_valid_detour_candidate(
                     candidate,
                     candidate_valid_cells,
                     local_occupied,
                     self_avoid_radius,
+                    precomputed_blocked=edge_blocked,
                 ):
                     continue
 
@@ -1089,7 +1105,7 @@ def _segment_candidate_paths(
     allow_diagonals: bool,
     target_length: Optional[float],
     self_avoid_radius: int = 0,
-    max_candidates: int = 14,
+    max_candidates: int = 8,
     vertical_move_penalty: float = 0.0,
     roominess_map: Optional[RoominessMap] = None,
     bottleneck_threshold: Optional[int] = None,
@@ -1155,15 +1171,15 @@ def _segment_candidate_paths(
         goal=goal,
         direct_length=direct_length,
         target_length=target_length,
-        limit=18,
+        limit=12,
         allow_diagonals=allow_diagonals,
         roominess_map=roominess_map,
         bottleneck_threshold=bottleneck_threshold,
     )
 
     beam: List[Tuple[GridIndex, ...]] = [tuple()]
-    beam_width = 14
-    max_waypoints = 4
+    beam_width = 8
+    max_waypoints = 3
     for _ in range(max_waypoints):
         expanded: List[Tuple[Tuple[float, float, int, int, int, float, float], Tuple[GridIndex, ...]]] = []
         for waypoint_sequence in beam:
@@ -1247,26 +1263,28 @@ def _segment_candidate_paths(
     )[:max_candidates]
 
 
-def _neighbor_offsets(allow_diagonals: bool) -> Iterator[Tuple[GridIndex, float]]:
-    if allow_diagonals:
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for dz in (-1, 0, 1):
-                    if dx == 0 and dy == 0 and dz == 0:
-                        continue
-                    yield (dx, dy, dz), math.sqrt(dx * dx + dy * dy + dz * dz)
-        return
+_AXIAL_NEIGHBOR_OFFSETS: Tuple[Tuple[GridIndex, float], ...] = (
+    ((1, 0, 0), 1.0),
+    ((-1, 0, 0), 1.0),
+    ((0, 1, 0), 1.0),
+    ((0, -1, 0), 1.0),
+    ((0, 0, 1), 1.0),
+    ((0, 0, -1), 1.0),
+)
 
-    axial_offsets = (
-        ((1, 0, 0), 1.0),
-        ((-1, 0, 0), 1.0),
-        ((0, 1, 0), 1.0),
-        ((0, -1, 0), 1.0),
-        ((0, 0, 1), 1.0),
-        ((0, 0, -1), 1.0),
-    )
-    for offset, cost in axial_offsets:
-        yield offset, cost
+_DIAGONAL_NEIGHBOR_OFFSETS: Tuple[Tuple[GridIndex, float], ...] = tuple(
+    ((dx, dy, dz), math.sqrt(dx * dx + dy * dy + dz * dz))
+    for dx in (-1, 0, 1)
+    for dy in (-1, 0, 1)
+    for dz in (-1, 0, 1)
+    if not (dx == 0 and dy == 0 and dz == 0)
+)
+
+
+def _neighbor_offsets(allow_diagonals: bool) -> Tuple[Tuple[GridIndex, float], ...]:
+    if allow_diagonals:
+        return _DIAGONAL_NEIGHBOR_OFFSETS
+    return _AXIAL_NEIGHBOR_OFFSETS
 
 
 def _reconstruct_path(
@@ -1342,12 +1360,11 @@ def dilate_cells(cells: Iterable[GridIndex], radius: int) -> Set[GridIndex]:
     if radius <= 0:
         return set(cells)
 
+    offsets = _dilation_offsets(radius)
     dilated: Set[GridIndex] = set()
     for cx, cy, cz in cells:
-        for dx in range(-radius, radius + 1):
-            for dy in range(-radius, radius + 1):
-                for dz in range(-radius, radius + 1):
-                    dilated.add((cx + dx, cy + dy, cz + dz))
+        for dx, dy, dz in offsets:
+            dilated.add((cx + dx, cy + dy, cz + dz))
     return dilated
 
 
