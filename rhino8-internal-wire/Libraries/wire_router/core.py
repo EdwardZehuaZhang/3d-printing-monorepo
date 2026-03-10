@@ -1821,9 +1821,10 @@ def route_node_sequence(
             non_adj_cells.discard(goal)
             if non_adj_cells:
                 non_adjacent_blocked = dilate_cells(non_adj_cells, blocked_radius)
-                # Tight exemption: only exempt cells within 1 cell of
-                # start/goal so routes can still approach their endpoints.
-                node_exempt = dilate_cells({start, goal}, 1)
+                # Exempt cells near start/goal so the path can still
+                # reach its endpoints.  Using only 1 cell was too tight
+                # and prevented valid routes in dense layouts.
+                node_exempt = dilate_cells({start, goal}, max(2, blocked_radius))
                 non_adjacent_blocked.difference_update(node_exempt)
 
         last_error: Optional[RoutingError] = None

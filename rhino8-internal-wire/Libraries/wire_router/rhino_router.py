@@ -46,7 +46,7 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_TAG = "2026-03-11 non-adjacent-overlap-check-boundary-penalty"
+ROUTER_BUILD_TAG = "2026-03-11 fix-spacing-radius-and-node-exemption"
 
 
 @dataclass(frozen=True)
@@ -1401,12 +1401,21 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         target_leg_length,
     )
 
-    # Add 1 extra cell beyond the minimum center-to-center distance so that
-    # pipe geometry at bends does not merge with adjacent parallel traces.
-    spacing_radius = max(1, int(math.ceil((wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)) + 1)
+    # dilate_cells blocks cells within Chebyshev radius R of each path
+    # cell, so the next path starts at distance R+1.  We need
+    # (R+1)*step >= wire_diameter + PATH_SEPARATION for the required
+    # edge-to-edge gap, i.e.  R >= (wire_d + sep) / step - 1.
+    spacing_radius = max(1, int(math.ceil(
+        (wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step - 1.0
+    )))
+    # The node exemption only needs to cover the physical node radius
+    # plus a small margin so paths can still reach the node through
+    # blocked zones.  Using the full node_diameter/2 + wire + separation
+    # made the zone far too large, allowing paths to run parallel with no
+    # spacing enforcement near nodes.
     node_exemption_radius = max(
-        1,
-        int(math.ceil((max(flush_node_diameter_mm, TERMINAL_DIAMETER_MM) * 0.5 + wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step)),
+        spacing_radius + 1,
+        int(math.ceil(max(flush_node_diameter_mm, TERMINAL_DIAMETER_MM) * 0.5 * _mm_to_model(doc, 1.0) / step)) + 1,
     )
 
     selected_candidate: Optional[TouchNodeOrderCandidate] = None
