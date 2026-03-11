@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -39,6 +40,7 @@ TERMINAL_DIAMETER_MM = 3.0
 TERMINAL_LENGTH_MM = 6.0
 MAX_DP_NODES = 10
 MAX_EXACT_TOUCH_ORDER_NODES = 6
+MAX_ORDER_CANDIDATES = 5
 DEFAULT_TOUCH_READING_DELTA_KOHM = 50.0
 MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
@@ -46,7 +48,7 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.75
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (2.0, 3.5)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_TAG = "2026-03-11 fix-serpentine-fill-and-unit-conversion"
+ROUTER_BUILD_TAG = "2026-03-11 perf-14-node-scaling"
 
 
 @dataclass(frozen=True)
@@ -174,15 +176,20 @@ def _estimate_grid_cells(bbox: rg.BoundingBox, step: float) -> int:
     return x_count * y_count * z_count
 
 
-def _auto_step(mesh: rg.Mesh, doc: Rhino.RhinoDoc, wire_diameter_mm: float) -> float:
+def _auto_step(mesh: rg.Mesh, doc: Rhino.RhinoDoc, wire_diameter_mm: float, node_count: int = 0) -> float:
     bbox = mesh.GetBoundingBox(True)
     diagonal = bbox.Diagonal.Length
     minimum = max(_mm_to_model(doc, wire_diameter_mm), doc.ModelAbsoluteTolerance * 2.0)
     step = max(minimum, diagonal / 100.0)
 
+    # Reduce the cell budget for high node counts so A* calls stay fast.
+    effective_max = MAX_ESTIMATED_CELLS
+    if node_count > 8:
+        effective_max = int(MAX_ESTIMATED_CELLS * 8.0 / node_count)
+
     estimated = _estimate_grid_cells(bbox, step)
-    if estimated > MAX_ESTIMATED_CELLS:
-        step *= (estimated / float(MAX_ESTIMATED_CELLS)) ** (1.0 / 3.0)
+    if estimated > effective_max:
+        step *= (estimated / float(effective_max)) ** (1.0 / 3.0)
     return step
 
 
@@ -372,7 +379,7 @@ def _target_order_candidates(
             candidate.metrics.total_path_length,
         )
     )
-    return candidates
+    return candidates[:MAX_ORDER_CANDIDATES]
 
 
 def _create_touch_node(
@@ -1357,7 +1364,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         return Rhino.Commands.Result.Cancel
 
     node_radius = _mm_to_model(doc, flush_node_diameter_mm * 0.5)
-    step = _auto_step(mesh, doc, wire_diameter_mm)
     target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm, wire_diameter_mm)
     target_leg_length_mm = _model_to_mm(doc, target_leg_length)
 
@@ -1383,6 +1389,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     )
     if touch_nodes is None:
         return Rhino.Commands.Result.Cancel
+
+    step = _auto_step(mesh, doc, wire_diameter_mm, node_count=len(touch_nodes))
 
     Rhino.RhinoApp.WriteLine("Routing...")
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
@@ -1460,6 +1468,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
 
         attempted_orders += 1
+        per_order_budget = max(30.0, 120.0 / max(1, len(order_candidates)))
+        deadline = time.monotonic() + per_order_budget
         try:
             segments = route_node_sequence(
                 valid_cells=valid_cells,
@@ -1474,6 +1484,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                 node_labels=route_labels,
                 allow_diagonals=False,
                 vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
+                deadline=deadline,
             )
         except RoutingError as error:
             if first_failure_reason is None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -1175,6 +1176,8 @@ def _segment_candidate_paths(
     bottleneck_threshold: Optional[int] = None,
     boundary_penalty_cells: Optional[Set[GridIndex]] = None,
     boundary_penalty_weight: float = 0.0,
+    beam_width: int = 8,
+    beam_max_waypoints: int = 3,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1246,9 +1249,7 @@ def _segment_candidate_paths(
     )
 
     beam: List[Tuple[GridIndex, ...]] = [tuple()]
-    beam_width = 8
-    max_waypoints = 3
-    for _ in range(max_waypoints):
+    for _ in range(beam_max_waypoints):
         expanded: List[Tuple[Tuple[float, float, int, int, int, float, float], Tuple[GridIndex, ...]]] = []
         for waypoint_sequence in beam:
             used = set(waypoint_sequence)
@@ -1766,6 +1767,7 @@ def route_node_sequence(
     node_labels: Optional[Sequence[str]] = None,
     allow_diagonals: bool = True,
     vertical_move_penalty: float = 0.0,
+    deadline: Optional[float] = None,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
@@ -1781,6 +1783,22 @@ def route_node_sequence(
     roominess_map = _build_roominess_map(valid_cells)
     bottleneck_threshold = _bottleneck_threshold(roominess_map)
 
+    # Adaptive beam search: reduce beam width and waypoint depth for
+    # high node counts to keep per-segment candidate generation fast.
+    num_segments = len(node_sequence) - 1
+    if num_segments > 8:
+        seg_beam_width = 4
+        seg_beam_max_waypoints = 2
+    else:
+        seg_beam_width = 8
+        seg_beam_max_waypoints = 3
+
+    # Maximum number of segments to backtrack when a downstream segment
+    # fails.  Deep backtracking is exponentially expensive and rarely
+    # productive — failing the order early and trying the next one is
+    # almost always a better strategy.
+    max_backtrack_depth = 3
+
     # Pre-compute boundary-penalty cells: cells near the geometry boundary
     # (low roominess) get a soft A* cost penalty so paths prefer the
     # interior.  This leaves more room for serpentine fills and reduces
@@ -1792,6 +1810,10 @@ def route_node_sequence(
             if roominess < bottleneck_threshold
         )
 
+    # Track the furthest segment reached so far (shared mutable state)
+    # so that _search can enforce the backtracking-depth limit.
+    frontier_reached = [0]
+
     def _search(
         segment_index: int,
         current_penalty_cells: Set[GridIndex],
@@ -1801,6 +1823,18 @@ def route_node_sequence(
     ) -> List[List[GridIndex]]:
         if segment_index >= len(node_sequence) - 1:
             return list(current_segments)
+
+        # Enforce per-order time budget.
+        if deadline is not None and time.monotonic() > deadline:
+            raise RoutingError("Routing timed out for this node order.")
+
+        # Enforce backtracking-depth limit.
+        if segment_index > frontier_reached[0]:
+            frontier_reached[0] = segment_index
+        elif frontier_reached[0] - segment_index > max_backtrack_depth:
+            raise RoutingError(
+                "Backtracking depth exceeded at segment {}.".format(segment_index)
+            )
 
         start = node_sequence[segment_index]
         goal = node_sequence[segment_index + 1]
@@ -1862,6 +1896,8 @@ def route_node_sequence(
                 bottleneck_threshold=bottleneck_threshold,
                 boundary_penalty_cells=boundary_penalty_cells,
                 boundary_penalty_weight=0.2,
+                beam_width=seg_beam_width,
+                beam_max_waypoints=seg_beam_max_waypoints,
             )
         except RoutingError:
             candidate_paths = []
