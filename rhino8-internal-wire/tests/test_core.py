@@ -628,5 +628,47 @@ class CoreRouterTests(unittest.TestCase):
         )
 
 
+    def test_paths_maintain_clearance_from_non_connected_nodes(self) -> None:
+        """Segments must not pass within (reserved_radius + blocked_radius)
+        of nodes they don't connect to."""
+        valid_cells = {(x, y, 0) for x in range(30) for y in range(12)}
+        blocked_radius = 2
+        reserved_exemption_radius = 2
+        # 5 nodes spread along x=0..28, y=6 (centre row).  A middle
+        # node at (14,6) is a non-endpoint for the first and last segs.
+        node_seq = [(0, 6, 0), (7, 6, 0), (14, 6, 0), (21, 6, 0), (28, 6, 0)]
+        reserved = set()
+        for node in node_seq:
+            reserved.update(dilate_cells({node}, reserved_exemption_radius))
+
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=node_seq,
+            segment_target_lengths=[12.0, 12.0, 12.0, 12.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=blocked_radius,
+            blocked_exemption_radius=blocked_radius + 1,
+            reserved_cells=reserved,
+            reserved_exemption_radius=reserved_exemption_radius,
+            allow_diagonals=False,
+        )
+        self.assertEqual(len(segments), 4)
+        keepout_radius = reserved_exemption_radius + blocked_radius
+        for seg_idx, seg in enumerate(segments):
+            expanded = set(self._expand_segment(seg))
+            seg_start = seg[0]
+            seg_end = seg[-1]
+            for node in node_seq:
+                if node == seg_start or node == seg_end:
+                    continue
+                too_close = expanded & dilate_cells({node}, keepout_radius)
+                self.assertFalse(
+                    too_close,
+                    f"Segment {seg_idx} passes within keepout of non-"
+                    f"connected node {node} (cells: {too_close}).",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

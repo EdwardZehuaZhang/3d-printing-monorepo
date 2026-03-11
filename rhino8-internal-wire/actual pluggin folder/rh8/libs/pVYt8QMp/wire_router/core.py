@@ -174,7 +174,9 @@ def _build_fill_corridor(
     row_spacing = max(2, self_avoid_radius + 2)
     pipe_length = max(1.0, _path_length(pipe_path))
     needed_r_sq = target_length * row_spacing * row_spacing / (4.0 * pipe_length)
-    radius = max(4, int(math.ceil(math.sqrt(max(1.0, needed_r_sq)) * 1.8)))
+    # Use a generous multiplier (3.0) so the serpentine can exploit
+    # available space even when multiple segments compete for room.
+    radius = max(4, int(math.ceil(math.sqrt(max(1.0, needed_r_sq)) * 3.0)))
 
     pipe_xs = [p[0] for p in pipe_path]
     pipe_ys = [p[1] for p in pipe_path]
@@ -191,6 +193,13 @@ def _build_fill_corridor(
         and min_y <= cell[1] <= max_y
         and min_z <= cell[2] <= max_z
     }
+
+    # If the bounding-box corridor is too small relative to the
+    # target, fall back to all valid cells so the serpentine can
+    # fill whatever space remains in the grid.
+    min_cells_needed = int(target_length * 1.5)
+    if len(corridor) < min_cells_needed:
+        corridor = set(valid_cells)
 
     return corridor
 
@@ -1789,6 +1798,18 @@ def route_node_sequence(
     roominess_map = _build_roominess_map(valid_cells)
     bottleneck_threshold = _bottleneck_threshold(roominess_map)
 
+    # Precompute node keepout zones: for each node, the set of cells
+    # that paths NOT connecting to that node must avoid.  The radius
+    # covers the physical node volume (reserved_exemption_radius) plus
+    # the wire-to-node edge-to-edge clearance (blocked_radius).
+    node_keepout_radius = reserved_exemption_radius + blocked_radius if blocked_radius > 0 else 0
+    per_node_keepout: Dict[GridIndex, FrozenSet[GridIndex]] = {}
+    if node_keepout_radius > 0 and len(node_sequence) > 2:
+        for node in set(node_sequence):
+            per_node_keepout[node] = frozenset(
+                dilate_cells({node}, node_keepout_radius)
+            )
+
     # Adaptive beam search: reduce beam width and waypoint depth for
     # high node counts to keep per-segment candidate generation fast.
     num_segments = len(node_sequence) - 1
@@ -1866,6 +1887,26 @@ def route_node_sequence(
             local_blocked.discard(start)
             local_blocked.discard(goal)
             segment_valid_cells.difference_update(local_blocked)
+
+        # Enforce wire-to-node edge-to-edge clearance for nodes that
+        # are NOT the current segment's endpoints.  reserved_cells
+        # blocks only the physical node volume; this extends that by
+        # blocked_radius so the conductive wire maintains at least
+        # PATH_SEPARATION_MM gap from every non-connected node.
+        if per_node_keepout:
+            endpoint_safe = dilate_cells(
+                {start, goal}, blocked_exemption_radius
+            )
+            for node in node_sequence:
+                if node == start or node == goal:
+                    continue
+                if node in per_node_keepout:
+                    segment_valid_cells.difference_update(
+                        per_node_keepout[node] - endpoint_safe
+                    )
+            # Ensure start/goal always remain routable.
+            segment_valid_cells.add(start)
+            segment_valid_cells.add(goal)
 
         local_penalties = set(current_penalty_cells)
         local_penalties.discard(start)
