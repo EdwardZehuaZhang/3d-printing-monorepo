@@ -41,14 +41,14 @@ TERMINAL_LENGTH_MM = 6.0
 MAX_DP_NODES = 10
 MAX_EXACT_TOUCH_ORDER_NODES = 6
 MAX_ORDER_CANDIDATES = 5
-DEFAULT_TOUCH_READING_DELTA_KOHM = 50.0
+DEFAULT_TOUCH_READING_DELTA_KOHM = 10.0
 MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
 PROTO_PASTA_BASE_DIAMETER_MM = 1.5
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (4.8, 5.0)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_TAG = "2026-03-11 filament-resistivity-1.5mm"
+ROUTER_BUILD_TAG = "2026-03-11 spacing-resistance-fix"
 
 
 @dataclass(frozen=True)
@@ -669,13 +669,14 @@ class _TerminalGetter(ric.GetPoint):
         for terminal in self._existing_terminals:
             e.Display.DrawPoint(terminal.surface_point, Rhino.Display.PointStyle.X, 6, System.Drawing.Color.Gold)
 
+        protrude_preview = bool(self.protrude_toggle.CurrentValue)
         preview = _create_terminal(
             self._mesh,
             self._label,
             e.CurrentPoint,
-            bool(self.protrude_toggle.CurrentValue),
-            self._terminal_radius if self.protrude_toggle.CurrentValue else _mm_to_model(_active_doc(), TERMINAL_LENGTH_MM),
-            self._minimum_clearance,
+            protrude_preview,
+            self._terminal_radius if protrude_preview else _mm_to_model(_active_doc(), TERMINAL_LENGTH_MM),
+            self._terminal_radius * 0.5 if protrude_preview else self._minimum_clearance,
             self._tolerance,
         )
         if preview is None:
@@ -723,7 +724,7 @@ def _collect_terminals(
                 gp.Point(),
                 protrudes,
                 anchor_depth,
-                minimum_clearance,
+                terminal_radius * 0.5 if protrudes else minimum_clearance,
                 tolerance,
             )
             if terminal is None:
@@ -1416,15 +1417,10 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     spacing_radius = max(1, int(math.ceil(
         (wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step - 1.0
     )))
-    # The node exemption only needs to cover the physical node radius
-    # plus a small margin so paths can still reach the node through
-    # blocked zones.  Using the full node_diameter/2 + wire + separation
-    # made the zone far too large, allowing paths to run parallel with no
-    # spacing enforcement near nodes.
-    node_exemption_radius = max(
-        spacing_radius + 1,
-        int(math.ceil(max(flush_node_diameter_mm, TERMINAL_DIAMETER_MM) * 0.5 * _mm_to_model(doc, 1.0) / step)) + 1,
-    )
+    # The node exemption covers the physical node radius so paths can
+    # reach the node through blocked zones, but no larger — oversized
+    # exemption zones allow parallel paths with no inter-segment gap.
+    node_exemption_radius = spacing_radius + 1
 
     selected_candidate: Optional[TouchNodeOrderCandidate] = None
     selected_touch_nodes: List[TouchNodePlacement] = []
@@ -1468,7 +1464,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
 
         attempted_orders += 1
-        per_order_budget = max(30.0, 120.0 / max(1, len(order_candidates)))
+        per_order_budget = max(60.0, 300.0 / max(1, len(order_candidates)))
         deadline = time.monotonic() + per_order_budget
         try:
             segments = route_node_sequence(

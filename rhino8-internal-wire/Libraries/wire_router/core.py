@@ -597,7 +597,7 @@ def _cross_segment_near_approach(
     seg_b: Sequence[GridIndex],
     radius: int,
     shared_node: GridIndex,
-    node_adjacency: int = 1,
+    node_adjacency: int = 2,
 ) -> bool:
     """Return True if *seg_b* comes within *radius* cells of *seg_a*
     (Chebyshev distance), ignoring cells within *node_adjacency* of the
@@ -1178,6 +1178,7 @@ def _segment_candidate_paths(
     boundary_penalty_weight: float = 0.0,
     beam_width: int = 8,
     beam_max_waypoints: int = 3,
+    deadline: Optional[float] = None,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1290,6 +1291,8 @@ def _segment_candidate_paths(
         expanded.sort(key=lambda item: item[0])
         beam = [sequence for _, sequence in expanded[:beam_width]]
         for waypoint_sequence in beam:
+            if deadline is not None and time.monotonic() > deadline:
+                break
             try:
                 candidates.append(
                     _route_through_waypoints(
@@ -1306,6 +1309,8 @@ def _segment_candidate_paths(
                 )
             except RoutingError:
                 continue
+        if deadline is not None and time.monotonic() > deadline:
+            break
 
     # Clean every candidate: remove self-overlapping loops, then dedupe.
     cleaned_candidates = [_remove_path_reversals(path) for path in candidates]
@@ -1322,6 +1327,7 @@ def _segment_candidate_paths(
                 growth_valid_cells=candidate_valid_cells,
             )
             for path in unique_candidates
+            if _path_length(path) < target_length * 0.95
         ]
         grown_cleaned = [_remove_path_reversals(path) for path in grown_candidates]
         unique_candidates = _dedupe_paths(unique_candidates + grown_cleaned)
@@ -1786,7 +1792,10 @@ def route_node_sequence(
     # Adaptive beam search: reduce beam width and waypoint depth for
     # high node counts to keep per-segment candidate generation fast.
     num_segments = len(node_sequence) - 1
-    if num_segments > 8:
+    if num_segments > 10:
+        seg_beam_width = 3
+        seg_beam_max_waypoints = 1
+    elif num_segments > 8:
         seg_beam_width = 4
         seg_beam_max_waypoints = 2
     else:
@@ -1898,6 +1907,7 @@ def route_node_sequence(
                 boundary_penalty_weight=0.2,
                 beam_width=seg_beam_width,
                 beam_max_waypoints=seg_beam_max_waypoints,
+                deadline=deadline,
             )
         except RoutingError:
             candidate_paths = []
@@ -1935,6 +1945,7 @@ def route_node_sequence(
                 shared = start
                 if _cross_segment_near_approach(
                     prev_seg, routed_segment, blocked_radius, shared,
+                    node_adjacency=max(2, blocked_exemption_radius),
                 ):
                     continue
 
