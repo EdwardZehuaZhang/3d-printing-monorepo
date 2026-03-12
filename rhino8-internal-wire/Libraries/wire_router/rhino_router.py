@@ -615,8 +615,10 @@ class _TouchNodeGetter(ric.GetPoint):
     def OnDynamicDraw(self, e: ri.GetPointDrawEventArgs) -> None:
         super(_TouchNodeGetter, self).OnDynamicDraw(e)
 
-        for node in self._touch_nodes:
+        for i, node in enumerate(self._touch_nodes):
             e.Display.DrawSphere(rg.Sphere(node.center_point, self._node_radius), System.Drawing.Color.DeepSkyBlue)
+            label_point = node.surface_point + node.outward_direction * self._node_radius * 2.0
+            e.Display.Draw2dText("Node {}".format(i + 1), System.Drawing.Color.White, rg.Point3d(label_point), False, 16)
 
         for terminal in self._terminals:
             e.Display.DrawPoint(terminal.surface_point, Rhino.Display.PointStyle.ControlPoint, 6, System.Drawing.Color.Gold)
@@ -756,6 +758,8 @@ def _collect_touch_nodes(
     touch_nodes: List[TouchNodePlacement] = []
 
     while True:
+        next_number = len(touch_nodes) + 1
+        Rhino.RhinoApp.WriteLine("Choose position of Node {}.".format(next_number))
         gp = _TouchNodeGetter(
             mesh,
             touch_nodes,
@@ -766,7 +770,7 @@ def _collect_touch_nodes(
             tolerance,
         )
         gp.SetCommandPrompt(
-            "Pick a touch node. Press Enter when you are finished adding touch nodes"
+            "Pick Node {}. Press Enter when finished adding touch nodes".format(next_number)
         )
         gp.Constrain(mesh, False)
         gp.AcceptNothing(True)
@@ -774,7 +778,7 @@ def _collect_touch_nodes(
 
         result = gp.Get()
         if result == ri.GetResult.Point:
-            label = "Node {}".format(len(touch_nodes) + 1)
+            label = "Node {}".format(next_number)
             candidate = _create_touch_node(
                 mesh,
                 label,
@@ -795,6 +799,14 @@ def _collect_touch_nodes(
                 Rhino.RhinoApp.WriteLine(error)
                 continue
             touch_nodes.append(candidate)
+            Rhino.RhinoApp.WriteLine("Node {} placed.".format(next_number))
+            # Add a persistent text dot in the viewport so the user can see the node number.
+            dot = rg.TextDot("Node {}".format(next_number), candidate.surface_point)
+            dot_attr = rd.ObjectAttributes()
+            dot_attr.Name = "GenerateInternalWire_NodeLabel_{}".format(next_number)
+            doc = _active_doc()
+            doc.Objects.AddTextDot(dot, dot_attr)
+            doc.Views.Redraw()
             continue
         if result == ri.GetResult.Nothing:
             return touch_nodes
@@ -1159,6 +1171,18 @@ def _write_touch_step_report(
     if len(touch_node_labels) < 2 or len(touch_segment_lengths) < 1:
         return
 
+    Rhino.RhinoApp.WriteLine(heading)
+    for i, seg_length in enumerate(touch_segment_lengths):
+        label_a = touch_node_labels[i]
+        label_b = touch_node_labels[i + 1]
+        length_mm = _model_to_mm(doc, seg_length)
+        low, high = _resistance_range_kohm(doc, seg_length, wire_diameter_mm)
+        Rhino.RhinoApp.WriteLine(
+            "  {} - {} (length: {}, resistance: {:.1f}-{:.1f} kohm)".format(
+                label_a, label_b, _format_length_mm(length_mm), low, high
+            )
+        )
+
     nominals = [
         _nominal_resistance_kohm(doc, seg, wire_diameter_mm)
         for seg in touch_segment_lengths
@@ -1519,6 +1543,10 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
 
     ordered_touch_nodes = selected_touch_nodes
     ordered_labels = [node.label for node in ordered_touch_nodes]
+
+    # Print the routed node path sequence.
+    path_sequence = [start_terminal.label] + ordered_labels + [end_terminal.label]
+    Rhino.RhinoApp.WriteLine("Routed path: {}".format(" -> ".join(path_sequence)))
 
     polyline_points = _segments_to_polyline_points(selected_route_points, selected_segments, grid, tolerance)
     cumulative_lengths = _cumulative_anchor_lengths(polyline_points, selected_route_points, tolerance)
