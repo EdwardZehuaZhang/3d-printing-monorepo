@@ -656,6 +656,7 @@ class _TerminalGetter(ric.GetPoint):
         terminal_radius: float,
         minimum_clearance: float,
         tolerance: float,
+        initial_protrude: bool = False,
     ) -> None:
         super(_TerminalGetter, self).__init__()
         self._mesh = mesh
@@ -664,7 +665,7 @@ class _TerminalGetter(ric.GetPoint):
         self._terminal_radius = terminal_radius
         self._minimum_clearance = minimum_clearance
         self._tolerance = tolerance
-        self.protrude_toggle = ric.OptionToggle(False, "Flush", "Protrude")
+        self.protrude_toggle = ric.OptionToggle(initial_protrude, "Flush", "Protrude")
 
     def OnDynamicDraw(self, e: ri.GetPointDrawEventArgs) -> None:
         super(_TerminalGetter, self).OnDynamicDraw(e)
@@ -706,11 +707,10 @@ def _collect_terminals(
     start_protrudes: Optional[bool] = None
 
     for label in ("Start", "End"):
-        gp = _TerminalGetter(mesh, label, terminals, terminal_radius, minimum_clearance, tolerance)
-        # Default End terminal mode to match what the user chose for Start.
-        # The user can still override via the TerminalMode option in the command prompt.
-        if label == "End" and start_protrudes is not None:
-            gp.protrude_toggle.SetValue(start_protrudes)
+        gp = _TerminalGetter(
+            mesh, label, terminals, terminal_radius, minimum_clearance, tolerance,
+            initial_protrude=start_protrudes if (label == "End" and start_protrudes is not None) else False,
+        )
         gp.SetCommandPrompt("Pick the {} terminal on the outer surface".format(label.lower()))
         gp.Constrain(mesh, False)
         gp.AddOptionToggle("TerminalMode", gp.protrude_toggle)
