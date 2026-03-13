@@ -398,33 +398,19 @@ def _generate_serpentine_fill(
             running_length += 1.0
             path.append(cell)
         else:
-            # Try body-avoiding micro-routing first so the serpentine
-            # doesn't loop back through previously visited cells.
-            # Fall back to full valid_cells if the restricted set has
-            # no viable route (common in tight grids).
-            body = set(path[:-1])
-            micro_valid = valid_cells - body
-            micro_valid.add(last)   # must be reachable
-            micro_valid.add(cell)   # must be reachable
-            walk = _axis_walk(last, cell, micro_valid)
-            if walk is None:
-                walk = _axis_walk(last, cell, valid_cells)
+            walk = _axis_walk(last, cell, valid_cells)
             if walk is not None:
                 _extend_and_track(walk)
             else:
                 try:
-                    micro = astar_path(micro_valid, last, cell)
+                    micro = astar_path(valid_cells, last, cell)
                     _extend_and_track(micro[1:])
                 except RoutingError:
-                    try:
-                        micro = astar_path(valid_cells, last, cell)
-                        _extend_and_track(micro[1:])
-                    except RoutingError:
-                        # Rollback any partial approach toward the unreachable
-                        # cell so the path is not stranded at a dead-end.
-                        del path[snapshot:]
-                        running_length = snapshot_length
-                        continue
+                    # Rollback any partial approach toward the unreachable
+                    # cell so the path is not stranded at a dead-end.
+                    del path[snapshot:]
+                    running_length = snapshot_length
+                    continue
 
         # Early stop once the serpentine has generated enough length.
         est_remaining = _distance(path[-1], goal)
@@ -1834,26 +1820,6 @@ def _reconstruct_order(
     return tuple(order_indices)
 
 
-def _segment_excluded_fill(
-    segment_fill_zones: Optional[List[Set[GridIndex]]],
-    segment_index: int,
-    valid_cells: Set[GridIndex],
-    highway_cells: Set[GridIndex],
-) -> Optional[Set[GridIndex]]:
-    """Return the set of cells this segment's serpentine fill must avoid.
-
-    When Voronoi fill zones are active, the segment may only fill its own
-    zone — everything else (other zones + highway cells) is excluded.
-    Falls back to highway-only exclusion when zones are not available.
-    """
-    if segment_fill_zones is not None:
-        own_zone = segment_fill_zones[segment_index]
-        return (valid_cells - own_zone) | highway_cells
-    if highway_cells:
-        return highway_cells
-    return None
-
-
 def route_node_sequence(
     valid_cells: Set[GridIndex],
     node_sequence: Sequence[GridIndex],
@@ -1884,45 +1850,22 @@ def route_node_sequence(
     roominess_map = _build_roominess_map(valid_cells)
     bottleneck_threshold = _bottleneck_threshold(roominess_map)
 
-    num_segments = len(node_sequence) - 1
-
     # Compute highway Z-levels: evenly-spaced Z values that serpentine fills
     # must avoid.  These layers act as transit corridors so inter-node paths
     # always have clear routes even after earlier segments have densely filled
     # their own Z-slices.  Only applied when target lengths are requested and
     # blocked_radius is active (i.e. real multi-segment routing with spacing).
-    highway_cells: Set[GridIndex] = set()
+    fill_excluded_cells: Set[GridIndex] = set()
     if segment_target_lengths is not None and blocked_radius > 0:
         all_z = sorted(set(c[2] for c in valid_cells))
         highway_step = max(2, blocked_radius * 2 + 2)
+        # Only apply highway exclusion when there are enough Z-levels
+        # for the serpentine to still fill densely between highways.
+        # In small grids (few Z-levels) removing any layer starves the
+        # fill; reserve this optimisation for deep geometries.
         if len(all_z) >= highway_step * 3:
             highway_z_set = set(all_z[i] for i in range(0, len(all_z), highway_step))
-            highway_cells = {c for c in valid_cells if c[2] in highway_z_set}
-
-    # Per-segment Voronoi fill zones: partition non-highway cells so each
-    # segment gets a dedicated fill region closest to its midpoint.  This
-    # prevents earlier segments from filling space that later segments need.
-    segment_fill_zones: Optional[List[Set[GridIndex]]] = None
-    if segment_target_lengths is not None and blocked_radius > 0 and num_segments > 2:
-        fill_pool = valid_cells - highway_cells  # cells available for fills
-        # Midpoint of each segment (average of its two endpoint nodes).
-        midpoints = []
-        for si in range(num_segments):
-            a = node_sequence[si]
-            b = node_sequence[si + 1]
-            midpoints.append(((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0))
-
-        segment_fill_zones = [set() for _ in range(num_segments)]
-        for cell in fill_pool:
-            best_seg = 0
-            best_dist = float("inf")
-            cx, cy, cz = cell
-            for si, mid in enumerate(midpoints):
-                d = (cx - mid[0]) ** 2 + (cy - mid[1]) ** 2 + (cz - mid[2]) ** 2
-                if d < best_dist:
-                    best_dist = d
-                    best_seg = si
-            segment_fill_zones[best_seg].add(cell)
+            fill_excluded_cells = {c for c in valid_cells if c[2] in highway_z_set}
 
     # Precompute node keepout zones: for each node, the set of cells
     # that paths NOT connecting to that node must avoid.  The radius
@@ -1938,6 +1881,7 @@ def route_node_sequence(
 
     # Adaptive beam search: reduce beam width and waypoint depth for
     # high node counts to keep per-segment candidate generation fast.
+    num_segments = len(node_sequence) - 1
     if num_segments > 10:
         seg_beam_width = 3
         seg_beam_max_waypoints = 1
@@ -2044,7 +1988,7 @@ def route_node_sequence(
             # Penalise cells in the direction the previous segment came from
             # (i.e. the reversed arrival direction).  This nudges A* to
             # leave the node in a different direction.
-            for depth in range(1, max(3, blocked_radius * 2 + 1)):
+            for depth in range(1, max(2, blocked_radius + 1)):
                 penalised = (
                     start[0] + prev_dir[0] * depth,
                     start[1] + prev_dir[1] * depth,
@@ -2075,9 +2019,7 @@ def route_node_sequence(
                 beam_max_waypoints=seg_beam_max_waypoints,
                 deadline=deadline,
                 min_self_spacing=min_self_spacing,
-                fill_excluded_cells=_segment_excluded_fill(
-                    segment_fill_zones, segment_index, valid_cells, highway_cells,
-                ),
+                fill_excluded_cells=fill_excluded_cells if fill_excluded_cells else None,
             )
         except RoutingError:
             candidate_paths = []
