@@ -703,9 +703,14 @@ def _collect_terminals(
     tolerance: float,
 ) -> Optional[Tuple[TerminalPlacement, TerminalPlacement]]:
     terminals: List[TerminalPlacement] = []
+    start_protrudes: Optional[bool] = None
 
     for label in ("Start", "End"):
         gp = _TerminalGetter(mesh, label, terminals, terminal_radius, minimum_clearance, tolerance)
+        # Default End terminal mode to match what the user chose for Start.
+        # The user can still override via the TerminalMode option in the command prompt.
+        if label == "End" and start_protrudes is not None:
+            gp.protrude_toggle.SetValue(start_protrudes)
         gp.SetCommandPrompt("Pick the {} terminal on the outer surface".format(label.lower()))
         gp.Constrain(mesh, False)
         gp.AddOptionToggle("TerminalMode", gp.protrude_toggle)
@@ -720,6 +725,8 @@ def _collect_terminals(
                 return None
 
             protrudes = bool(gp.protrude_toggle.CurrentValue)
+            if label == "Start":
+                start_protrudes = protrudes
             anchor_depth = terminal_radius if protrudes else terminal_length
             terminal = _create_terminal(
                 mesh,

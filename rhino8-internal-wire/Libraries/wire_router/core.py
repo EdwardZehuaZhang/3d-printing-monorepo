@@ -168,6 +168,7 @@ def _build_fill_corridor(
     target_length: float,
     self_avoid_radius: int,
     min_self_spacing: int = 0,
+    fill_excluded_cells: Optional[Set[GridIndex]] = None,
 ) -> Set[GridIndex]:
     """Build a corridor around the pipe wide enough for a serpentine fill."""
     # Use the same spacing as _generate_serpentine_fill so the radius
@@ -188,19 +189,21 @@ def _build_fill_corridor(
     max_y = max(pipe_ys) + radius
     min_z = min(pipe_zs) - radius
     max_z = max(pipe_zs) + radius
+    excluded = fill_excluded_cells or set()
     corridor = {
         cell for cell in valid_cells
         if min_x <= cell[0] <= max_x
         and min_y <= cell[1] <= max_y
         and min_z <= cell[2] <= max_z
+        and cell not in excluded
     }
 
     # If the bounding-box corridor is too small relative to the
-    # target, fall back to all valid cells so the serpentine can
-    # fill whatever space remains in the grid.
+    # target, fall back to all valid cells (minus highway layers) so
+    # the serpentine can exploit all available fill space in the grid.
     min_cells_needed = int(target_length * 1.5)
     if len(corridor) < min_cells_needed:
-        corridor = set(valid_cells)
+        corridor = set(valid_cells) - excluded
 
     return corridor
 
@@ -1194,6 +1197,7 @@ def _segment_candidate_paths(
     beam_max_waypoints: int = 3,
     deadline: Optional[float] = None,
     min_self_spacing: int = 0,
+    fill_excluded_cells: Optional[Set[GridIndex]] = None,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1231,10 +1235,11 @@ def _segment_candidate_paths(
 
     # ---- Serpentine fill (primary strategy for large targets) ----
     # Inspired by trace_filling from 3dp-singlewire-sensing.
-    if not allow_diagonals and target_length > direct_length * 1.5:
+    if not allow_diagonals and target_length > direct_length * 1.2:
         fill_corridor = _build_fill_corridor(
             pipe_path, valid_cells, target_length, self_avoid_radius,
             min_self_spacing=min_self_spacing,
+            fill_excluded_cells=fill_excluded_cells,
         )
         serpentine = _generate_serpentine_fill(
             fill_corridor, valid_cells, start, goal, target_length, self_avoid_radius,
@@ -1243,6 +1248,18 @@ def _segment_candidate_paths(
         if serpentine is not None:
             candidates.append(serpentine)
             serpentine_length = _path_length(serpentine)
+            # If the corridor-based fill fell short, try again with
+            # the full valid cell set (minus highway layers) so the
+            # serpentine can exploit all available fill space.
+            fill_full = set(valid_cells) - (fill_excluded_cells or set())
+            if serpentine_length < target_length * 0.85 and len(fill_corridor) < len(fill_full):
+                full_serpentine = _generate_serpentine_fill(
+                    fill_full, valid_cells, start, goal, target_length,
+                    self_avoid_radius, min_self_spacing=min_self_spacing,
+                )
+                if full_serpentine is not None:
+                    candidates.append(full_serpentine)
+                    serpentine_length = max(serpentine_length, _path_length(full_serpentine))
             if serpentine_length >= target_length * 0.85:
                 # Serpentine reached the target — skip the expensive beam search.
                 unique = _dedupe_paths(candidates)
@@ -1333,6 +1350,11 @@ def _segment_candidate_paths(
     cleaned_candidates = [_remove_path_reversals(path) for path in candidates]
     unique_candidates = _dedupe_paths(cleaned_candidates)
     if target_length is not None and not allow_diagonals:
+        short_candidates = [
+            path for path in unique_candidates
+            if _path_length(path) < target_length * 0.95
+        ]
+        # First pass: grow within the corridor.
         grown_candidates = [
             _grow_path_toward_target(
                 path,
@@ -1344,9 +1366,29 @@ def _segment_candidate_paths(
                 growth_valid_cells=candidate_valid_cells,
                 min_self_spacing=min_self_spacing,
             )
-            for path in unique_candidates
-            if _path_length(path) < target_length * 0.95
+            for path in short_candidates
         ]
+        # Second pass: if corridor growth fell short, grow using all
+        # valid cells so the wire can expand into unused space.
+        still_short = [
+            path for path in grown_candidates
+            if _path_length(path) < target_length * 0.95
+            and len(candidate_valid_cells) < len(valid_cells)
+        ]
+        if still_short:
+            grown_candidates.extend(
+                _grow_path_toward_target(
+                    path,
+                    valid_cells,
+                    target_length,
+                    max(0, self_avoid_radius),
+                    roominess_map,
+                    bottleneck_threshold,
+                    growth_valid_cells=valid_cells,
+                    min_self_spacing=min_self_spacing,
+                )
+                for path in still_short
+            )
         grown_cleaned = [_remove_path_reversals(path) for path in grown_candidates]
         unique_candidates = _dedupe_paths(unique_candidates + grown_cleaned)
     return _sort_candidate_paths(
@@ -1808,6 +1850,23 @@ def route_node_sequence(
     roominess_map = _build_roominess_map(valid_cells)
     bottleneck_threshold = _bottleneck_threshold(roominess_map)
 
+    # Compute highway Z-levels: evenly-spaced Z values that serpentine fills
+    # must avoid.  These layers act as transit corridors so inter-node paths
+    # always have clear routes even after earlier segments have densely filled
+    # their own Z-slices.  Only applied when target lengths are requested and
+    # blocked_radius is active (i.e. real multi-segment routing with spacing).
+    fill_excluded_cells: Set[GridIndex] = set()
+    if segment_target_lengths is not None and blocked_radius > 0:
+        all_z = sorted(set(c[2] for c in valid_cells))
+        highway_step = max(2, blocked_radius * 2 + 2)
+        # Only apply highway exclusion when there are enough Z-levels
+        # for the serpentine to still fill densely between highways.
+        # In small grids (few Z-levels) removing any layer starves the
+        # fill; reserve this optimisation for deep geometries.
+        if len(all_z) >= highway_step * 3:
+            highway_z_set = set(all_z[i] for i in range(0, len(all_z), highway_step))
+            fill_excluded_cells = {c for c in valid_cells if c[2] in highway_z_set}
+
     # Precompute node keepout zones: for each node, the set of cells
     # that paths NOT connecting to that node must avoid.  The radius
     # covers the physical node volume (reserved_exemption_radius) plus
@@ -1960,6 +2019,7 @@ def route_node_sequence(
                 beam_max_waypoints=seg_beam_max_waypoints,
                 deadline=deadline,
                 min_self_spacing=min_self_spacing,
+                fill_excluded_cells=fill_excluded_cells if fill_excluded_cells else None,
             )
         except RoutingError:
             candidate_paths = []
@@ -1990,14 +2050,16 @@ def route_node_sequence(
             # Cross-segment overlap check: verify the new segment does
             # not run parallel to the previous segment near the shared
             # node.  The blocked_exemption_radius is deliberately NOT
-            # used here — only a tiny 1-cell zone around the shared node
-            # is exempt so that near-node overlaps are caught.
+            # used here — node_adjacency is set to max(2, blocked_radius+1)
+            # so the exemption zone is just large enough for two paths to
+            # physically arrive/depart at the shared node while still
+            # catching near-node overlaps that violate the 1 mm gap.
             if blocked_radius > 0 and current_segments:
                 prev_seg = current_segments[-1]
                 shared = start
                 if _cross_segment_near_approach(
                     prev_seg, routed_segment, blocked_radius, shared,
-                    node_adjacency=max(2, blocked_exemption_radius),
+                    node_adjacency=max(2, blocked_radius + 1),
                 ):
                     continue
 

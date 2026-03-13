@@ -669,6 +669,59 @@ class CoreRouterTests(unittest.TestCase):
                     f"connected node {node} (cells: {too_close}).",
                 )
 
+    # ---- highway / fill-layer separation ----
+
+    def test_highway_exclusion_activates_for_deep_grids(self) -> None:
+        """In a 3D grid with many Z-levels, two competing segments should
+        both route successfully when highway layers keep transit corridors
+        clear while fill layers are used for serpentine expansion."""
+        valid_cells = {(x, y, z) for x in range(20) for y in range(20) for z in range(20)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(1, 10, 10), (10, 10, 10), (18, 10, 10)],
+            segment_target_lengths=[80.0, 80.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=2,
+            blocked_exemption_radius=2,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 2)
+        # Both segments should reach a meaningful length
+        length_0 = self._segment_length(segments[0])
+        length_1 = self._segment_length(segments[1])
+        self.assertGreaterEqual(length_0, 40.0, "First segment too short.")
+        self.assertGreaterEqual(length_1, 40.0, "Second segment too short.")
+
+    def test_near_node_cross_segment_clearance(self) -> None:
+        """Consecutive segments sharing a node must maintain clearance
+        even in the cells immediately surrounding the shared node."""
+        valid_cells = {(x, y, 0) for x in range(16) for y in range(8)}
+        blocked_radius = 2
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 4, 0), (7, 4, 0), (15, 4, 0)],
+            segment_target_lengths=[14.0, 14.0],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=blocked_radius,
+            blocked_exemption_radius=blocked_radius,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 2)
+        seg_a = self._expand_segment(segments[0])
+        seg_b = self._expand_segment(segments[1])
+        shared = (7, 4, 0)
+        self.assertFalse(
+            _cross_segment_near_approach(
+                seg_a, seg_b, radius=blocked_radius, shared_node=shared,
+                node_adjacency=max(2, blocked_radius + 1),
+            ),
+            "Consecutive segments overlap near their shared node.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
