@@ -167,14 +167,17 @@ def _build_fill_corridor(
     valid_cells: Set[GridIndex],
     target_length: float,
     self_avoid_radius: int,
+    min_self_spacing: int = 0,
 ) -> Set[GridIndex]:
     """Build a corridor around the pipe wide enough for a serpentine fill."""
     # Use the same spacing as _generate_serpentine_fill so the radius
     # estimate is consistent with the actual row/layer layout.
-    row_spacing = max(2, self_avoid_radius + 2)
+    row_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
     pipe_length = max(1.0, _path_length(pipe_path))
     needed_r_sq = target_length * row_spacing * row_spacing / (4.0 * pipe_length)
-    radius = max(4, int(math.ceil(math.sqrt(max(1.0, needed_r_sq)) * 1.8)))
+    # Use a generous multiplier (3.0) so the serpentine can exploit
+    # available space even when multiple segments compete for room.
+    radius = max(4, int(math.ceil(math.sqrt(max(1.0, needed_r_sq)) * 3.0)))
 
     pipe_xs = [p[0] for p in pipe_path]
     pipe_ys = [p[1] for p in pipe_path]
@@ -192,6 +195,13 @@ def _build_fill_corridor(
         and min_z <= cell[2] <= max_z
     }
 
+    # If the bounding-box corridor is too small relative to the
+    # target, fall back to all valid cells so the serpentine can
+    # fill whatever space remains in the grid.
+    min_cells_needed = int(target_length * 1.5)
+    if len(corridor) < min_cells_needed:
+        corridor = set(valid_cells)
+
     return corridor
 
 
@@ -202,6 +212,7 @@ def _generate_serpentine_fill(
     goal: GridIndex,
     target_length: float,
     self_avoid_radius: int,
+    min_self_spacing: int = 0,
 ) -> Optional[List[GridIndex]]:
     """Fill *corridor* with a dense serpentine path to reach *target_length*.
 
@@ -212,10 +223,10 @@ def _generate_serpentine_fill(
     if len(corridor) < 4:
         return None
 
-    # +2 gives one full cell of clearance beyond the blocked radius,
-    # which prevents pipe geometry at bends from overlapping adjacent rows.
-    row_spacing = max(2, self_avoid_radius + 2)
-    layer_spacing = max(2, self_avoid_radius + 2)
+    # +1 gives clearance beyond the blocked radius.
+    # min_self_spacing encodes the physics-based minimum separation.
+    row_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
+    layer_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
 
     # Choose sweep axes: sweep along the longest corridor dimension,
     # layer through the shortest, rows in the middle.
@@ -666,6 +677,7 @@ def _candidate_edge_detours(
     goal: GridIndex,
     max_primary_depth: int,
     max_secondary_depth: int,
+    min_primary_depth: int = 1,
 ) -> List[List[GridIndex]]:
     step_offset = _segment_step_offset(start, goal)
     if step_offset is None:
@@ -674,7 +686,7 @@ def _candidate_edge_detours(
     candidates: List[List[GridIndex]] = []
     orthogonal = _orthogonal_offsets(step_offset)
     for primary_offset in orthogonal:
-        for primary_depth in range(1, max_primary_depth + 1):
+        for primary_depth in range(min_primary_depth, max_primary_depth + 1):
             simple: List[GridIndex] = [start]
             current = start
             for _ in range(primary_depth):
@@ -746,6 +758,7 @@ def _grow_path_toward_target(
     roominess_map: RoominessMap,
     bottleneck_threshold: int,
     growth_valid_cells: Optional[Set[GridIndex]] = None,
+    min_self_spacing: int = 0,
 ) -> List[GridIndex]:
     grown = list(path)
     if len(grown) < 2:
@@ -791,6 +804,7 @@ def _grow_path_toward_target(
                 goal,
                 max_primary_depth=4,
                 max_secondary_depth=3,
+                min_primary_depth=max(1, min_self_spacing),
             ):
                 if not _is_valid_detour_candidate(
                     candidate,
@@ -1179,6 +1193,7 @@ def _segment_candidate_paths(
     beam_width: int = 8,
     beam_max_waypoints: int = 3,
     deadline: Optional[float] = None,
+    min_self_spacing: int = 0,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1219,9 +1234,11 @@ def _segment_candidate_paths(
     if not allow_diagonals and target_length > direct_length * 1.5:
         fill_corridor = _build_fill_corridor(
             pipe_path, valid_cells, target_length, self_avoid_radius,
+            min_self_spacing=min_self_spacing,
         )
         serpentine = _generate_serpentine_fill(
             fill_corridor, valid_cells, start, goal, target_length, self_avoid_radius,
+            min_self_spacing=min_self_spacing,
         )
         if serpentine is not None:
             candidates.append(serpentine)
@@ -1325,6 +1342,7 @@ def _segment_candidate_paths(
                 roominess_map,
                 bottleneck_threshold,
                 growth_valid_cells=candidate_valid_cells,
+                min_self_spacing=min_self_spacing,
             )
             for path in unique_candidates
             if _path_length(path) < target_length * 0.95
@@ -1774,6 +1792,7 @@ def route_node_sequence(
     allow_diagonals: bool = True,
     vertical_move_penalty: float = 0.0,
     deadline: Optional[float] = None,
+    min_self_spacing: int = 0,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
@@ -1788,6 +1807,18 @@ def route_node_sequence(
     reserved = reserved_cells or set()
     roominess_map = _build_roominess_map(valid_cells)
     bottleneck_threshold = _bottleneck_threshold(roominess_map)
+
+    # Precompute node keepout zones: for each node, the set of cells
+    # that paths NOT connecting to that node must avoid.  The radius
+    # covers the physical node volume (reserved_exemption_radius) plus
+    # the wire-to-node edge-to-edge clearance (blocked_radius).
+    node_keepout_radius = reserved_exemption_radius + blocked_radius if blocked_radius > 0 else 0
+    per_node_keepout: Dict[GridIndex, FrozenSet[GridIndex]] = {}
+    if node_keepout_radius > 0 and len(node_sequence) > 2:
+        for node in set(node_sequence):
+            per_node_keepout[node] = frozenset(
+                dilate_cells({node}, node_keepout_radius)
+            )
 
     # Adaptive beam search: reduce beam width and waypoint depth for
     # high node counts to keep per-segment candidate generation fast.
@@ -1867,6 +1898,26 @@ def route_node_sequence(
             local_blocked.discard(goal)
             segment_valid_cells.difference_update(local_blocked)
 
+        # Enforce wire-to-node edge-to-edge clearance for nodes that
+        # are NOT the current segment's endpoints.  reserved_cells
+        # blocks only the physical node volume; this extends that by
+        # blocked_radius so the conductive wire maintains at least
+        # PATH_SEPARATION_MM gap from every non-connected node.
+        if per_node_keepout:
+            endpoint_safe = dilate_cells(
+                {start, goal}, max(1, blocked_radius)
+            )
+            for node in node_sequence:
+                if node == start or node == goal:
+                    continue
+                if node in per_node_keepout:
+                    segment_valid_cells.difference_update(
+                        per_node_keepout[node] - endpoint_safe
+                    )
+            # Ensure start/goal always remain routable.
+            segment_valid_cells.add(start)
+            segment_valid_cells.add(goal)
+
         local_penalties = set(current_penalty_cells)
         local_penalties.discard(start)
         local_penalties.discard(goal)
@@ -1908,6 +1959,7 @@ def route_node_sequence(
                 beam_width=seg_beam_width,
                 beam_max_waypoints=seg_beam_max_waypoints,
                 deadline=deadline,
+                min_self_spacing=min_self_spacing,
             )
         except RoutingError:
             candidate_paths = []
@@ -1954,6 +2006,26 @@ def route_node_sequence(
             # segments that do not directly connect to start or goal.
             if non_adjacent_blocked is not None:
                 if any(cell in non_adjacent_blocked for cell in routed_segment):
+                    continue
+
+            # Post-hoc per-node keepout check: the endpoint_safe exemption
+            # during valid_cells filtering may let a path slip through a
+            # non-connected node's keepout zone.  Reject it here.
+            if per_node_keepout and blocked_radius > 0:
+                routed_set = set(routed_segment)
+                posthoc_safe = dilate_cells(
+                    {start, goal}, max(1, blocked_radius)
+                )
+                node_violation = False
+                for node in node_sequence:
+                    if node == start or node == goal:
+                        continue
+                    if node in per_node_keepout:
+                        violation = (routed_set & per_node_keepout[node]) - posthoc_safe
+                        if violation:
+                            node_violation = True
+                            break
+                if node_violation:
                     continue
 
             next_penalty_cells = set(current_penalty_cells)

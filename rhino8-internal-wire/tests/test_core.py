@@ -311,10 +311,10 @@ class CoreRouterTests(unittest.TestCase):
         self.assertGreaterEqual(self._segment_length(segments[0]), 50.0)
 
     def test_target_segment_avoids_nonlocal_self_overlap_when_spacing_is_required(self) -> None:
-        valid_cells = {(x, y, 0) for x in range(12) for y in range(8)}
+        valid_cells = {(x, y, 0) for x in range(14) for y in range(10)}
         segments = route_node_sequence(
             valid_cells=valid_cells,
-            node_sequence=[(1, 1, 0), (10, 6, 0)],
+            node_sequence=[(1, 1, 0), (12, 8, 0)],
             segment_target_lengths=[50.0],
             penalty_radius=0,
             penalty_weight=0.0,

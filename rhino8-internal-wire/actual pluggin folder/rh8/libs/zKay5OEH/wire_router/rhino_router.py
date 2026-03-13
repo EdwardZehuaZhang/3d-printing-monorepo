@@ -34,6 +34,7 @@ MIN_WIRE_DIAMETER_MM = 0.5
 CASING_THICKNESS_MM = 0.5
 BOUNDARY_CLEARANCE_MM = 0.5
 PATH_SEPARATION_MM = 1.0
+MIN_INTRA_PATH_GAP_MM = 1.0
 DEFAULT_TOUCH_NODE_FLUSH_DIAMETER_MM = 10.0
 MIN_TOUCH_NODE_FLUSH_DIAMETER_MM = 0.5
 TERMINAL_DIAMETER_MM = 3.0
@@ -1444,7 +1445,14 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     # The node exemption covers the physical node radius so paths can
     # reach the node through blocked zones, but no larger — oversized
     # exemption zones allow parallel paths with no inter-segment gap.
-    node_exemption_radius = spacing_radius + 1
+    node_exemption_radius = spacing_radius
+
+    # Minimum intra-path spacing for U-turns and serpentine fills.
+    # ceil((wire_d + gap) / step) gives the minimum center-to-center
+    # distance in grid cells so that edge-to-edge gap >= MIN_INTRA_PATH_GAP_MM.
+    min_self_spacing = max(1, int(math.ceil(
+        (wire_diameter_mm + MIN_INTRA_PATH_GAP_MM) * _mm_to_model(doc, 1.0) / step
+    )))
 
     selected_candidate: Optional[TouchNodeOrderCandidate] = None
     selected_touch_nodes: List[TouchNodePlacement] = []
@@ -1505,6 +1513,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                 allow_diagonals=False,
                 vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
                 deadline=deadline,
+                min_self_spacing=min_self_spacing,
             )
         except RoutingError as error:
             if first_failure_reason is None:
