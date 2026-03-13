@@ -1,0 +1,18 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{17b2b8e4-030d-4607-ace4-9004a6203486}") = "internal wire", "internal wire\internal wire.csproj", "{c219a7ad-e5b0-471e-baf9-53e04ee253f1}"
+EndProject
+
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{c219a7ad-e5b0-471e-baf9-53e04ee253f1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{c219a7ad-e5b0-471e-baf9-53e04ee253f1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{c219a7ad-e5b0-471e-baf9-53e04ee253f1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{c219a7ad-e5b0-471e-baf9-53e04ee253f1}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
