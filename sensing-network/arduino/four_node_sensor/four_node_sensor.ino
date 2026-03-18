@@ -36,6 +36,11 @@
 // ── Trace ────────────────────────────────────────────────────────────
 #define NUM_NODES 4
 const float nodeResKohm[NUM_NODES] = {3.0, 13.0, 19.0, 27.0};
+#define EXT_RES_KOHM 10.0  // external resistor on SEND path (Pin5 -> trace start)
+
+// ── Quality heuristics ────────────────────────────────────────────────
+#define SIGMA_WARN_TH 2.0
+#define SIGMA_GOOD_TH 3.0
 
 // ── Measurement ──────────────────────────────────────────────────────
 #define SAMPLES_PER_READ  100   // accumulated cycles per direction
@@ -383,6 +388,12 @@ void setup() {
   Serial.println();
   Serial.println(F("  2D distances between nodes:"));
   bool allGood = true;
+  float minSigmaAll = 9999.0f;
+  int minSigmaNodeA = -1;
+  int minSigmaNodeB = -1;
+  float minSigmaAdj = 9999.0f;
+  int minAdjIdx = -1;
+
   for (int i = 0; i < NUM_NODES; i++) {
     for (int j = i + 1; j < NUM_NODES; j++) {
       long d = (long)sqrt((double)dist2(nodeFwdMean[i], nodeRevMean[i],
@@ -392,10 +403,20 @@ void setup() {
       Serial.print(F(": "));   Serial.print(d);
       long maxStd = max(max(nodeFwdStd[i], nodeRevStd[i]),
                         max(nodeFwdStd[j], nodeRevStd[j]));
+      float sigma = 9999.0f;
       if (maxStd > 0) {
-        float sigma = (float)d / (float)maxStd;
+        sigma = (float)d / (float)maxStd;
         Serial.print(F("  (")); Serial.print(sigma, 1); Serial.print(F("σ)"));
-        if (sigma < 2.0) { Serial.print(F(" *** OVERLAP ***")); allGood = false; }
+        if (sigma < minSigmaAll) {
+          minSigmaAll = sigma;
+          minSigmaNodeA = i;
+          minSigmaNodeB = j;
+        }
+        if ((j == i + 1) && (sigma < minSigmaAdj)) {
+          minSigmaAdj = sigma;
+          minAdjIdx = i;
+        }
+        if (sigma < SIGMA_WARN_TH) { Serial.print(F(" *** OVERLAP ***")); allGood = false; }
       }
       Serial.println();
     }
@@ -407,6 +428,66 @@ void setup() {
   } else {
     Serial.println(F("  >> WARNING: some nodes may overlap."));
     Serial.println(F("     Touch each node at dead center during calibration."));
+  }
+
+  // ── Practical tuning guidance ─────────────────────────────────────
+  float totalPathK = nodeResKohm[NUM_NODES - 1];
+  float extRatio = totalPathK > 0.0f ? (EXT_RES_KOHM / totalPathK) : 0.0f;
+
+  Serial.println();
+  Serial.println(F("  TUNING GUIDE"));
+  Serial.println(F("  ------------"));
+  Serial.print(F("  Total path: ~")); Serial.print(totalPathK, 1); Serial.println(F("k"));
+  Serial.print(F("  External resistor: ")); Serial.print(EXT_RES_KOHM, 1); Serial.println(F("k"));
+  Serial.print(F("  ext/total ratio: ")); Serial.print(extRatio, 2);
+  Serial.println(F("  (recommended ~0.3 to 1.0 for low-path traces)"));
+
+  Serial.print(F("  Phase-0 signal delta: +")); Serial.println(delta);
+  if (delta < 50) {
+    Serial.println(F("  -> Signal is weak. Improve contact and consider smaller external R."));
+  } else if (delta < 120) {
+    Serial.println(F("  -> Signal is usable but moderate; calibration quality matters."));
+  } else {
+    Serial.println(F("  -> Signal amplitude is strong."));
+  }
+
+  if (extRatio > 1.0f) {
+    Serial.println(F("  -> External R likely too large for this trace; node values may compress."));
+  } else if (extRatio < 0.3f) {
+    Serial.println(F("  -> External R is low; fast response, but verify noise/consistency."));
+  } else {
+    Serial.println(F("  -> External R is in a good operating window for this trace."));
+  }
+
+  if (minSigmaNodeA >= 0) {
+    Serial.print(F("  Worst pair: N")); Serial.print(minSigmaNodeA + 1);
+    Serial.print(F(" ↔ N")); Serial.print(minSigmaNodeB + 1);
+    Serial.print(F(" at ")); Serial.print(minSigmaAll, 2); Serial.println(F("σ"));
+  }
+
+  if (!allGood && minAdjIdx >= 0) {
+    float oldGap = nodeResKohm[minAdjIdx + 1] - nodeResKohm[minAdjIdx];
+    float targetGap = oldGap * 1.30f;
+    float suggestedCum = nodeResKohm[minAdjIdx] + targetGap;
+
+    Serial.println(F("  -> First adjustment recommendation:"));
+    Serial.print(F("     Increase segment between N")); Serial.print(minAdjIdx + 1);
+    Serial.print(F(" and N")); Serial.print(minAdjIdx + 2); Serial.println(F("."));
+    Serial.print(F("     Current gap: ")); Serial.print(oldGap, 1); Serial.println(F("k"));
+    Serial.print(F("     Try gap: ~")); Serial.print(targetGap, 1); Serial.println(F("k"));
+    Serial.print(F("     That means cumulative N")); Serial.print(minAdjIdx + 2);
+    Serial.print(F(" from ")); Serial.print(nodeResKohm[minAdjIdx + 1], 1);
+    Serial.print(F("k -> ~")); Serial.print(suggestedCum, 1); Serial.println(F("k"));
+    Serial.println(F("     Recalibrate after this single change before further edits."));
+  } else if (allGood) {
+    Serial.println(F("  -> Keep current resistance map. No increase needed now."));
+    Serial.println(F("  -> UNO R4 is suitable; no need to switch to UNO R3 for stability."));
+  }
+
+  if ((minSigmaAdj < SIGMA_WARN_TH) && (minAdjIdx >= 0)) {
+    Serial.print(F("  Adjacent bottleneck: N")); Serial.print(minAdjIdx + 1);
+    Serial.print(F(" ↔ N")); Serial.print(minAdjIdx + 2);
+    Serial.print(F(" at ")); Serial.print(minSigmaAdj, 2); Serial.println(F("σ"));
   }
 
   calibrated = true;
