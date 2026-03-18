@@ -58,9 +58,10 @@ long   nodeRatioHigh[NUM_NODES];  // detection boundary high
 long   nodeSumMean[NUM_NODES];
 int    sortIdx[NUM_NODES];
 
-long   baselineSum    = 0;
-long   touchThreshold = 0;
-bool   calibrated     = false;
+long   baselineSum         = 0;
+long   touchThreshold      = 0;
+unsigned long phase0TouchAvg = 0;  // saved from Phase 0 for adaptive threshold
+bool   calibrated          = false;
 
 // ── Runtime ──────────────────────────────────────────────────────────
 int    currentNode   = -1;
@@ -294,28 +295,29 @@ void setup() {
   }
 
   unsigned long touchAvgSum = touchCount > 0 ? touchSumAcc / touchCount : 0;
-  long margin = noTouchAvgSum > 0 ? (long)(touchAvgSum / noTouchAvgSum) : 0;
+  phase0TouchAvg = touchAvgSum;  // save for adaptive threshold in Phase 1
+  long delta = (long)(touchAvgSum - noTouchAvgSum);
 
   Serial.println();
   Serial.print(F("  No-touch avg sum: ")); Serial.print(noTouchAvgSum); Serial.println(F("us"));
   Serial.print(F("  Touch avg sum:    ")); Serial.print(touchAvgSum);   Serial.println(F("us"));
-  Serial.print(F("  Touch/no-touch:   ")); Serial.print(margin);        Serial.println(F("x"));
+  Serial.print(F("  Delta:            +")); Serial.print(delta);         Serial.println(F("us"));
   Serial.print(F("  Ratio range on touch: "));
   Serial.print(touchRatioMin); Serial.print(F(" - ")); Serial.println(touchRatioMax);
   Serial.println();
 
-  if (margin < 3) {
-    Serial.println(F("  *** WARNING: weak signal (need 3x ratio) ***"));
+  if (delta < 30) {
+    Serial.println(F("  *** WARNING: weak signal (need delta > 30us) ***"));
     Serial.println(F("  Check:"));
-    Serial.println(F("    - 1M ohm resistor between pin 5 and pin 2"));
+    Serial.println(F("    - 10k ohm resistor between pin 5 and pin 2"));
     Serial.println(F("    - Pin 2 wire → TRACE START (not trace end!)"));
     Serial.println(F("    - Pin 3 wire → TRACE END (no other connections on pin 3)"));
     Serial.println(F("    - Trace is conductive (measure ~34k with multimeter)"));
     Serial.println(F("    - Touch the conductive material directly"));
   } else {
-    Serial.print(F("  Signal OK! "));
-    Serial.print(margin);
-    Serial.println(F("x above baseline."));
+    Serial.print(F("  Signal OK! Delta = +"));
+    Serial.print(delta);
+    Serial.println(F("us on touch."));
     if (touchRatioMax - touchRatioMin < 30) {
       Serial.println(F("  NOTE: Ratio spread is small (<30). Node discrimination"));
       Serial.println(F("        may be limited. Calibration will determine feasibility."));
@@ -335,9 +337,10 @@ void setup() {
   statsN(BASELINE_READS, bRatioMean, bRatioStd, bSumMean);
   baselineSum = bSumMean;
 
-  // Preliminary touch threshold: 3x baseline sum, will be refined after Phase 2
-  touchThreshold = baselineSum * 3;
-  if (touchThreshold < baselineSum + 100) touchThreshold = baselineSum + 100;
+  // Adaptive threshold using Phase 0 touch data
+  // Place threshold at 1/3 of the way from baseline to average touch sum
+  long touchDelta = (long)phase0TouchAvg - baselineSum;
+  touchThreshold = baselineSum + max(touchDelta / 3, 20L);
 
   Serial.print(F("  Baseline sum:       ")); Serial.println(bSumMean);
   Serial.print(F("  Baseline ratio:     ")); Serial.println(bRatioMean);
