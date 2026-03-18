@@ -50,14 +50,29 @@ const float nodeResKohm[NUM_NODES] = {3.0, 13.0, 19.0, 27.0};
 // ── Calibration ──────────────────────────────────────────────────────
 #define BASELINE_READS     30
 #define CAL_READS_PER_NODE 40
+#define CAL_NODE_DURATION_MS 7000
+#define CAL_MIN_VALID_SAMPLES 30
+#define CAL_PROGRESS_MS     700
 #define DEBOUNCE_COUNT      3
 #define RELEASE_COUNT       4
+
+// ── Runtime robustness ──────────────────────────────────────────────
+#define CLASS_STD_FLOOR     22
+#define CLASS_MAX_SCORE     45.0f
+#define SWITCH_CONFIRM_COUNT 5
+#define SWITCH_SCORE_MARGIN  0.9f
+#define FILTER_ALPHA         0.30f
+#define BASELINE_TRACK_ALPHA 0.02f
 
 // ── Calibration data ─────────────────────────────────────────────────
 long   nodeFwdMean[NUM_NODES];     // forward Pin B count mean
 long   nodeRevMean[NUM_NODES];     // reverse Pin A count mean
 long   nodeFwdStd[NUM_NODES];
 long   nodeRevStd[NUM_NODES];
+long   nodeFwdMin[NUM_NODES];
+long   nodeFwdMax[NUM_NODES];
+long   nodeRevMin[NUM_NODES];
+long   nodeRevMax[NUM_NODES];
 int    sortIdx[NUM_NODES];
 
 long   baselineFwd  = 0;
@@ -73,7 +88,12 @@ int    currentNode   = -1;
 int    candidateNode = -1;
 int    hitCounter    = 0;
 int    missCounter   = 0;
+int    switchCandidate = -1;
+int    switchCounter   = 0;
 unsigned long lastPrintMs = 0;
+float  filtFwd = 0.0f;
+float  filtRev = 0.0f;
+bool   filterInitialized = false;
 
 // ═════════════════════════════════════════════════════════════════════
 // CORE MEASUREMENT
@@ -193,11 +213,122 @@ long dist2(long fwd, long rev, long fMean, long rMean) {
   return df * df + dr * dr;
 }
 
+float nodeScore(int idx, long fwd, long rev) {
+  float fStd = (float)nodeFwdStd[idx];
+  float rStd = (float)nodeRevStd[idx];
+  if (fStd < CLASS_STD_FLOOR) fStd = CLASS_STD_FLOOR;
+  if (rStd < CLASS_STD_FLOOR) rStd = CLASS_STD_FLOOR;
+
+  float df = ((float)fwd - (float)nodeFwdMean[idx]) / fStd;
+  float dr = ((float)rev - (float)nodeRevMean[idx]) / rStd;
+  float score = df * df + dr * dr;
+
+  const float slack = 20.0f;
+  if ((float)fwd < ((float)nodeFwdMin[idx] - slack) ||
+      (float)fwd > ((float)nodeFwdMax[idx] + slack) ||
+      (float)rev < ((float)nodeRevMin[idx] - slack) ||
+      (float)rev > ((float)nodeRevMax[idx] + slack)) {
+    score += 0.75f;
+  }
+
+  return score;
+}
+
+void updateBaselineIfIdle(long fwd, long rev, long sum, long diff) {
+  long sumGate = (touchThreshold * 3L) / 5L;
+  long diffGate = (touchThresholdDiff * 3L) / 5L;
+  if (sum < sumGate && diff < diffGate) {
+    baselineFwd = (long)((1.0f - BASELINE_TRACK_ALPHA) * baselineFwd + BASELINE_TRACK_ALPHA * (float)fwd);
+    baselineRev = (long)((1.0f - BASELINE_TRACK_ALPHA) * baselineRev + BASELINE_TRACK_ALPHA * (float)rev);
+    baselineSum = baselineFwd + baselineRev;
+  }
+}
+
+void calibrateNodeLongWindow(int nodeIdx,
+                             long &fMean, long &rMean,
+                             long &fStd, long &rStd,
+                             long &fMin, long &fMax,
+                             long &rMin, long &rMax) {
+  double fMeanAcc = 0.0;
+  double rMeanAcc = 0.0;
+  double fM2 = 0.0;
+  double rM2 = 0.0;
+  int n = 0;
+
+  fMin = 2147483647L;
+  rMin = 2147483647L;
+  fMax = -2147483647L;
+  rMax = -2147483647L;
+
+  unsigned long startMs = millis();
+  unsigned long lastProgress = 0;
+
+  while (millis() - startMs < CAL_NODE_DURATION_MS) {
+    unsigned long fRaw, rRaw;
+    readBidir(fRaw, rRaw);
+
+    long f = (long)fRaw;
+    long r = (long)rRaw;
+    long s = f + r;
+    long d = signalDiffFromBaseline(f, r);
+
+    if (s > touchThreshold || d > touchThresholdDiff) {
+      n++;
+
+      double df = (double)f - fMeanAcc;
+      fMeanAcc += df / (double)n;
+      fM2 += df * ((double)f - fMeanAcc);
+
+      double dr = (double)r - rMeanAcc;
+      rMeanAcc += dr / (double)n;
+      rM2 += dr * ((double)r - rMeanAcc);
+
+      if (f < fMin) fMin = f;
+      if (f > fMax) fMax = f;
+      if (r < rMin) rMin = r;
+      if (r > rMax) rMax = r;
+    }
+
+    if (millis() - lastProgress >= CAL_PROGRESS_MS) {
+      lastProgress = millis();
+      Serial.print(F("    collecting Node "));
+      Serial.print(nodeIdx + 1);
+      Serial.print(F(": fwd=")); pLong(f, 6);
+      Serial.print(F(" rev=")); pLong(r, 6);
+      Serial.print(F(" sum=")); pLong(s, 6);
+      Serial.print(F(" diff=")); pLong(d, 6);
+      Serial.print(F(" valid=")); Serial.println(n);
+    }
+  }
+
+  if (n < CAL_MIN_VALID_SAMPLES) {
+    long sfm, srm, sfs, srs;
+    statsN(CAL_READS_PER_NODE, sfm, srm, sfs, srs);
+    fMean = sfm;
+    rMean = srm;
+    fStd = sfs;
+    rStd = srs;
+    fMin = sfm - max(2L * sfs, 15L);
+    fMax = sfm + max(2L * sfs, 15L);
+    rMin = srm - max(2L * srs, 15L);
+    rMax = srm + max(2L * srs, 15L);
+    return;
+  }
+
+  fMean = (long)(fMeanAcc + 0.5);
+  rMean = (long)(rMeanAcc + 0.5);
+  fStd = (long)(sqrt(fM2 / (double)n) + 0.5);
+  rStd = (long)(sqrt(rM2 / (double)n) + 0.5);
+
+  if (fStd < 1) fStd = 1;
+  if (rStd < 1) rStd = 1;
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // SETUP
 // ═════════════════════════════════════════════════════════════════════
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   while (!Serial);
 
   Serial.println();
@@ -326,7 +457,8 @@ void setup() {
 
   // ── PHASE 2: Per-node calibration ──────────────────────────────
   Serial.println(F("[PHASE 2] Per-node calibration"));
-  Serial.println(F("  Touch each node when prompted. Hold firmly."));
+  Serial.println(F("  Touch each node when prompted."));
+  Serial.println(F("  Keep contact for 7s and vary from light to firm pressure."));
   Serial.println(F("  fwdB = charge from start, sense end"));
   Serial.println(F("  revA = charge from end, sense start"));
   Serial.println();
@@ -358,21 +490,30 @@ void setup() {
       if (s > touchThreshold || diff > touchThresholdDiff) break;
     }
 
-    Serial.println(F("  Touch detected! Hold steady..."));
-    delay(300);
+    Serial.println(F("  Touch detected! Keep touching and vary pressure..."));
+    delay(250);
 
-    long fm, rm, fs, rs;
-    statsN(CAL_READS_PER_NODE, fm, rm, fs, rs);
+    long fm, rm, fs, rs, fmin, fmax, rmin, rmax;
+    calibrateNodeLongWindow(i, fm, rm, fs, rs, fmin, fmax, rmin, rmax);
     nodeFwdMean[i] = fm;
     nodeRevMean[i] = rm;
     nodeFwdStd[i]  = fs;
     nodeRevStd[i]  = rs;
+    nodeFwdMin[i]  = fmin;
+    nodeFwdMax[i]  = fmax;
+    nodeRevMin[i]  = rmin;
+    nodeRevMax[i]  = rmax;
 
     Serial.print(F("  Node ")); Serial.print(i + 1);
     Serial.print(F(": fwd=")); Serial.print(fm);
     Serial.print(F("±")); Serial.print(fs);
     Serial.print(F("  rev=")); Serial.print(rm);
     Serial.print(F("±")); Serial.println(rs);
+    Serial.print(F("          range fwd[")); Serial.print(fmin);
+    Serial.print(F(", ")); Serial.print(fmax);
+    Serial.print(F("] rev[")); Serial.print(rmin);
+    Serial.print(F(", ")); Serial.print(rmax);
+    Serial.println(F("]"));
 
     Serial.println(F("  >>> RELEASE NOW <<<"));
     delay(800);
@@ -530,18 +671,44 @@ void setup() {
 void loop() {
   if (!calibrated) return;
 
-  unsigned long fwd, rev;
-  readBidir(fwd, rev);
-  long sum = (long)(fwd + rev);
-  long diff = signalDiffFromBaseline((long)fwd, (long)rev);
+  unsigned long fwdRaw, revRaw;
+  readBidir(fwdRaw, revRaw);
+
+  if (!filterInitialized) {
+    filtFwd = (float)fwdRaw;
+    filtRev = (float)revRaw;
+    filterInitialized = true;
+  } else {
+    filtFwd = (1.0f - FILTER_ALPHA) * filtFwd + FILTER_ALPHA * (float)fwdRaw;
+    filtRev = (1.0f - FILTER_ALPHA) * filtRev + FILTER_ALPHA * (float)revRaw;
+  }
+
+  long fwd = (long)(filtFwd + 0.5f);
+  long rev = (long)(filtRev + 0.5f);
+  long sum = fwd + rev;
+  long diff = signalDiffFromBaseline(fwd, rev);
+
+  updateBaselineIfIdle(fwd, rev, sum, diff);
+  diff = signalDiffFromBaseline(fwd, rev);
 
   // ── Node identification by nearest centroid ─────────────────────
   int detectedNode = -1;
+  float bestScore = 1.0e9f;
+  float secondScore = 1.0e9f;
   if (sum > touchThreshold || diff > touchThresholdDiff) {
-    long bestDist = 0x7FFFFFFFL;
     for (int i = 0; i < NUM_NODES; i++) {
-      long d = dist2((long)fwd, (long)rev, nodeFwdMean[i], nodeRevMean[i]);
-      if (d < bestDist) { bestDist = d; detectedNode = i; }
+      float score = nodeScore(i, fwd, rev);
+      if (score < bestScore) {
+        secondScore = bestScore;
+        bestScore = score;
+        detectedNode = i;
+      } else if (score < secondScore) {
+        secondScore = score;
+      }
+    }
+
+    if (bestScore > CLASS_MAX_SCORE) {
+      detectedNode = -1;
     }
   }
 
@@ -555,7 +722,7 @@ void loop() {
         Serial.println();
         Serial.print(F(">>> Node ")); Serial.print(currentNode + 1);
         Serial.println(F(" PRESSED <<<"));
-        hitCounter = 0; missCounter = 0;
+        hitCounter = 0; missCounter = 0; switchCandidate = -1; switchCounter = 0;
       }
     } else {
       hitCounter = 0; candidateNode = -1;
@@ -568,15 +735,34 @@ void loop() {
         Serial.println();
         currentNode = -1; candidateNode = -1;
         hitCounter = 0; missCounter = 0;
+        switchCandidate = -1; switchCounter = 0;
       }
     } else if (detectedNode == currentNode) {
       missCounter = 0;
+      switchCandidate = -1;
+      switchCounter = 0;
     } else {
-      missCounter++;
-      if (missCounter >= RELEASE_COUNT) {
-        Serial.print(F("[SWITCH → Node ")); Serial.print(detectedNode + 1);
-        Serial.println(F("]"));
-        currentNode = detectedNode; missCounter = 0;
+      missCounter = 0;
+      float currentScore = nodeScore(currentNode, fwd, rev);
+      bool challengerIsClearlyBetter = (bestScore + SWITCH_SCORE_MARGIN < currentScore);
+
+      if (challengerIsClearlyBetter) {
+        if (detectedNode == switchCandidate) switchCounter++;
+        else {
+          switchCandidate = detectedNode;
+          switchCounter = 1;
+        }
+
+        if (switchCounter >= SWITCH_CONFIRM_COUNT) {
+          Serial.print(F("[SWITCH → Node ")); Serial.print(detectedNode + 1);
+          Serial.println(F("]"));
+          currentNode = detectedNode;
+          switchCandidate = -1;
+          switchCounter = 0;
+        }
+      } else {
+        switchCandidate = -1;
+        switchCounter = 0;
       }
     }
   }
@@ -586,8 +772,8 @@ void loop() {
   if (now - lastPrintMs >= 200) {
     lastPrintMs = now;
 
-    Serial.print(F("fwd=")); pLong((long)fwd, 6);
-    Serial.print(F(" rev=")); pLong((long)rev, 6);
+    Serial.print(F("fwd=")); pLong(fwd, 6);
+    Serial.print(F(" rev=")); pLong(rev, 6);
     Serial.print(F(" sum=")); pLong(sum, 7);
     Serial.print(F(" diff=")); pLong(diff, 7);
 
@@ -604,9 +790,14 @@ void loop() {
       Serial.print(F(" d:"));
       for (int i = 0; i < NUM_NODES; i++) {
         if (i > 0) Serial.print(',');
-        Serial.print((long)sqrt((double)dist2((long)fwd, (long)rev,
+        Serial.print((long)sqrt((double)dist2(fwd, rev,
                                               nodeFwdMean[i], nodeRevMean[i])));
       }
+      Serial.print(F(" s:"));
+      Serial.print(bestScore, 2);
+      Serial.print(',');
+      if (secondScore < 1.0e8f) Serial.print(secondScore, 2);
+      else Serial.print(F("-"));
     }
     Serial.println();
   }
