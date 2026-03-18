@@ -64,6 +64,8 @@ long   baselineFwd  = 0;
 long   baselineRev  = 0;
 long   baselineSum  = 0;
 long   touchThreshold = 0;
+long   touchThresholdDiff = 0;
+long   phase0DirectionalDelta = 0;
 bool   calibrated   = false;
 
 // ── Runtime ──────────────────────────────────────────────────────────
@@ -176,6 +178,14 @@ void pLong(long v, int w) {
   Serial.print(s);
 }
 
+long absLong(long v) {
+  return v >= 0 ? v : -v;
+}
+
+long signalDiffFromBaseline(long fwd, long rev) {
+  return absLong(fwd - baselineFwd) + absLong(rev - baselineRev);
+}
+
 // Euclidean distance squared in 2D (fwd, rev) space
 long dist2(long fwd, long rev, long fMean, long rMean) {
   long df = fwd - fMean;
@@ -262,6 +272,8 @@ void setup() {
   long tRevAvg = tCount > 0 ? touchRevAcc / tCount : 0;
   long tSumAvg = tFwdAvg + tRevAvg;
   long delta = tSumAvg - ntSumAvg;
+  long directionalDelta = absLong(tFwdAvg - ntFwdAvg) + absLong(tRevAvg - ntRevAvg);
+  phase0DirectionalDelta = directionalDelta;
 
   Serial.println();
   Serial.print(F("  No-touch avg: fwd=")); Serial.print(ntFwdAvg);
@@ -271,14 +283,17 @@ void setup() {
   Serial.print(F("  rev=")); Serial.print(tRevAvg);
   Serial.print(F("  sum=")); Serial.println(tSumAvg);
   Serial.print(F("  Delta: +")); Serial.println(delta);
+  Serial.print(F("  Directional delta: +")); Serial.println(directionalDelta);
   Serial.println();
 
-  if (delta < 50) {
-    Serial.println(F("  *** WARNING: weak signal (need delta > 50) ***"));
+  if (delta < 50 && directionalDelta < 40) {
+    Serial.println(F("  *** WARNING: weak signal (need delta > 50 OR directional > 40) ***"));
     Serial.println(F("  Check wiring and that you're touching conductive material."));
   } else {
     Serial.print(F("  Signal OK! Delta = +"));
-    Serial.println(delta);
+    Serial.print(delta);
+    Serial.print(F(", Directional = +"));
+    Serial.println(directionalDelta);
   }
 
   Serial.println();
@@ -298,11 +313,15 @@ void setup() {
 
   // Adaptive threshold using Phase 0 touch data
   touchThreshold = baselineSum + max(delta / 3, 30L);
+  touchThresholdDiff = max((bfs + brs) * 3, max(phase0DirectionalDelta / 3, 25L));
 
   Serial.print(F("  Baseline: fwd=")); Serial.print(baselineFwd);
   Serial.print(F("  rev=")); Serial.print(baselineRev);
   Serial.print(F("  sum=")); Serial.println(baselineSum);
+  Serial.print(F("  Baseline std: fwd=")); Serial.print(bfs);
+  Serial.print(F("  rev=")); Serial.println(brs);
   Serial.print(F("  Threshold: sum > ")); Serial.println(touchThreshold);
+  Serial.print(F("  Threshold: diff > ")); Serial.println(touchThresholdDiff);
   Serial.println();
 
   // ── PHASE 2: Per-node calibration ──────────────────────────────
@@ -326,14 +345,17 @@ void setup() {
       unsigned long f, r;
       readBidir(f, r);
       long s = (long)(f + r);
+      long diff = signalDiffFromBaseline((long)f, (long)r);
       waitCount++;
       if (waitCount % 3 == 0) {
         Serial.print(F("    fwd="));  pLong((long)f, 6);
         Serial.print(F("  rev="));    pLong((long)r, 6);
         Serial.print(F("  sum="));    pLong(s, 6);
-        Serial.print(F("  (need > ")); Serial.print(touchThreshold); Serial.println(F(")"));
+        Serial.print(F("  diff="));   pLong(diff, 6);
+        Serial.print(F("  (need sum > ")); Serial.print(touchThreshold);
+        Serial.print(F(" or diff > ")); Serial.print(touchThresholdDiff); Serial.println(F(")"));
       }
-      if (s > touchThreshold) break;
+      if (s > touchThreshold || diff > touchThresholdDiff) break;
     }
 
     Serial.println(F("  Touch detected! Hold steady..."));
@@ -358,7 +380,9 @@ void setup() {
     while (relCount < 8) {
       unsigned long f, r;
       readBidir(f, r);
-      if ((long)(f + r) < touchThreshold) relCount++;
+      long s = (long)(f + r);
+      long diff = signalDiffFromBaseline((long)f, (long)r);
+      if (s < touchThreshold && diff < touchThresholdDiff) relCount++;
       else relCount = 0;
     }
     Serial.println(F("  Released."));
@@ -443,12 +467,14 @@ void setup() {
   Serial.println(F("  (recommended ~0.3 to 1.0 for low-path traces)"));
 
   Serial.print(F("  Phase-0 signal delta: +")); Serial.println(delta);
-  if (delta < 50) {
-    Serial.println(F("  -> Signal is weak. Improve contact and consider smaller external R."));
-  } else if (delta < 120) {
+  Serial.print(F("  Phase-0 directional delta: +")); Serial.println(phase0DirectionalDelta);
+  Serial.print(F("  Runtime diff threshold: ")); Serial.println(touchThresholdDiff);
+  if (delta < 50 && phase0DirectionalDelta < 40) {
+    Serial.println(F("  -> Signal is weak in both metrics. Improve contact and consider smaller external R."));
+  } else if (delta < 120 || phase0DirectionalDelta < 100) {
     Serial.println(F("  -> Signal is usable but moderate; calibration quality matters."));
   } else {
-    Serial.println(F("  -> Signal amplitude is strong."));
+    Serial.println(F("  -> Signal amplitude is strong (sum and directional)."));
   }
 
   if (extRatio > 1.0f) {
@@ -507,10 +533,11 @@ void loop() {
   unsigned long fwd, rev;
   readBidir(fwd, rev);
   long sum = (long)(fwd + rev);
+  long diff = signalDiffFromBaseline((long)fwd, (long)rev);
 
   // ── Node identification by nearest centroid ─────────────────────
   int detectedNode = -1;
-  if (sum > touchThreshold) {
+  if (sum > touchThreshold || diff > touchThresholdDiff) {
     long bestDist = 0x7FFFFFFFL;
     for (int i = 0; i < NUM_NODES; i++) {
       long d = dist2((long)fwd, (long)rev, nodeFwdMean[i], nodeRevMean[i]);
@@ -562,17 +589,18 @@ void loop() {
     Serial.print(F("fwd=")); pLong((long)fwd, 6);
     Serial.print(F(" rev=")); pLong((long)rev, 6);
     Serial.print(F(" sum=")); pLong(sum, 7);
+    Serial.print(F(" diff=")); pLong(diff, 7);
 
     if (currentNode >= 0) {
       Serial.print(F(" [N")); Serial.print(currentNode + 1); Serial.print(F("]"));
-    } else if (sum > touchThreshold) {
+    } else if (sum > touchThreshold || diff > touchThresholdDiff) {
       Serial.print(F(" [?]"));
     } else {
       Serial.print(F(" [-]"));
     }
 
     // Show distance to each node centroid
-    if (sum > touchThreshold / 2) {
+    if (sum > touchThreshold / 2 || diff > touchThresholdDiff / 2) {
       Serial.print(F(" d:"));
       for (int i = 0; i < NUM_NODES; i++) {
         if (i > 0) Serial.print(',');
