@@ -66,6 +66,13 @@ const float nodeResKohm[NUM_NODES] = {3.0, 13.0, 19.0, 27.0};
 #define SWITCH_LOCKOUT_FRAMES 4
 #define FILTER_ALPHA         0.18f
 #define BASELINE_TRACK_ALPHA 0.02f
+#define ENTRY_TOUCH_GATE_COUNT 2
+#define ENTRY_SUM_MARGIN      8
+#define ENTRY_DIFF_MARGIN     8
+#define ENTRY_SCORE_GAP_MIN   0.70f
+#define N23_ENTRY_GAP_MIN     1.60f
+#define N23_SWITCH_SCORE_MARGIN 4.0f
+#define N23_SWITCH_CONFIRM_COUNT 10
 
 // ── Calibration data ─────────────────────────────────────────────────
 long   nodeFwdMean[NUM_NODES];     // forward Pin B count mean
@@ -94,6 +101,7 @@ int    missCounter   = 0;
 int    switchCandidate = -1;
 int    switchCounter   = 0;
 int    switchLockoutCounter = 0;
+int    touchGateCounter = 0;
 unsigned long lastPrintMs = 0;
 float  filtFwd = 0.0f;
 float  filtRev = 0.0f;
@@ -695,12 +703,19 @@ void loop() {
   updateBaselineIfIdle(fwd, rev, sum, diff);
   diff = signalDiffFromBaseline(fwd, rev);
 
+  bool touchActive = (sum > touchThreshold || diff > touchThresholdDiff);
+  if (touchActive) touchGateCounter++;
+  else touchGateCounter = 0;
+  bool entryTouchStable = touchGateCounter >= ENTRY_TOUCH_GATE_COUNT;
+  bool entrySignalStrong = (sum > (touchThreshold + ENTRY_SUM_MARGIN)) ||
+                           (diff > (touchThresholdDiff + ENTRY_DIFF_MARGIN));
+
   // ── Node identification by nearest centroid ─────────────────────
   int detectedNode = -1;
   int secondNode = -1;
   float bestScore = 1.0e9f;
   float secondScore = 1.0e9f;
-  if (sum > touchThreshold || diff > touchThresholdDiff) {
+  if (touchActive) {
     for (int i = 0; i < NUM_NODES; i++) {
       float score = nodeScore(i, fwd, rev);
       if (score < bestScore) {
@@ -722,12 +737,21 @@ void loop() {
   float scoreGap = secondScore - bestScore;
   bool n23Boundary = ((detectedNode == 1 && secondNode == 2) || (detectedNode == 2 && secondNode == 1));
   bool n23Ambiguous = n23Boundary && (scoreGap < N23_AMBIG_MARGIN);
+  bool entryConfident = scoreGap >= ENTRY_SCORE_GAP_MIN;
+  bool n23EntryConfident = !n23Boundary || (scoreGap >= N23_ENTRY_GAP_MIN);
+  int entryRejectCode = 0;
 
   // ── Debounce ──────────────────────────────────────────────────
   if (currentNode == -1) {
-    if (detectedNode != -1 && bestScore <= PRESS_SCORE_MAX && !n23Ambiguous) {
+    if (detectedNode != -1 && bestScore <= PRESS_SCORE_MAX && !n23Ambiguous &&
+        entryTouchStable && entrySignalStrong && entryConfident && n23EntryConfident) {
       if (detectedNode == candidateNode) hitCounter++;
       else { candidateNode = detectedNode; hitCounter = 1; }
+
+      if (hitCounter < DEBOUNCE_COUNT) {
+        entryRejectCode = 7;
+      }
+
       if (hitCounter >= DEBOUNCE_COUNT) {
         currentNode = candidateNode;
         Serial.println();
@@ -738,6 +762,14 @@ void loop() {
       }
     } else {
       hitCounter = 0; candidateNode = -1;
+      if (touchActive) {
+        if (detectedNode == -1) entryRejectCode = 1;
+        else if (bestScore > PRESS_SCORE_MAX) entryRejectCode = 2;
+        else if (!entryTouchStable) entryRejectCode = 3;
+        else if (!entrySignalStrong) entryRejectCode = 4;
+        else if (!entryConfident) entryRejectCode = 5;
+        else entryRejectCode = 6;
+      }
     }
   } else {
     if (detectedNode == -1) {
@@ -763,7 +795,11 @@ void loop() {
         switchCounter = 0;
       } else {
         float currentScore = nodeScore(currentNode, fwd, rev);
-        bool challengerIsClearlyBetter = (bestScore + SWITCH_SCORE_MARGIN < currentScore);
+        bool n23SwitchPair = ((currentNode == 1 && detectedNode == 2) ||
+                              (currentNode == 2 && detectedNode == 1));
+        float switchScoreMargin = n23SwitchPair ? N23_SWITCH_SCORE_MARGIN : SWITCH_SCORE_MARGIN;
+        int switchConfirmNeed = n23SwitchPair ? N23_SWITCH_CONFIRM_COUNT : SWITCH_CONFIRM_COUNT;
+        bool challengerIsClearlyBetter = (bestScore + switchScoreMargin < currentScore);
 
         if (challengerIsClearlyBetter) {
           if (detectedNode == switchCandidate) switchCounter++;
@@ -772,7 +808,7 @@ void loop() {
             switchCounter = 1;
           }
 
-          if (switchCounter >= SWITCH_CONFIRM_COUNT) {
+          if (switchCounter >= switchConfirmNeed) {
             Serial.print(F("[SWITCH → Node ")); Serial.print(detectedNode + 1);
             Serial.println(F("]"));
             currentNode = detectedNode;
@@ -800,8 +836,27 @@ void loop() {
 
     if (currentNode >= 0) {
       Serial.print(F(" [N")); Serial.print(currentNode + 1); Serial.print(F("]"));
-    } else if (sum > touchThreshold || diff > touchThresholdDiff) {
+    } else if (touchActive) {
       Serial.print(F(" [?]"));
+      if (entryRejectCode != 0) {
+        Serial.print(F(" r:"));
+        switch (entryRejectCode) {
+          case 1: Serial.print(F("noclass")); break;
+          case 2: Serial.print(F("score")); break;
+          case 3: Serial.print(F("gate")); break;
+          case 4: Serial.print(F("amp")); break;
+          case 5: Serial.print(F("gap")); break;
+          case 6: Serial.print(F("n23")); break;
+          case 7:
+            Serial.print(F("deb("));
+            Serial.print(hitCounter);
+            Serial.print('/');
+            Serial.print(DEBOUNCE_COUNT);
+            Serial.print(')');
+            break;
+          default: Serial.print(F("-")); break;
+        }
+      }
     } else {
       Serial.print(F(" [-]"));
     }
