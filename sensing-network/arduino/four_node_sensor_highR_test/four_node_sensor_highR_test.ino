@@ -11,13 +11,13 @@
  *
  * WIRING:
  *
- *                 68k ohm resistor (start value)
+ *                 220k ohm resistor (start value)
  *   Pin 5 ────[████████]──── Pin 2 ──── TRACE START
  *
  *   Pin 3 ──────────────────────────── TRACE END
  *
- * New print (nominal path order): START - N1 - N3 - N2 - N4 - END
- * Approx. segment resistance: ~52.7k each, total ~161.5k to ~168.2k.
+ * New print (nominal path order): START - N1 - N2 - N3 - N4 - END
+ * Cumulative resistance from START: N1=3k, N2=200k, N3=300k, N4=500k.
  */
 
 // ── Pin config ───────────────────────────────────────────────────────
@@ -27,12 +27,12 @@
 
 // ── Trace ────────────────────────────────────────────────────────────
 #define NUM_NODES 4
-const float segmentResKohm[NUM_NODES - 1] = {52.7f, 52.7f, 52.7f};
-const int physicalNodeOrder[NUM_NODES] = {1, 3, 2, 4}; // logical IDs along physical path
-const float totalPathRangeKohmMin = 161.5f;
-const float totalPathRangeKohmMax = 168.2f;
+const float physicalNodeCumKohm[NUM_NODES] = {3.0f, 200.0f, 300.0f, 500.0f};
+const int physicalNodeOrder[NUM_NODES] = {1, 2, 3, 4}; // logical IDs along physical path
+const float totalPathRangeKohmMin = 500.0f;
+const float totalPathRangeKohmMax = 500.0f;
 float nodeResKohm[NUM_NODES] = {0.0f, 0.0f, 0.0f, 0.0f}; // cumulative from START by logical node ID
-#define EXT_RES_KOHM 68.0  // start point for ~165k total traces
+#define EXT_RES_KOHM 220.0  // start point for ~500k total traces
 
 // ── Quality heuristics ────────────────────────────────────────────────
 #define SIGMA_WARN_TH 2.0
@@ -220,18 +220,17 @@ int physicalIndexForLogicalId(int logicalId) {
 }
 
 void initNodeResistanceMap() {
-  float physicalCum[NUM_NODES];
-  physicalCum[0] = 0.0f;
-  for (int i = 1; i < NUM_NODES; i++) {
-    physicalCum[i] = physicalCum[i - 1] + segmentResKohm[i - 1];
-  }
-
   for (int logicalId = 1; logicalId <= NUM_NODES; logicalId++) {
     int physIdx = physicalIndexForLogicalId(logicalId);
     if (physIdx >= 0) {
-      nodeResKohm[logicalIdToIdx(logicalId)] = physicalCum[physIdx];
+      nodeResKohm[logicalIdToIdx(logicalId)] = physicalNodeCumKohm[physIdx];
     }
   }
+}
+
+float physicalSegmentGapKohm(int segmentIdx) {
+  if (segmentIdx < 0 || segmentIdx >= NUM_NODES - 1) return 0.0f;
+  return physicalNodeCumKohm[segmentIdx + 1] - physicalNodeCumKohm[segmentIdx];
 }
 
 void printPhysicalOrder() {
@@ -397,8 +396,10 @@ void setup() {
   Serial.println(F("  New print target: high-resistance 4-node trace"));
   Serial.print(F("  Total path range: ")); Serial.print(totalPathRangeKohmMin, 1);
   Serial.print(F("k to ")); Serial.print(totalPathRangeKohmMax, 1); Serial.println(F("k"));
-  Serial.print(F("  Segment targets: ~")); Serial.print(segmentResKohm[0], 1);
-  Serial.println(F("k per adjacent pair"));
+  Serial.print(F("  Cumulative targets: N1=")); Serial.print(physicalNodeCumKohm[0], 1);
+  Serial.print(F("k, N2=")); Serial.print(physicalNodeCumKohm[1], 1);
+  Serial.print(F("k, N3=")); Serial.print(physicalNodeCumKohm[2], 1);
+  Serial.print(F("k, N4=")); Serial.print(physicalNodeCumKohm[3], 1); Serial.println(F("k"));
   printPhysicalOrder();
   Serial.println();
   Serial.println(F("  WIRING:"));
@@ -664,7 +665,7 @@ void setup() {
 
     Serial.print(F("    N")); Serial.print(nodeA + 1);
     Serial.print(F(" ↔ N")); Serial.print(nodeB + 1);
-    Serial.print(F(": Rseg~")); Serial.print(segmentResKohm[p], 1);
+    Serial.print(F(": Rseg~")); Serial.print(physicalSegmentGapKohm(p), 1);
     Serial.print(F("k, d=")); Serial.print(d);
     if (maxStd > 0) {
       Serial.print(F(" (")); Serial.print(sigma, 2); Serial.print(F("σ)"));
@@ -697,7 +698,7 @@ void setup() {
   Serial.print(F("  External resistor: ")); Serial.print(EXT_RES_KOHM, 1); Serial.println(F("k"));
   Serial.print(F("  ext/total ratio: ")); Serial.print(extRatio, 2);
   Serial.println(F("  (recommended ~0.3 to 1.0 for this bidirectional method)"));
-  Serial.println(F("  Test ladder for this print: 47k -> 68k -> 100k"));
+  Serial.println(F("  Test ladder for this print: 150k -> 220k -> 330k"));
 
   Serial.print(F("  Phase-0 signal delta: +")); Serial.println(delta);
   Serial.print(F("  Phase-0 directional delta: +")); Serial.println(phase0DirectionalDelta);
@@ -710,12 +711,12 @@ void setup() {
     Serial.println(F("  -> Signal amplitude is strong (sum and directional)."));
   }
 
-  if (EXT_RES_KOHM > 100.0f) {
-    Serial.println(F("  -> External R may be too large; onset may feel laggy. Try 68k or 47k."));
-  } else if (EXT_RES_KOHM < 47.0f) {
+  if (EXT_RES_KOHM > 330.0f) {
+    Serial.println(F("  -> External R may be too large; onset may feel laggy. Try 220k or 150k."));
+  } else if (EXT_RES_KOHM < 150.0f) {
     Serial.println(F("  -> External R is low; fast response, but verify noise/consistency."));
-  } else if (EXT_RES_KOHM >= 47.0f && EXT_RES_KOHM <= 100.0f) {
-    Serial.println(F("  -> External R is in the recommended high-R test window (47k to 100k)."));
+  } else if (EXT_RES_KOHM >= 150.0f && EXT_RES_KOHM <= 330.0f) {
+    Serial.println(F("  -> External R is in the recommended high-R test window (150k to 330k)."));
   } else {
     Serial.println(F("  -> External R is acceptable; tune using onset stability and sigma margins."));
   }
@@ -729,7 +730,7 @@ void setup() {
   if (!allGood && minAdjSegIdx >= 0) {
     int nodeA = physicalNodeOrder[minAdjSegIdx];
     int nodeB = physicalNodeOrder[minAdjSegIdx + 1];
-    float oldGap = segmentResKohm[minAdjSegIdx];
+    float oldGap = physicalSegmentGapKohm(minAdjSegIdx);
     float targetGap = oldGap * 1.30f;
     float suggestedCum = nodeResKohm[logicalIdToIdx(nodeA)] + targetGap;
 
