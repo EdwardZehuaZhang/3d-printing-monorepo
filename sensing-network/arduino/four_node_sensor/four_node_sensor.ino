@@ -36,7 +36,7 @@
 // ── Trace ────────────────────────────────────────────────────────────
 #define NUM_NODES 4
 const float nodeResKohm[NUM_NODES] = {3.0, 13.0, 19.0, 27.0};
-#define EXT_RES_KOHM 10.0  // external resistor on SEND path (Pin5 -> trace start)
+#define EXT_RES_KOHM 20.0  // external resistor on SEND path (Pin5 -> trace start)
 
 // ── Quality heuristics ────────────────────────────────────────────────
 #define SIGMA_WARN_TH 2.0
@@ -53,15 +53,18 @@ const float nodeResKohm[NUM_NODES] = {3.0, 13.0, 19.0, 27.0};
 #define CAL_NODE_DURATION_MS 7000
 #define CAL_MIN_VALID_SAMPLES 30
 #define CAL_PROGRESS_MS     700
-#define DEBOUNCE_COUNT      3
-#define RELEASE_COUNT       4
+#define DEBOUNCE_COUNT      6
+#define RELEASE_COUNT       5
 
 // ── Runtime robustness ──────────────────────────────────────────────
-#define CLASS_STD_FLOOR     22
+#define CLASS_STD_FLOOR     18
 #define CLASS_MAX_SCORE     45.0f
-#define SWITCH_CONFIRM_COUNT 5
-#define SWITCH_SCORE_MARGIN  0.9f
-#define FILTER_ALPHA         0.30f
+#define PRESS_SCORE_MAX      12.0f
+#define N23_AMBIG_MARGIN     1.25f
+#define SWITCH_CONFIRM_COUNT 7
+#define SWITCH_SCORE_MARGIN  2.5f
+#define SWITCH_LOCKOUT_FRAMES 4
+#define FILTER_ALPHA         0.18f
 #define BASELINE_TRACK_ALPHA 0.02f
 
 // ── Calibration data ─────────────────────────────────────────────────
@@ -90,6 +93,7 @@ int    hitCounter    = 0;
 int    missCounter   = 0;
 int    switchCandidate = -1;
 int    switchCounter   = 0;
+int    switchLockoutCounter = 0;
 unsigned long lastPrintMs = 0;
 float  filtFwd = 0.0f;
 float  filtRev = 0.0f;
@@ -339,11 +343,11 @@ void setup() {
   Serial.println(F("  Trace: START -[3k]- N1 -[10k]- N2 -[6k]- N3 -[8k]- N4 - END"));
   Serial.println();
   Serial.println(F("  WIRING:"));
-  Serial.println(F("               10k resistor"));
+  Serial.print(F("               ")); Serial.print(EXT_RES_KOHM, 0); Serial.println(F("k resistor"));
   Serial.println(F("    Pin 5 ───[████████]─── Pin 2 ── TRACE START"));
   Serial.println(F("    Pin 3 ─────────────────────── TRACE END"));
   Serial.println();
-  Serial.println(F("  Forward: Pin5→10k→start→trace→Pin3(sense)"));
+  Serial.print(F("  Forward: Pin5→")); Serial.print(EXT_RES_KOHM, 0); Serial.println(F("k→start→trace→Pin3(sense)"));
   Serial.println(F("  Reverse: Pin3(drive)→trace→Pin2(sense), Pin5=INPUT"));
   Serial.println();
 
@@ -693,6 +697,7 @@ void loop() {
 
   // ── Node identification by nearest centroid ─────────────────────
   int detectedNode = -1;
+  int secondNode = -1;
   float bestScore = 1.0e9f;
   float secondScore = 1.0e9f;
   if (sum > touchThreshold || diff > touchThresholdDiff) {
@@ -700,10 +705,12 @@ void loop() {
       float score = nodeScore(i, fwd, rev);
       if (score < bestScore) {
         secondScore = bestScore;
+        secondNode = detectedNode;
         bestScore = score;
         detectedNode = i;
       } else if (score < secondScore) {
         secondScore = score;
+        secondNode = i;
       }
     }
 
@@ -712,9 +719,13 @@ void loop() {
     }
   }
 
+  float scoreGap = secondScore - bestScore;
+  bool n23Boundary = ((detectedNode == 1 && secondNode == 2) || (detectedNode == 2 && secondNode == 1));
+  bool n23Ambiguous = n23Boundary && (scoreGap < N23_AMBIG_MARGIN);
+
   // ── Debounce ──────────────────────────────────────────────────
   if (currentNode == -1) {
-    if (detectedNode != -1) {
+    if (detectedNode != -1 && bestScore <= PRESS_SCORE_MAX && !n23Ambiguous) {
       if (detectedNode == candidateNode) hitCounter++;
       else { candidateNode = detectedNode; hitCounter = 1; }
       if (hitCounter >= DEBOUNCE_COUNT) {
@@ -723,6 +734,7 @@ void loop() {
         Serial.print(F(">>> Node ")); Serial.print(currentNode + 1);
         Serial.println(F(" PRESSED <<<"));
         hitCounter = 0; missCounter = 0; switchCandidate = -1; switchCounter = 0;
+        switchLockoutCounter = SWITCH_LOCKOUT_FRAMES;
       }
     } else {
       hitCounter = 0; candidateNode = -1;
@@ -736,33 +748,42 @@ void loop() {
         currentNode = -1; candidateNode = -1;
         hitCounter = 0; missCounter = 0;
         switchCandidate = -1; switchCounter = 0;
+        switchLockoutCounter = 0;
       }
     } else if (detectedNode == currentNode) {
       missCounter = 0;
       switchCandidate = -1;
       switchCounter = 0;
+      if (switchLockoutCounter > 0) switchLockoutCounter--;
     } else {
       missCounter = 0;
-      float currentScore = nodeScore(currentNode, fwd, rev);
-      bool challengerIsClearlyBetter = (bestScore + SWITCH_SCORE_MARGIN < currentScore);
+      if (switchLockoutCounter > 0 || n23Ambiguous) {
+        if (switchLockoutCounter > 0) switchLockoutCounter--;
+        switchCandidate = -1;
+        switchCounter = 0;
+      } else {
+        float currentScore = nodeScore(currentNode, fwd, rev);
+        bool challengerIsClearlyBetter = (bestScore + SWITCH_SCORE_MARGIN < currentScore);
 
-      if (challengerIsClearlyBetter) {
-        if (detectedNode == switchCandidate) switchCounter++;
-        else {
-          switchCandidate = detectedNode;
-          switchCounter = 1;
-        }
+        if (challengerIsClearlyBetter) {
+          if (detectedNode == switchCandidate) switchCounter++;
+          else {
+            switchCandidate = detectedNode;
+            switchCounter = 1;
+          }
 
-        if (switchCounter >= SWITCH_CONFIRM_COUNT) {
-          Serial.print(F("[SWITCH → Node ")); Serial.print(detectedNode + 1);
-          Serial.println(F("]"));
-          currentNode = detectedNode;
+          if (switchCounter >= SWITCH_CONFIRM_COUNT) {
+            Serial.print(F("[SWITCH → Node ")); Serial.print(detectedNode + 1);
+            Serial.println(F("]"));
+            currentNode = detectedNode;
+            switchCandidate = -1;
+            switchCounter = 0;
+            switchLockoutCounter = SWITCH_LOCKOUT_FRAMES;
+          }
+        } else {
           switchCandidate = -1;
           switchCounter = 0;
         }
-      } else {
-        switchCandidate = -1;
-        switchCounter = 0;
       }
     }
   }
