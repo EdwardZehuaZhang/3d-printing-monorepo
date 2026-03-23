@@ -79,6 +79,10 @@ findSerialPortPath.then(serialPortPath => {
     simpleSocketClient.on('close', () => {
       console.log('Connection closed');
     });
+
+    simpleSocketClient.on('error', (err) => {
+      console.log('TCP connection failed (Arduino not available): ' + err.message);
+    });
   }
 
   io.on('connection', socket => {

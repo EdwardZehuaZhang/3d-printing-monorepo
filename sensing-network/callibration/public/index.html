@@ -2,17 +2,462 @@
 <html>
 
 <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
   <style>
+    /* Premium Color Palette */
+    :root {
+      --bg-root: #0f1419;
+      --bg-card: #151d28;
+      --bg-elevated: #1a2332;
+      --bg-inset: #0d1117;
+      --border-subtle: #2a3546;
+      --border-strong: #3d4a5c;
+      --accent-primary: #6b9d7d;
+      --accent-secondary: #c4a373;
+      --accent-glow: rgba(107, 157, 125, 0.15);
+      --text-primary: #f0f4f8;
+      --text-secondary: #a8b5c5;
+      --text-tertiary: #7a8899;
+      --success: #5eac91;
+      --warning: #d4994a;
+    }
+
+    /* Reset & Base */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
     body {
-      margin: 1em;
-      font-family: Verdana, Geneva, Tahoma, sans-serif;
+      background: linear-gradient(135deg, #0f1419 0%, #141c27 100%);
+      color: var(--text-primary);
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 14px;
+      line-height: 1.6;
+      padding: 3rem 2rem;
+      min-height: 100vh;
+      background-attachment: fixed;
+    }
+
+    /* Header - Refined Typography */
+    .app-header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      margin-bottom: 1.5rem;
+      padding-bottom: 1.5rem;
+      gap: 2rem;
+    }
+
+    .app-header h1 {
+      font-family: 'Playfair Display', serif;
+      font-size: 2.5rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      background: linear-gradient(135deg, #f0f4f8 0%, #a8b5c5 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin: 0;
+      line-height: 1.1;
+    }
+
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      font-weight: 500;
+    }
+
+    .live-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background-color: var(--text-tertiary);
+      box-shadow: 0 0 8px rgba(107, 157, 125, 0.3);
+      transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+
+    .live-dot.active {
+      background-color: var(--accent-primary);
+      box-shadow: 0 0 16px rgba(107, 157, 125, 0.6),
+                  0 0 32px rgba(107, 157, 125, 0.3);
+      animation: pulse-refined 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+
+    @keyframes pulse-refined {
+      0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+      }
+      50% {
+        opacity: 0.6;
+        transform: scale(1.2);
+      }
+    }
+
+    /* Main Layout - Asymmetric */
+    .main {
+      display: grid;
+      grid-template-columns: 1.3fr 0.7fr;
+      gap: 2.5rem;
+      max-width: 1600px;
+      margin: 0 auto;
+    }
+
+    @media (max-width: 1024px) {
+      .main {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Card Styles - Premium */
+    .card {
+      background: linear-gradient(135deg, var(--bg-card) 0%, var(--bg-elevated) 100%);
+      border: 1px solid var(--border-subtle);
+      border-radius: 16px;
+      padding: 2rem;
+      position: relative;
+      overflow: hidden;
+      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+      backdrop-filter: blur(10px);
+    }
+
+    .card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(107, 157, 125, 0.3), transparent);
+      pointer-events: none;
+    }
+
+    .card:hover {
+      border-color: var(--border-strong);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3),
+                  inset 0 1px 0 rgba(107, 157, 125, 0.1);
+    }
+
+    /* Dim Step 2 until Step 1 is complete */
+    .card--step2 {
+      opacity: 0.4;
+      pointer-events: none;
+      transition: opacity 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+
+    .card--step2.is-active {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: baseline;
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .card-step {
+      font-family: 'Playfair Display', serif;
+      font-size: 3rem;
+      font-weight: 700;
+      color: var(--accent-primary);
+      opacity: 0.3;
+      line-height: 1;
+      min-width: 50px;
+    }
+
+    .card-title {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.5rem;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+      color: var(--text-primary);
+    }
+
+    .card-divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--border-subtle), transparent);
+      margin: 2rem 0;
+    }
+
+    /* Control Group */
+    .control-group {
+      margin-bottom: 2rem;
+    }
+
+    .input-wrapper {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    label {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-weight: 500;
+    }
+
+    .progress-label {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    input[type="number"] {
+      background-color: var(--bg-inset);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-primary);
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-family: 'Outfit', sans-serif;
+      width: 100px;
+      transition: all 0.2s ease;
+      letter-spacing: 0.3px;
+    }
+
+    input[type="number"]:focus {
+      outline: none;
+      border-color: var(--accent-primary);
+      background-color: var(--bg-elevated);
+      box-shadow: 0 0 16px rgba(107, 157, 125, 0.2);
+    }
+
+    /* Buttons - Refined */
+    .btn {
+      padding: 0.85rem 1.75rem;
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+      font-family: 'Outfit', sans-serif;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      font-size: 0.8rem;
+    }
+
+    .btn--primary {
+      background-color: var(--accent-primary);
+      color: var(--bg-root);
+      border-color: var(--accent-primary);
+      box-shadow: 0 4px 12px rgba(107, 157, 125, 0.2);
+    }
+
+    .btn--primary:hover {
+      background-color: #7baf8d;
+      border-color: #7baf8d;
+      box-shadow: 0 8px 24px rgba(107, 157, 125, 0.3),
+                  inset 0 1px 0 rgba(255, 255, 255, 0.1);
+      transform: translateY(-2px);
+    }
+
+    .btn--primary:active {
+      transform: translateY(0);
+      box-shadow: 0 2px 8px rgba(107, 157, 125, 0.2);
+    }
+
+    .btn--primary.is-active {
+      background-color: transparent;
+      color: var(--accent-primary);
+      border-color: var(--accent-primary);
+      box-shadow: none;
+    }
+
+    .btn--primary.is-disabled {
+      background-color: var(--border-subtle);
+      color: var(--text-tertiary);
+      border-color: var(--border-subtle);
+      opacity: 0.5;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+
+    .btn--primary.is-disabled:hover {
+      background-color: var(--border-subtle);
+      transform: none;
+    }
+
+    /* Status & Progress */
+    .status-text {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+      margin-bottom: 0;
+      min-height: 0;
+      letter-spacing: 0.2px;
+    }
+
+    .status-text.active {
+      margin-bottom: 1.5rem;
+      min-height: 1.5rem;
+    }
+
+    .status-text.active {
+      color: var(--accent-primary);
+      font-weight: 500;
+    }
+
+    .progress-section {
+      margin: 2rem 0;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+
+    .progress-bar-container {
+      flex: 1;
+      height: 6px;
+      background-color: transparent;
+      border-radius: 3px;
+      overflow: hidden;
+      position: relative;
+      display: flex;
+      gap: 3px;
+      align-items: center;
+    }
+
+    .progress-bar-segment {
+      flex: 1;
+      height: 6px;
+      background-color: var(--bg-inset);
+      border-radius: 2px;
+      border: 1px solid var(--border-subtle);
+      transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+      position: relative;
+    }
+
+    .progress-bar-segment.filled {
+      background: linear-gradient(90deg, var(--accent-primary), #7baf8d);
+      border-color: var(--accent-primary);
+      box-shadow: 0 0 8px rgba(107, 157, 125, 0.4);
+    }
+
+    /* Chart Container */
+    #vis {
+      background-color: var(--bg-inset);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 1.5rem;
+      height: 320px;
+      overflow: hidden;
+      margin-top: 1.5rem;
+      position: relative;
+    }
+
+    #vis::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(107, 157, 125, 0.2), transparent);
+      pointer-events: none;
+    }
+
+    /* Node Display */
+    .node-display-container {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    .node-status {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 0.5rem;
+      font-weight: 500;
+    }
+
+    #selectedNode {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 200px;
+      font-family: 'Playfair Display', serif;
+      font-size: 5rem;
+      font-weight: 700;
+      color: var(--text-tertiary);
+      text-align: center;
+      transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+      padding: 2rem;
+      letter-spacing: -1px;
+      border: 2px solid var(--border-subtle);
+      border-radius: 12px;
+      background: linear-gradient(135deg, rgba(107, 157, 125, 0.03), transparent);
+    }
+
+    #selectedNode.is-active {
+      color: var(--accent-primary);
+      border-color: var(--accent-primary);
+      box-shadow: 0 0 32px rgba(107, 157, 125, 0.3),
+                  inset 0 0 32px rgba(107, 157, 125, 0.05);
+      transform: scale(1.05);
+    }
+
+    /* Vega-Embed adjustments */
+    #vis canvas {
+      max-height: 100%;
+    }
+
+    /* Utility */
+    .spacer {
+      height: 1rem;
+    }
+
+    /* Responsive adjustments */
+    @media (max-width: 768px) {
+      body {
+        padding: 2rem 1rem;
+      }
+
+      .app-header {
+        flex-direction: column;
+        align-items: flex-start;
+        margin-bottom: 2rem;
+      }
+
+      .app-header h1 {
+        font-size: 2rem;
+      }
+
+      .card {
+        padding: 1.5rem;
+      }
+
+      #selectedNode {
+        font-size: 3.5rem;
+        min-height: 150px;
+      }
     }
   </style>
-  <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.0.4/socket.io.js"></script>
-  <script src="https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script> -->
+
   <script src="./js/libraries/socket.io@4.7.1"></script>
   <script src="./js/libraries/vega@5.25.0"></script>
   <script src="./js/libraries/vega-lite@5.12.0"></script>
@@ -20,18 +465,63 @@
 </head>
 
 <body>
-  <b>1. Collect and process data</b>
-  <p id="currentCollectingNode">Press Start to collect data</p>
-  <label for="nNodes"># of nodes:</label>
-  <input id="nNodesInput" name="nNodes" type="number" value="20" min="1" max="1000"></input>
-  <button id="collectionStartButton">Start</button>
-  <br />
-  <div id="vis" style="height: 250px;"></div>
-  <hr>
-  <b>2. Node selection demo (after finishing 1)</b>
-  <p id="selectedNode" style="font-size: x-large;">Press Start</p>
-  <button id="demoStartButton">Start</button>
+  <header class="app-header">
+    <h1>Calibration Tool</h1>
+    <div class="header-status">
+      <span>System Status</span>
+      <div id="liveDot" class="live-dot"></div>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- Step 1: Collect & Process Data -->
+    <section class="card card--step1">
+      <div class="card-header">
+        <div class="card-step">01</div>
+        <div class="card-title">Data Collection</div>
+      </div>
+
+      <div class="card-divider"></div>
+
+      <div class="control-group">
+        <div class="input-wrapper">
+          <label for="nNodesInput">Number of Nodes</label>
+          <input id="nNodesInput" name="nNodes" type="number" value="20" min="1" max="1000">
+          <button id="collectionStartButton" class="btn btn--primary">Start Capture</button>
+        </div>
+      </div>
+
+      <div class="status-text" id="currentCollectingNode"></div>
+
+      <div class="progress-section">
+        <div class="progress-label">Collection Progress</div>
+        <div class="progress-bar-container" id="progressBarsContainer"></div>
+      </div>
+
+      <div id="vis"></div>
+    </section>
+
+    <!-- Step 2: Node Selection Demo -->
+    <section class="card card--step2">
+      <div class="card-header">
+        <div class="card-step">02</div>
+        <div class="card-title">Node Detection</div>
+      </div>
+
+      <div class="card-divider"></div>
+
+      <div style="margin-bottom: 2rem;">
+        <button id="demoStartButton" class="btn btn--primary is-disabled" disabled>Start Detection</button>
+      </div>
+
+      <div class="node-display-container">
+        <div class="node-status">Detected Node</div>
+        <div id="selectedNode">—</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="./js/main.js" type="module"></script>
 </body>
-<script src="./js/main.js" type="module"></script>
 
 </html>

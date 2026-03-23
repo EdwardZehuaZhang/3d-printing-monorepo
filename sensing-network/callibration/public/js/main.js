@@ -11,6 +11,14 @@ const socket = io();
 
 let mode = null; // collection or demo
 
+// DOM elements for visual state
+const liveDot = document.getElementById('liveDot');
+const collectionStartButton = document.getElementById('collectionStartButton');
+const demoStartButton = document.getElementById('demoStartButton');
+const progressBarFill = document.getElementById('progressBarFill');
+const selectedNodeEl = document.getElementById('selectedNode');
+let liveDotActivated = false;
+
 // for data collection and preprocessing
 const collectingData = [];
 let currentCollectingNode = -1;
@@ -26,7 +34,16 @@ const bufferedCapValues = [];
 const bufferedSelectedNodes = [];
 
 const processData = (data) => {
-  document.querySelector("#currentCollectingNode").innerHTML = "Processing collected data";
+  const statusEl = document.querySelector("#currentCollectingNode");
+  statusEl.innerHTML = "Processing collected data";
+  statusEl.classList.add('active');
+
+  // Enable demo start button once step 1 is complete
+  demoStartButton.classList.remove('is-disabled');
+  demoStartButton.disabled = false;
+
+  // Activate the Node Detection panel
+  document.querySelector('.card--step2').classList.add('is-active');
 
   const vegaLiteSpec = {
     $schema: 'https://vega.github.io/schema/vega-lite/v5.json',
@@ -78,7 +95,9 @@ const processData = (data) => {
   }
 
   socket.emit("endProcessing", JSON.stringify(config));
-  document.querySelector("#currentCollectingNode").innerHTML = "Finished processing data (config data is in data directory)";
+  const finishedEl = document.querySelector("#currentCollectingNode");
+  finishedEl.innerHTML = "Finished processing data (config data is in data directory)";
+  finishedEl.classList.add('active');
 };
 
 const selectCloseCapValNode = (aveCapValue, config) => {
@@ -98,7 +117,7 @@ const selectCloseCapValNode = (aveCapValue, config) => {
   return parseInt(selectedNode);
 }
 
-document.querySelector("#collectionStartButton").addEventListener("click", () => {
+collectionStartButton.addEventListener("click", () => {
   mode = "collection";
 
   socket.emit("io", {
@@ -109,24 +128,48 @@ document.querySelector("#collectionStartButton").addEventListener("click", () =>
   currentCollectingNode = -1;
   collectingData.length = 0;
 
-  document.querySelector("#currentCollectingNode").innerHTML = 'Wait';
+  const nTotal = parseInt(document.querySelector("#nNodesInput").value);
+
+  // Create individual progress bar segments
+  const container = document.querySelector("#progressBarsContainer");
+  container.innerHTML = '';
+  for (let i = 0; i < nTotal; i++) {
+    const segment = document.createElement('div');
+    segment.className = 'progress-bar-segment';
+    segment.id = `progress-segment-${i}`;
+    container.appendChild(segment);
+  }
+
+  const statusEl = document.querySelector("#currentCollectingNode");
+  statusEl.innerHTML = 'Initializing...';
+  statusEl.classList.remove('active');
+  collectionStartButton.classList.add('is-active');
 
   intervalId = setInterval(() => {
     currentCollectingNode++;
-    if (currentCollectingNode < document.querySelector("#nNodesInput").value) {
-      document.querySelector("#currentCollectingNode").innerHTML =
-        `Touch Node ${currentCollectingNode} (total ${document.querySelector("#nNodesInput").value} nodes)`;
+    if (currentCollectingNode < nTotal) {
+      statusEl.innerHTML = `Touch Node ${currentCollectingNode} (${nTotal} total)`;
+      statusEl.classList.add('active');
+      // Fill the segment for the completed node
+      if (currentCollectingNode > 0) {
+        document.querySelector(`#progress-segment-${currentCollectingNode - 1}`).classList.add('filled');
+      }
     } else {
-      document.querySelector("#currentCollectingNode").innerHTML = "Done (raw json data is in data directory)";
+      statusEl.innerHTML = "Collection complete. Processing...";
+      statusEl.classList.add('active');
+      // Fill the last segment
+      document.querySelector(`#progress-segment-${nTotal - 1}`).classList.add('filled');
       socket.emit("endCollection", JSON.stringify(collectingData));
       clearInterval(intervalId);
+      collectionStartButton.classList.remove('is-active');
       processData(collectingData);
     }
   }, 5000);
 });
 
-document.querySelector("#demoStartButton").addEventListener("click", () => {
+demoStartButton.addEventListener("click", () => {
   mode = "demo";
+  demoStartButton.classList.add('is-active');
 
   if (config) {
     socket.emit("io", {
@@ -149,6 +192,12 @@ socket.on("data", data => {
   const connectType = data.connectType;
   // use smaller buffer sizes when not using a serial port
   const bufferSizeDiv = connectType == 'serial' ? 1 : 2;
+
+  // Activate live dot on first data event with refined animation
+  if (!liveDotActivated) {
+    liveDot.classList.add('active');
+    liveDotActivated = true;
+  }
 
   if (mode == "collection") {
     const time = performance.now() - startTime; // in millisec
@@ -184,11 +233,12 @@ socket.on("data", data => {
           selectedNode = mostFreqNode;
           prevSelectedNode = selectedNode;
           bufferedCapValues.length = 0;
+          selectedNodeEl.classList.add('is-active');
         } else {
           selectedNode = prevSelectedNode;
         }
 
-        document.querySelector("#selectedNode").innerHTML = `Node ${selectedNode}`;
+        document.querySelector("#selectedNode").innerHTML = `${selectedNode}`;
       }
     }
   }
