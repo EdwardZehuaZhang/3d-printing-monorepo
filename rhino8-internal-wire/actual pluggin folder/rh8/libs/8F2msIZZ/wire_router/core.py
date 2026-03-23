@@ -2608,9 +2608,8 @@ def route_node_sequence(
         best_internal_length = 0.0
         for routed_segment in candidate_paths:
             if strict_internal_target:
-                routed_length = _path_length(routed_segment)
-                best_internal_length = max(best_internal_length, routed_length)
-                if routed_length + 1e-9 < strict_target_threshold:
+                best_internal_length = max(best_internal_length, _path_length(routed_segment))
+                if best_internal_length + 1e-9 < strict_target_threshold:
                     continue
 
             # Cross-segment overlap check: verify the new segment does
