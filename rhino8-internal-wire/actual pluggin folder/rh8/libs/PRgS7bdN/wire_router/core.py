@@ -1397,15 +1397,6 @@ def _segment_candidate_paths(
             candidates.append(serpentine)
             serpentine_length = _path_length(serpentine)
             if strict_layercake_mode:
-                reverse_serpentine = _generate_serpentine_fill(
-                    fill_corridor, valid_cells, goal, start, target_length, self_avoid_radius,
-                    min_self_spacing=min_self_spacing,
-                )
-                if reverse_serpentine is not None:
-                    reverse_candidate = list(reversed(reverse_serpentine))
-                    candidates.append(reverse_candidate)
-                    serpentine_length = max(serpentine_length, _path_length(reverse_candidate))
-
                 best_strict = serpentine
                 best_strict_length = serpentine_length
                 growth_attempt = serpentine
@@ -2537,10 +2528,6 @@ def route_node_sequence(
         candidate_lengths = [_path_length(path) for path in candidate_paths]
         candidate_max_length = max(candidate_lengths) if candidate_lengths else 0.0
         candidate_min_length = min(candidate_lengths) if candidate_lengths else 0.0
-        best_candidate_path_cells: List[GridIndex] = []
-        if candidate_lengths:
-            best_candidate_index = max(range(len(candidate_lengths)), key=lambda index: candidate_lengths[index])
-            best_candidate_path_cells = list(candidate_paths[best_candidate_index])
 
         # Pre-compute blocked zone from non-adjacent prior segments
         # (segments that share no start/goal node with the current one).
@@ -2676,8 +2663,6 @@ def route_node_sequence(
                 "candidate_min_length_cells": candidate_min_length,
                 "candidate_max_length_cells": candidate_max_length,
                 "bridge_path_cells": bridge_paths.get(segment_index, []),
-                "best_candidate_path_cells": best_candidate_path_cells,
-                "accepted_prefix_segments_cells": [list(segment) for segment in current_segments],
             }
             if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
                 own_zone = segment_fill_zones[segment_index]
@@ -2720,8 +2705,6 @@ def route_node_sequence(
                     "candidate_min_length_cells": candidate_min_length,
                     "candidate_max_length_cells": candidate_max_length,
                     "bridge_path_cells": bridge_paths.get(segment_index, []),
-                    "best_candidate_path_cells": best_candidate_path_cells,
-                    "accepted_prefix_segments_cells": [list(segment) for segment in current_segments],
                 }
                 if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
                     own_zone = segment_fill_zones[segment_index]
@@ -2750,8 +2733,6 @@ def route_node_sequence(
                 "candidate_min_length_cells": candidate_min_length,
                 "candidate_max_length_cells": candidate_max_length,
                 "bridge_path_cells": bridge_paths.get(segment_index, []),
-                "best_candidate_path_cells": best_candidate_path_cells,
-                "accepted_prefix_segments_cells": [list(segment) for segment in current_segments],
             }
             if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
                 own_zone = segment_fill_zones[segment_index]

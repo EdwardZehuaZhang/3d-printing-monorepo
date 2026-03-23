@@ -1142,23 +1142,6 @@ def _draw_infeasible_internal_preview(
         bridge_points = _preview_points_from_cells(bridge_cells, grid)
         _add_named_curve(doc, bridge_points, "RoutingPreview_InternalBridge")
 
-    prefix_segments = diagnostics.get("accepted_prefix_segments_cells")
-    prefix_count = 0
-    if isinstance(prefix_segments, list):
-        for segment in prefix_segments:
-            if not isinstance(segment, list) or not segment:
-                continue
-            segment_points = _preview_points_from_cells(segment, grid)
-            if _add_named_curve(doc, segment_points, "RoutingPreview_AcceptedPrefix"):
-                prefix_count += 1
-
-    best_candidate = diagnostics.get("best_candidate_path_cells")
-    best_candidate_len = 0
-    if isinstance(best_candidate, list) and best_candidate:
-        best_candidate_len = len(best_candidate)
-        candidate_points = _preview_points_from_cells(best_candidate, grid)
-        _add_named_curve(doc, candidate_points, "RoutingPreview_FailingSegmentBest")
-
     fill_zone_cells = diagnostics.get("fill_zone_sample_cells")
     fill_points_added = 0
     if isinstance(fill_zone_cells, list) and fill_zone_cells:
@@ -1197,12 +1180,6 @@ def _draw_infeasible_internal_preview(
                 fill_points_added,
             )
         )
-    Rhino.RhinoApp.WriteLine(
-        "Preview stats: accepted-prefix segments {}, failing-segment points {}.".format(
-            prefix_count,
-            best_candidate_len,
-        )
-    )
 
 
 def _write_failure_debug(
@@ -1252,17 +1229,6 @@ def _write_failure_debug(
             diagnostics.get("candidate_path_count", "n/a"),
             _fmt_value("candidate_min_length_cells", " cells"),
             _fmt_value("candidate_max_length_cells", " cells"),
-        )
-    )
-
-    accepted_prefix_segments = diagnostics.get("accepted_prefix_segments_cells")
-    prefix_segments_count = len(accepted_prefix_segments) if isinstance(accepted_prefix_segments, list) else 0
-    best_candidate = diagnostics.get("best_candidate_path_cells")
-    best_candidate_points = len(best_candidate) if isinstance(best_candidate, list) else 0
-    Rhino.RhinoApp.WriteLine(
-        "  partial_route prefix_segments={} failing_segment_points={}".format(
-            prefix_segments_count,
-            best_candidate_points,
         )
     )
 
