@@ -29,8 +29,8 @@ from .core import (
 
 
 MAX_ESTIMATED_CELLS = 180000
-DEFAULT_WIRE_DIAMETER_MM = 1.5
-MIN_WIRE_DIAMETER_MM = 0.5
+FIXED_WIRE_DIAMETER_XY_MM = 0.8
+FIXED_WIRE_DIAMETER_Z_MM = 1.2
 CASING_THICKNESS_MM = 0.5
 BOUNDARY_CLEARANCE_MM = 0.5
 PATH_SEPARATION_MM = 1.0
@@ -1003,12 +1003,18 @@ def _nodes_from_order_indices(
 def _segment_solids(
     doc: Rhino.RhinoDoc,
     points: Sequence[rg.Point3d],
-    radius: float,
+    radius_xy: float,
+    radius_z: float,
 ) -> List[rg.Brep]:
     solids: List[rg.Brep] = []
     for start, end in zip(points[:-1], points[1:]):
         if start.DistanceTo(end) <= doc.ModelAbsoluteTolerance:
             continue
+        dx = end.X - start.X
+        dy = end.Y - start.Y
+        dz = end.Z - start.Z
+        planar_span = math.sqrt(dx * dx + dy * dy)
+        radius = radius_z if abs(dz) > planar_span else radius_xy
         line_curve = rg.LineCurve(start, end)
         pipes = rg.Brep.CreatePipe(
             line_curve,
@@ -1022,8 +1028,9 @@ def _segment_solids(
         if pipes:
             solids.extend(pipe for pipe in pipes if pipe is not None and pipe.IsValid)
 
+    junction_radius = max(radius_xy, radius_z)
     for point in points:
-        sphere = rg.Sphere(point, radius).ToBrep()
+        sphere = rg.Sphere(point, junction_radius).ToBrep()
         if sphere is not None and sphere.IsValid:
             solids.append(sphere)
     return solids
@@ -1225,36 +1232,6 @@ def _get_touch_node_flush_diameter_mm() -> Optional[float]:
         return value
 
 
-def _get_conductive_path_diameter_mm(maximum_diameter_mm: float) -> Optional[float]:
-    getter = ric.GetNumber()
-    getter.SetCommandPrompt("Set the conductive trace diameter in millimeters")
-    getter.SetDefaultNumber(DEFAULT_WIRE_DIAMETER_MM)
-    getter.AcceptNothing(True)
-
-    while True:
-        result = getter.Get()
-        if result == ri.GetResult.Cancel:
-            return None
-        if result == ri.GetResult.Nothing:
-            value = DEFAULT_WIRE_DIAMETER_MM
-        elif result == ri.GetResult.Number:
-            value = getter.Number()
-        else:
-            continue
-
-        if value + 1e-9 < MIN_WIRE_DIAMETER_MM:
-            Rhino.RhinoApp.WriteLine("The conductive trace diameter is too small. It must be at least 0.5 mm.")
-            continue
-        if value - 1e-9 > maximum_diameter_mm:
-            Rhino.RhinoApp.WriteLine(
-                "The conductive trace diameter is too large. It cannot be larger than the touch node diameter of {:.2f} mm.".format(
-                    maximum_diameter_mm
-                )
-            )
-            continue
-        return value
-
-
 def _recommended_touch_reading_delta_kohm(wire_diameter_mm: float) -> float:
     _ = wire_diameter_mm
     return DEFAULT_TOUCH_READING_DELTA_KOHM
@@ -1317,7 +1294,8 @@ def _add_output_geometry(
     polyline_points: Sequence[rg.Point3d],
     touch_nodes: Sequence[TouchNodePlacement],
     terminals: Sequence[TerminalPlacement],
-    wire_radius: float,
+    wire_radius_xy: float,
+    wire_radius_z: float,
     node_radius: float,
     terminal_radius: float,
     terminal_length: float,
@@ -1328,7 +1306,7 @@ def _add_output_geometry(
     if not _add_named_curve(doc, polyline_points, "GenerateInternalWire_Centerline"):
         return False
 
-    path_breps = _segment_solids(doc, polyline_points, wire_radius)
+    path_breps = _segment_solids(doc, polyline_points, wire_radius_xy, wire_radius_z)
     touch_node_breps = _touch_node_conductive_breps(
         touch_nodes,
         host_brep,
@@ -1385,19 +1363,40 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if flush_node_diameter_mm is None:
         return Rhino.Commands.Result.Cancel
 
-    wire_diameter_mm = _get_conductive_path_diameter_mm(flush_node_diameter_mm)
-    if wire_diameter_mm is None:
-        return Rhino.Commands.Result.Cancel
+    wire_diameter_xy_mm = FIXED_WIRE_DIAMETER_XY_MM
+    wire_diameter_z_mm = FIXED_WIRE_DIAMETER_Z_MM
+    wire_diameter_for_clearance_mm = max(wire_diameter_xy_mm, wire_diameter_z_mm)
+    wire_diameter_for_estimate_mm = wire_diameter_xy_mm
+    if flush_node_diameter_mm + 1e-9 < wire_diameter_for_clearance_mm:
+        Rhino.RhinoApp.WriteLine(
+            "The touch node diameter is too small for fixed conductive trace widths. Set touch node diameter to at least {:.1f} mm.".format(
+                wire_diameter_for_clearance_mm
+            )
+        )
+        return Rhino.Commands.Result.Failure
 
-    wire_radius = _mm_to_model(doc, wire_diameter_mm * 0.5)
-    route_clearance = wire_radius + casing_thickness + boundary_clearance
+    Rhino.RhinoApp.WriteLine(
+        "Conductive trace widths are fixed: {:.1f} mm (XY) and {:.1f} mm (Z).".format(
+            wire_diameter_xy_mm,
+            wire_diameter_z_mm,
+        )
+    )
 
-    target_touch_reading_delta_kohm = _get_target_touch_reading_delta_kohm(wire_diameter_mm)
+    wire_radius_xy = _mm_to_model(doc, wire_diameter_xy_mm * 0.5)
+    wire_radius_z = _mm_to_model(doc, wire_diameter_z_mm * 0.5)
+    wire_radius_for_clearance = _mm_to_model(doc, wire_diameter_for_clearance_mm * 0.5)
+    route_clearance = wire_radius_for_clearance + casing_thickness + boundary_clearance
+
+    target_touch_reading_delta_kohm = _get_target_touch_reading_delta_kohm(wire_diameter_for_estimate_mm)
     if target_touch_reading_delta_kohm is None:
         return Rhino.Commands.Result.Cancel
 
     node_radius = _mm_to_model(doc, flush_node_diameter_mm * 0.5)
-    target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm, wire_diameter_mm)
+    target_leg_length = _reading_delta_length(
+        doc,
+        target_touch_reading_delta_kohm,
+        wire_diameter_for_estimate_mm,
+    )
     target_leg_length_mm = _model_to_mm(doc, target_leg_length)
 
     terminals = _collect_terminals(
@@ -1423,14 +1422,14 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if touch_nodes is None:
         return Rhino.Commands.Result.Cancel
 
-    step = _auto_step(mesh, doc, wire_diameter_mm, node_count=len(touch_nodes))
+    step = _auto_step(mesh, doc, wire_diameter_for_clearance_mm, node_count=len(touch_nodes))
 
     Rhino.RhinoApp.WriteLine("Routing...")
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
             "No valid routing space was found. The part is too small for a {:.2f} mm conductive trace while also keeping {:.1f} mm clearance from the outer wall and {:.1f} mm spacing around the trace."
-            .format(wire_diameter_mm, BOUNDARY_CLEARANCE_MM, PATH_SEPARATION_MM)
+            .format(wire_diameter_for_clearance_mm, BOUNDARY_CLEARANCE_MM, PATH_SEPARATION_MM)
         )
         return Rhino.Commands.Result.Failure
 
@@ -1447,7 +1446,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     # (R+1)*step >= wire_diameter + PATH_SEPARATION for the required
     # edge-to-edge gap, i.e.  R >= (wire_d + sep) / step - 1.
     spacing_radius = max(1, int(math.ceil(
-        (wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step - 1.0
+        (wire_diameter_for_clearance_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step - 1.0
     )))
     # The node exemption covers the physical node radius so paths can
     # reach the node through blocked zones, but no larger — oversized
@@ -1458,7 +1457,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     # ceil((wire_d + gap) / step) gives the minimum center-to-center
     # distance in grid cells so that edge-to-edge gap >= MIN_INTRA_PATH_GAP_MM.
     min_self_spacing = max(1, int(math.ceil(
-        (wire_diameter_mm + MIN_INTRA_PATH_GAP_MM) * _mm_to_model(doc, 1.0) / step
+        (wire_diameter_for_clearance_mm + MIN_INTRA_PATH_GAP_MM) * _mm_to_model(doc, 1.0) / step
     )))
 
     selected_candidate: Optional[TouchNodeOrderCandidate] = None
@@ -1574,7 +1573,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             doc,
             ordered_labels,
             touch_segment_lengths,
-            wire_diameter_mm,
+            wire_diameter_for_estimate_mm,
             "Resistance between touch nodes:",
         )
 
@@ -1584,7 +1583,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         polyline_points,
         ordered_touch_nodes,
         terminals,
-        wire_radius,
+        wire_radius_xy,
+        wire_radius_z,
         node_radius,
         terminal_radius,
         terminal_length,
@@ -1594,7 +1594,11 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
-    total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1], wire_diameter_mm)
+    total_low, total_high = _resistance_range_kohm(
+        doc,
+        cumulative_lengths[-1],
+        wire_diameter_for_estimate_mm,
+    )
     Rhino.RhinoApp.WriteLine(
         "Total resistance: {:.1f}-{:.1f} kohm.".format(total_low, total_high)
     )

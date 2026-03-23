@@ -58,8 +58,8 @@ First-use workflow inside Rhino:
 1. Start `GenerateInternalWire`.
 2. Select one closed solid, closed mesh, extrusion, or SubD.
 3. Enter the conductive pathway node sphere diameter in millimeters. Press Enter to accept the default `10.0 mm` finger-sized conductive node.
-4. Enter the conductive path diameter in millimeters. Press Enter to accept the default `0.5 mm` single printable line.
-5. Enter the desired touch-to-touch resistance between successive nodes in kohm. Press Enter to accept the recommended default based on the selected conductive path diameter. With the default `0.5 mm` single printable line, the suggested target is `200.0 kohm` for stronger noise separation.
+4. The conductive trace widths are fixed by the command: `0.8 mm` for horizontal (XY-dominant) segments and `1.2 mm` for vertical (Z-dominant) segments.
+5. Enter the desired touch-to-touch resistance between successive nodes in kohm.
 6. Pick the `Start` terminal.
 7. Set that terminal to `Flush` or `Protrude`.
 8. Pick the `End` terminal.
@@ -138,14 +138,14 @@ can be used for downstream boolean operations or fabrication workflows.
 The command now uses fixed fabrication rules instead of prompting for
 `VoxelSize`, `Clearance`, or legacy `WireRadius` settings:
 
-- conductive path diameter: user-defined per command run, but never smaller than `0.5 mm` and never larger than the selected conductive pathway node diameter
+- conductive trace widths are fixed per command run: `0.8 mm` for horizontal (XY-dominant) segments and `1.2 mm` for vertical (Z-dominant) segments
 - retained virtual clearance margin around conductive paths: `0.5 mm`
 - minimum clearance from that retained margin to the host-object wall: `0.5 mm`
 - minimum conductive path spacing from other conductive paths: `0.5 mm`
 - conductive pathway node sphere diameter: user-defined per command run, but defaults to `10.0 mm` and is never smaller than `0.5 mm`
 - start and end terminal connector diameter: `3.0 mm`
 - start and end terminal connector length: `6.0 mm`
-- default desired touch-to-touch resistance target: recommended from conductive path diameter, using `50.0 kohm` at `1.0 mm` as the reference value and `200.0 kohm` for the default `0.5 mm` single printable line
+- default desired touch-to-touch resistance target: `10.0 kohm`
 
 The routing grid resolution is computed automatically in the background.
 
@@ -153,7 +153,7 @@ The routing grid resolution is computed automatically in the background.
 
 The command prints an estimated conductive resistance range using ProtoPasta
 Conductive PLA, scaled from the published `2.0-3.5 kohm per 10 cm` value for
-`1.75 mm` filament and the user-selected conductive path diameter.
+`1.75 mm` filament and a fixed trace-width reference.
 
 It reports:
 
@@ -169,15 +169,14 @@ It reports:
 1. Start `GenerateInternalWire`.
 2. Select one closed target object.
 3. Enter the conductive pathway node sphere diameter in millimeters.
-4. Enter the conductive path diameter in millimeters.
-5. Enter the desired touch-to-touch resistance target in kohm.
-6. Pick the `Start` terminal on the object.
-7. Choose whether that terminal is `Flush` or `Protrude`.
-8. Pick the `End` terminal on the object.
-9. Choose whether that terminal is `Flush` or `Protrude`.
-10. Pick touch nodes on the object surface.
-11. Watch the live node preview while placing each touch node.
-12. Press Enter after the last touch node.
+4. Enter the desired touch-to-touch resistance target in kohm.
+5. Pick the `Start` terminal on the object.
+6. Choose whether that terminal is `Flush` or `Protrude`.
+7. Pick the `End` terminal on the object.
+8. Choose whether that terminal is `Flush` or `Protrude`.
+9. Pick touch nodes on the object surface.
+10. Watch the live node preview while placing each touch node.
+11. Press Enter after the last touch node.
 
 The command adds:
 
@@ -204,10 +203,9 @@ Touch-node rules:
 
 Routing rules:
 
-- conductive path diameter is chosen by the user for the entire command run
-- conductive path diameter must be at least 0.5 mm
-- conductive path diameter cannot exceed the selected conductive pathway node diameter
-- if a chosen conductive path diameter is geometrically too large and would force overlaps with nodes or pathways, routing fails and the command reports that the pathway is not big enough
+- conductive trace widths are fixed by the command: `0.8 mm` in XY-dominant segments and `1.2 mm` in Z-dominant segments
+- the selected conductive pathway node diameter must be at least `1.2 mm`
+- if the fixed conductive widths are geometrically too large and would force overlaps with nodes or pathways, routing fails and the command reports that the pathway is not big enough
 - no casing geometry is generated, but a virtual 0.5 mm clearance margin is still enforced in the routing logic
 - conductive paths stay at least 0.5 mm away from other conductive paths where the geometry allows
 - conductive paths reserve protected space around every terminal and every conductive pathway node so the route cannot cut through another anchor
