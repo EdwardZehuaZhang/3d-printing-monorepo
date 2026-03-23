@@ -2241,11 +2241,56 @@ def route_node_sequence(
     # band zones and hard no-go reservations.
     highway_cells: Set[GridIndex] = set()
 
-    # Coiling domain is not statically partitioned by segment.
-    # Strict coiling expands in the full currently-valid space, while
-    # blocked cells + keepouts + bridge exclusions enforce sequential
-    # consumption of available geometry.
+    # Per-segment fill zones for serpentine growth. Internal node-pair
+    # segments get bottom-up "layer-cake" Z-bands with proportional band
+    # thickness by target demand and upward-only spill.
     segment_fill_zones: Optional[List[Set[GridIndex]]] = None
+    if segment_target_lengths is not None and blocked_radius > 0 and num_segments > 2:
+        fill_pool = set(valid_cells) - reserved
+        all_z = sorted(set(cell[2] for cell in fill_pool))
+        internal_segment_indices = [index for index in range(1, num_segments - 1)]
+
+        segment_fill_zones = [set(fill_pool) for _ in range(num_segments)]
+        if all_z and internal_segment_indices:
+            segment_demands: Dict[int, float] = {}
+            for segment_index in internal_segment_indices:
+                segment_target = segment_target_lengths[segment_index]
+                direct_length = max(
+                    1.0,
+                    _movement_distance(
+                        node_sequence[segment_index],
+                        node_sequence[segment_index + 1],
+                        allow_diagonals,
+                    ),
+                )
+                if segment_target is None or segment_target <= 0.0:
+                    segment_demands[segment_index] = 1.0
+                else:
+                    segment_demands[segment_index] = max(
+                        1.0,
+                        min(
+                            AGGRESSIVE_PRESSURE_WEIGHT_CAP,
+                            float(segment_target) / direct_length,
+                        ),
+                    )
+
+            own_bands = _internal_layer_band_allocation(
+                z_levels=all_z,
+                internal_segment_indices=internal_segment_indices,
+                segment_demands=segment_demands,
+            )
+
+            cumulative_z: Set[int] = set()
+            spill_bands: Dict[int, Set[int]] = {}
+            for segment_index in reversed(internal_segment_indices):
+                cumulative_z |= own_bands.get(segment_index, set())
+                spill_bands[segment_index] = set(cumulative_z)
+
+            for segment_index in internal_segment_indices:
+                allowed_z = spill_bands.get(segment_index, set(all_z))
+                segment_fill_zones[segment_index] = {
+                    cell for cell in fill_pool if cell[2] in allowed_z
+                }
 
     # Precompute node keepout zones: for each node, the set of cells
     # that paths NOT connecting to that node must avoid.  The radius
