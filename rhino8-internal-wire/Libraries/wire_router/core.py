@@ -31,6 +31,18 @@ BRIDGE_CONDUIT_RADIUS_MULTIPLIER = 4
 class RoutingError(RuntimeError):
     """Raised when a valid route cannot be found."""
 
+    def __init__(self, message: str, *, diagnostics: Optional[Dict[str, object]] = None) -> None:
+        super().__init__(message)
+        self.diagnostics: Dict[str, object] = diagnostics or {}
+
+
+def _sample_preview_cells(cells: Iterable[GridIndex], limit: int = 600) -> List[GridIndex]:
+    sampled = sorted(set(cells), key=lambda cell: (cell[2], cell[1], cell[0]))
+    if len(sampled) <= limit:
+        return sampled
+    stride = max(1, int(math.ceil(len(sampled) / float(limit))))
+    return sampled[::stride][:limit]
+
 
 _DILATION_OFFSET_CACHE: Dict[int, Tuple[Tuple[int, int, int], ...]] = {}
 
@@ -2199,6 +2211,7 @@ def route_node_sequence(
     bridge_endpoint_exemption_radius = max(1, blocked_exemption_radius, blocked_radius)
     bridge_paths: Dict[int, List[GridIndex]] = {}
     bridge_conduit_cells: Set[GridIndex] = set()
+    bridge_conduit_cells_by_segment: Dict[int, Set[GridIndex]] = {}
 
     edge_roominess_cutoff = max(1, bottleneck_threshold)
     preferred_edge_cells = {
@@ -2255,7 +2268,9 @@ def route_node_sequence(
             bridge_paths[segment_index] = bridge_path
 
             if bridge_conduit_radius > 0:
-                bridge_conduit_cells.update(dilate_cells(bridge_path, bridge_conduit_radius))
+                segment_conduit_cells = dilate_cells(bridge_path, bridge_conduit_radius)
+                bridge_conduit_cells_by_segment[segment_index] = segment_conduit_cells
+                bridge_conduit_cells.update(segment_conduit_cells)
 
     for segment_index in terminal_segment_indices:
         bridge_path = bridge_paths.get(segment_index)
@@ -2330,6 +2345,10 @@ def route_node_sequence(
 
         if current_blocked_cells:
             local_blocked = set(current_blocked_cells)
+            if has_internal_segments:
+                local_blocked.difference_update(
+                    bridge_conduit_cells_by_segment.get(segment_index, set())
+                )
             if bridge_endpoint_exemption_radius > 0:
                 local_blocked.difference_update(
                     dilate_cells({start, goal}, bridge_endpoint_exemption_radius)
@@ -2538,6 +2557,21 @@ def route_node_sequence(
 
         if strict_internal_target:
             target_length_value = float(segment_target_length or 0.0)
+            failure_diagnostics: Dict[str, object] = {
+                "type": "strict_internal_target_failure",
+                "segment_index": segment_index,
+                "start": start,
+                "goal": goal,
+                "target_length_cells": target_length_value,
+                "achieved_length_cells": best_internal_length,
+                "required_ratio": STRICT_INTERNAL_TARGET_RATIO,
+                "required_length_cells": strict_target_threshold,
+                "bridge_path_cells": bridge_paths.get(segment_index, []),
+            }
+            if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
+                own_zone = segment_fill_zones[segment_index]
+                failure_diagnostics["fill_zone_cell_count"] = len(own_zone)
+                failure_diagnostics["fill_zone_sample_cells"] = _sample_preview_cells(own_zone)
             if node_labels is not None:
                 raise RoutingError(
                     "Internal pathway between {} and {} could not reach target length ({:.1f}/{:.1f} cells).".format(
@@ -2545,7 +2579,8 @@ def route_node_sequence(
                         node_labels[segment_index + 1],
                         best_internal_length,
                         target_length_value,
-                    )
+                    ),
+                    diagnostics=failure_diagnostics,
                 )
             raise RoutingError(
                 "Internal route between {} and {} failed strict target ({:.1f}/{:.1f} cells).".format(
@@ -2553,18 +2588,47 @@ def route_node_sequence(
                     goal,
                     best_internal_length,
                     target_length_value,
-                )
+                ),
+                diagnostics=failure_diagnostics,
             )
 
         if node_labels is not None:
+            failure_diagnostics: Optional[Dict[str, object]] = None
+            if segment_index in internal_segment_indices:
+                failure_diagnostics = {
+                    "type": "internal_route_unreachable",
+                    "segment_index": segment_index,
+                    "start": start,
+                    "goal": goal,
+                    "bridge_path_cells": bridge_paths.get(segment_index, []),
+                }
+                if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
+                    own_zone = segment_fill_zones[segment_index]
+                    failure_diagnostics["fill_zone_cell_count"] = len(own_zone)
+                    failure_diagnostics["fill_zone_sample_cells"] = _sample_preview_cells(own_zone)
             raise RoutingError(
                 "Pathway between {} and {} could not fit the current routing constraints.".format(
                     node_labels[segment_index],
                     node_labels[segment_index + 1],
-                )
+                ),
+                diagnostics=failure_diagnostics,
             )
+        failure_diagnostics = None
+        if segment_index in internal_segment_indices:
+            failure_diagnostics = {
+                "type": "internal_route_unreachable",
+                "segment_index": segment_index,
+                "start": start,
+                "goal": goal,
+                "bridge_path_cells": bridge_paths.get(segment_index, []),
+            }
+            if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
+                own_zone = segment_fill_zones[segment_index]
+                failure_diagnostics["fill_zone_cell_count"] = len(own_zone)
+                failure_diagnostics["fill_zone_sample_cells"] = _sample_preview_cells(own_zone)
         raise RoutingError(
-            "No route found between {} and {}.".format(start, goal)
+            "No route found between {} and {}.".format(start, goal),
+            diagnostics=failure_diagnostics,
         )
 
     initial_segments: List[List[GridIndex]] = list(segments)

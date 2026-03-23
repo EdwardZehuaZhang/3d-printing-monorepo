@@ -1110,6 +1110,78 @@ def _add_breps(doc: Rhino.RhinoDoc, breps: Sequence[rg.Brep], name: str) -> bool
     return added
 
 
+def _add_named_points(doc: Rhino.RhinoDoc, points: Sequence[rg.Point3d], name: str) -> int:
+    attributes = rd.ObjectAttributes()
+    attributes.Name = name
+    added = 0
+    for point in points:
+        if doc.Objects.AddPoint(point, attributes) != System.Guid.Empty:
+            added += 1
+    return added
+
+
+def _preview_points_from_cells(cells: Sequence[GridIndex], grid: GridSpec) -> List[rg.Point3d]:
+    return [rg.Point3d(*index_to_point(cell, grid)) for cell in cells]
+
+
+def _draw_infeasible_internal_preview(
+    doc: Rhino.RhinoDoc,
+    diagnostics: Dict[str, object],
+    grid: GridSpec,
+) -> None:
+    failure_type = diagnostics.get("type")
+    if failure_type not in {"strict_internal_target_failure", "internal_route_unreachable"}:
+        return
+
+    segment_index = diagnostics.get("segment_index")
+    start = diagnostics.get("start")
+    goal = diagnostics.get("goal")
+
+    bridge_cells = diagnostics.get("bridge_path_cells")
+    if isinstance(bridge_cells, list) and bridge_cells:
+        bridge_points = _preview_points_from_cells(bridge_cells, grid)
+        _add_named_curve(doc, bridge_points, "RoutingPreview_InternalBridge")
+
+    fill_zone_cells = diagnostics.get("fill_zone_sample_cells")
+    fill_points_added = 0
+    if isinstance(fill_zone_cells, list) and fill_zone_cells:
+        fill_points = _preview_points_from_cells(fill_zone_cells, grid)
+        fill_points_added = _add_named_points(doc, fill_points, "RoutingPreview_InternalFillZoneSample")
+
+    endpoint_points: List[rg.Point3d] = []
+    if isinstance(start, tuple) and len(start) == 3:
+        endpoint_points.append(rg.Point3d(*index_to_point(start, grid)))
+    if isinstance(goal, tuple) and len(goal) == 3:
+        endpoint_points.append(rg.Point3d(*index_to_point(goal, grid)))
+    if endpoint_points:
+        _add_named_points(doc, endpoint_points, "RoutingPreview_InternalPairEndpoints")
+
+    target_length = diagnostics.get("target_length_cells")
+    achieved_length = diagnostics.get("achieved_length_cells")
+    fill_zone_count = diagnostics.get("fill_zone_cell_count")
+    Rhino.RhinoApp.WriteLine(
+        "Infeasible-pair preview generated for segment {} ({} -> {}).".format(
+            segment_index,
+            start,
+            goal,
+        )
+    )
+    if isinstance(target_length, (int, float)) and isinstance(achieved_length, (int, float)):
+        Rhino.RhinoApp.WriteLine(
+            "Preview stats: achieved {:.1f} / target {:.1f} cells.".format(
+                float(achieved_length),
+                float(target_length),
+            )
+        )
+    if isinstance(fill_zone_count, int):
+        Rhino.RhinoApp.WriteLine(
+            "Preview stats: fill-zone cells {}, sampled points {}.".format(
+                fill_zone_count,
+                fill_points_added,
+            )
+        )
+
+
 def _cumulative_anchor_lengths(
     polyline_points: Sequence[rg.Point3d],
     anchor_points: Sequence[rg.Point3d],
@@ -1485,6 +1557,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     selected_segments: List[List[GridIndex]] = []
     first_failure_reason: Optional[str] = None
     first_failure_order: Optional[List[str]] = None
+    first_failure_diagnostics: Optional[Dict[str, object]] = None
     attempted_orders = 0
 
     for candidate in order_candidates:
@@ -1543,6 +1616,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             if first_failure_reason is None:
                 first_failure_reason = str(error)
                 first_failure_order = [node.label for node in ordered_touch_nodes]
+                first_failure_diagnostics = error.diagnostics if hasattr(error, "diagnostics") else None
             continue
 
         selected_candidate = candidate
@@ -1568,6 +1642,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             Rhino.RhinoApp.WriteLine(
                 "This does not always mean the whole part is too small. It means at least one segment did not have enough local space once the trace diameter, node protection zones, wall clearance, and trace spacing were applied."
             )
+            if first_failure_diagnostics:
+                _draw_infeasible_internal_preview(doc, first_failure_diagnostics, grid)
         else:
             Rhino.RhinoApp.WriteLine(
                 "No valid route could be found with the current geometry and spacing rules."

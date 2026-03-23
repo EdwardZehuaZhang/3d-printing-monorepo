@@ -334,6 +334,22 @@ class CoreRouterTests(unittest.TestCase):
         self.assertLessEqual(self._segment_length(segments[0]), 30.0)
         self.assertLessEqual(self._segment_length(segments[1]), 30.0)
 
+    def test_strict_internal_target_succeeds_with_terminal_bridges(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(40) for y in range(20)}
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=[(0, 10, 0), (12, 10, 0), (27, 10, 0), (39, 10, 0)],
+            segment_target_lengths=[None, 45.0, None],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            blocked_exemption_radius=1,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 3)
+        self.assertGreaterEqual(self._segment_length(segments[1]), 45.0 * 0.98)
+
     def test_target_leg_falls_back_when_detour_blocks_later_segment(self) -> None:
         valid_cells = (
             {(x, 5, 0) for x in range(12)}
@@ -472,17 +488,30 @@ class CoreRouterTests(unittest.TestCase):
     def test_terminal_segments_are_reserved_no_go_for_internal_fill(self) -> None:
         valid_cells = {(x, y, 0) for x in range(15) for y in range(15)}
         node_sequence = [(0, 7, 0), (4, 7, 0), (10, 7, 0), (14, 7, 0)]
-        with self.assertRaises(RoutingError):
-            route_node_sequence(
-                valid_cells=valid_cells,
-                node_sequence=node_sequence,
-                segment_target_lengths=[None, None, None],
-                penalty_radius=0,
-                penalty_weight=0.0,
-                blocked_radius=1,
-                blocked_exemption_radius=1,
-                allow_diagonals=False,
-            )
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=node_sequence,
+            segment_target_lengths=[None, None, None],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            blocked_exemption_radius=1,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 3)
+        first_terminal = set(self._expand_segment(segments[0]))
+        internal = set(self._expand_segment(segments[1]))
+        last_terminal = set(self._expand_segment(segments[2]))
+
+        terminal_blocked = dilate_cells(first_terminal | last_terminal, 1)
+        shared_endpoint_safe = dilate_cells({node_sequence[1], node_sequence[2]}, 1)
+        forbidden_internal = terminal_blocked - shared_endpoint_safe
+
+        self.assertFalse(
+            internal & forbidden_internal,
+            "Internal segment entered terminal no-go reservation outside shared endpoints.",
+        )
 
     # ---- reversal removal ----
 
@@ -643,17 +672,29 @@ class CoreRouterTests(unittest.TestCase):
         valid_cells = {(x, y, 0) for x in range(25) for y in range(20)}
         blocked_radius = 1
         node_seq = [(0, 10, 0), (6, 10, 0), (12, 10, 0), (18, 10, 0), (24, 10, 0)]
-        with self.assertRaises(RoutingError):
-            route_node_sequence(
-                valid_cells=valid_cells,
-                node_sequence=node_seq,
-                segment_target_lengths=[None, None, None, None],
-                penalty_radius=0,
-                penalty_weight=0.0,
-                blocked_radius=blocked_radius,
-                blocked_exemption_radius=2,
-                allow_diagonals=False,
-            )
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=node_seq,
+            segment_target_lengths=[None, None, None, None],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=blocked_radius,
+            blocked_exemption_radius=2,
+            allow_diagonals=False,
+        )
+        self.assertEqual(len(segments), 4)
+        endpoints = {c for s in segments for c in (s[0], s[-1])}
+        for i in range(len(segments)):
+            expanded_i = set(self._expand_segment(segments[i]))
+            for j in range(i + 2, len(segments)):
+                expanded_j = set(self._expand_segment(segments[j]))
+                check_i = expanded_i - endpoints
+                check_j = expanded_j - endpoints
+                overlap = check_j & dilate_cells(check_i, blocked_radius)
+                self.assertFalse(
+                    overlap,
+                    f"Segments {i} and {j} violate spacing (cells: {overlap}).",
+                )
 
     def test_boundary_penalty_in_astar(self) -> None:
         """astar_path with boundary_penalty_cells avoids penalised cells."""
