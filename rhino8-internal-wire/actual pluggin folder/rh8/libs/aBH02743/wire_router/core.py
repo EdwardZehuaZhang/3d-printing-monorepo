@@ -26,7 +26,6 @@ AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_TARGET_PRESSURE = 8.0
 AGGRESSIVE_TOUCH_SEGMENT_PRIORITY_BONUS = 1.5
 STRICT_INTERNAL_TARGET_RATIO = 0.98
 BRIDGE_CONDUIT_RADIUS_MULTIPLIER = 4
-LIQUID_REROUTE_MAX_RADIUS = 3
 
 
 class RoutingError(RuntimeError):
@@ -278,49 +277,6 @@ def _build_fill_corridor(
     return corridor
 
 
-def _local_transition_reroute(
-    valid_cells: Set[GridIndex],
-    start: GridIndex,
-    goal: GridIndex,
-    blocked_cells: Set[GridIndex],
-    max_radius: int = LIQUID_REROUTE_MAX_RADIUS,
-) -> Optional[List[GridIndex]]:
-    """Try bounded, deterministic local reroutes around transition obstacles."""
-    base_min_x = min(start[0], goal[0])
-    base_max_x = max(start[0], goal[0])
-    base_min_y = min(start[1], goal[1])
-    base_max_y = max(start[1], goal[1])
-    base_min_z = min(start[2], goal[2])
-    base_max_z = max(start[2], goal[2])
-
-    for radius in range(1, max(1, max_radius) + 1):
-        min_x = base_min_x - radius
-        max_x = base_max_x + radius
-        min_y = base_min_y - radius
-        max_y = base_max_y + radius
-        min_z = base_min_z - radius
-        max_z = base_max_z + radius
-
-        local_valid = {
-            cell for cell in valid_cells
-            if min_x <= cell[0] <= max_x
-            and min_y <= cell[1] <= max_y
-            and min_z <= cell[2] <= max_z
-            and cell not in blocked_cells
-        }
-        local_valid.add(start)
-        local_valid.add(goal)
-        if start not in local_valid or goal not in local_valid:
-            continue
-
-        try:
-            return astar_path(local_valid, start, goal, allow_diagonals=False)
-        except RoutingError:
-            continue
-
-    return None
-
-
 def _generate_serpentine_fill(
     corridor: Set[GridIndex],
     valid_cells: Set[GridIndex],
@@ -550,20 +506,11 @@ def _generate_serpentine_fill(
                         micro = astar_path(valid_cells, last, cell)
                         _extend_and_track(micro[1:])
                     except RoutingError:
-                        local_detour = _local_transition_reroute(
-                            valid_cells,
-                            last,
-                            cell,
-                            blocked_cells=body,
-                        )
-                        if local_detour is not None:
-                            _extend_and_track(local_detour[1:])
-                        else:
-                            # Rollback any partial approach toward the unreachable
-                            # cell so the path is not stranded at a dead-end.
-                            del path[snapshot:]
-                            running_length = snapshot_length
-                            continue
+                        # Rollback any partial approach toward the unreachable
+                        # cell so the path is not stranded at a dead-end.
+                        del path[snapshot:]
+                        running_length = snapshot_length
+                        continue
 
         # Early stop once the serpentine has generated enough length.
         est_remaining = _distance(path[-1], goal)
@@ -2686,14 +2633,7 @@ def route_node_sequence(
                 # Exempt cells near start/goal so the path can still
                 # reach its endpoints.  Using only 1 cell was too tight
                 # and prevented valid routes in dense layouts.
-                adaptive_exempt = max(2, blocked_radius)
-                if strict_internal_target and target_length_value > 0.0:
-                    pressure_ratio = target_length_value / max(1e-9, direct_distance)
-                    if pressure_ratio >= 1.6:
-                        adaptive_exempt = max(adaptive_exempt, blocked_radius + 1)
-                    if pressure_ratio >= 2.0:
-                        adaptive_exempt = max(adaptive_exempt, blocked_radius + 2)
-                node_exempt = dilate_cells({start, goal}, adaptive_exempt)
+                node_exempt = dilate_cells({start, goal}, max(2, blocked_radius))
                 non_adjacent_blocked.difference_update(node_exempt)
 
         last_error: Optional[RoutingError] = None
