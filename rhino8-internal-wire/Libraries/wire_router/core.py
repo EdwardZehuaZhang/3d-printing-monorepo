@@ -19,6 +19,11 @@ AGGRESSIVE_HEADROOM_RATIO = 0.10
 AGGRESSIVE_HEADROOM_MIN_CELLS = 50
 AGGRESSIVE_FORCE_BEAM_MAX_HEADROOM = 200
 AGGRESSIVE_PRESSURE_WEIGHT_CAP = 8.0
+AGGRESSIVE_CANDIDATE_EXPAND_RATIO = 2.2
+AGGRESSIVE_WAYPOINT_LIMIT = 20
+AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_MAX_SEGMENTS = 5
+AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_TARGET_PRESSURE = 8.0
+AGGRESSIVE_TOUCH_SEGMENT_PRIORITY_BONUS = 1.5
 
 
 class RoutingError(RuntimeError):
@@ -1311,6 +1316,13 @@ def _segment_candidate_paths(
     aggressive_growth_valid = set(valid_cells) - hard_excluded
     aggressive_growth_valid.add(start)
     aggressive_growth_valid.add(goal)
+    target_ratio = target_length / max(1.0, direct_length)
+    if (
+        not allow_diagonals
+        and target_ratio >= AGGRESSIVE_CANDIDATE_EXPAND_RATIO
+        and len(candidate_valid_cells) < int(len(aggressive_growth_valid) * 0.95)
+    ):
+        candidate_valid_cells = aggressive_growth_valid
 
     # ---- Serpentine fill (primary strategy for large targets) ----
     # Inspired by trace_filling from 3dp-singlewire-sensing.
@@ -1366,13 +1378,17 @@ def _segment_candidate_paths(
                     bottleneck_threshold=bottleneck_threshold,
                 )[:max_candidates]
 
+    waypoint_limit = 12
+    if not allow_diagonals and target_ratio >= AGGRESSIVE_CANDIDATE_EXPAND_RATIO:
+        waypoint_limit = AGGRESSIVE_WAYPOINT_LIMIT
+
     candidate_waypoints = _select_detour_waypoints(
         valid_cells=candidate_valid_cells,
         start=start,
         goal=goal,
         direct_length=direct_length,
         target_length=target_length,
-        limit=12,
+        limit=waypoint_limit,
         allow_diagonals=allow_diagonals,
         roominess_map=roominess_map,
         bottleneck_threshold=bottleneck_threshold,
@@ -2027,6 +2043,7 @@ def route_node_sequence(
     if segment_target_lengths is not None and blocked_radius > 0:
         all_z = sorted(set(c[2] for c in valid_cells))
         highway_step = max(2, blocked_radius * 2 + 2)
+        target_pressure = 0.0
         numeric_targets = [
             float(length)
             for length in segment_target_lengths
@@ -2045,7 +2062,11 @@ def route_node_sequence(
                 highway_step += 1
             if num_segments >= 8 and target_pressure < 8.0:
                 highway_step = max(2, highway_step - 1)
-        if len(all_z) >= highway_step * 3:
+        disable_highways_for_short_chain = (
+            num_segments <= AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_MAX_SEGMENTS
+            and target_pressure >= AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_TARGET_PRESSURE
+        )
+        if not disable_highways_for_short_chain and len(all_z) >= highway_step * 3:
             highway_z_set = set(all_z[i] for i in range(0, len(all_z), highway_step))
             highway_cells = {c for c in valid_cells if c[2] in highway_z_set}
 
@@ -2069,7 +2090,10 @@ def route_node_sequence(
                     allow_diagonals,
                 ),
             )
-            pressure_weight = max(1.0, min(AGGRESSIVE_PRESSURE_WEIGHT_CAP, float(segment_target) / direct_length))
+            pressure_weight = float(segment_target) / direct_length
+            if 0 < segment_index < (num_segments - 1):
+                pressure_weight *= AGGRESSIVE_TOUCH_SEGMENT_PRIORITY_BONUS
+            pressure_weight = max(1.0, min(AGGRESSIVE_PRESSURE_WEIGHT_CAP, pressure_weight))
             segment_pressure_weights.append(pressure_weight)
         # Midpoint of each segment (average of its two endpoint nodes).
         midpoints = []
