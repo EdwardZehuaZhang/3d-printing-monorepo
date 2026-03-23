@@ -49,9 +49,9 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.5
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (4.8, 5.0)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_VERSION = "v27.3.2"
+ROUTER_BUILD_VERSION = "v37 layered logic"
 ROUTER_BUILD_DATE = "2026-03-23"
-ROUTER_ROUTING_PROFILE = "aggressive-fill-phase3"
+ROUTER_ROUTING_PROFILE = "deterministic-layercake-bridge-lock"
 ROUTER_BUILD_SOURCE = "main-source"
 ROUTER_BUILD_TAG = "{} | {} | {} | {}".format(
     ROUTER_BUILD_VERSION,
@@ -384,64 +384,20 @@ def _target_order_candidates(
 
     start_distances, end_distances, pair_distances = _touch_node_distance_tables(start, touch_nodes, end)
 
-    order_indices: List[Tuple[int, ...]] = []
-    node_count = len(touch_nodes)
-
     preferred_bottom_up = _preferred_bottom_up_order(touch_nodes)
-    if preferred_bottom_up:
-        order_indices.append(preferred_bottom_up)
+    if not preferred_bottom_up:
+        return []
 
-    if node_count <= max_exact_nodes:
-        order_indices.extend(tuple(order) for order in itertools.permutations(range(node_count)))
-    else:
-        primary = optimize_node_order_for_target_leg_length(
-            start_distances,
-            end_distances,
-            pair_distances,
-            target_leg_length,
-            max_exact_nodes=MAX_DP_NODES,
+    metrics = evaluate_node_order(preferred_bottom_up, start_distances, end_distances, pair_distances)
+    max_length_error, total_length_error, _ = _target_length_score(metrics, target_leg_length)
+    return [
+        TouchNodeOrderCandidate(
+            ordered_nodes=_nodes_from_order_indices(touch_nodes, preferred_bottom_up),
+            metrics=metrics,
+            max_length_error=max_length_error,
+            total_length_error=total_length_error,
         )
-        order_indices.append(primary)
-        for start_index in range(node_count):
-            order_indices.append(
-                _greedy_target_order(
-                    start_distances,
-                    end_distances,
-                    pair_distances,
-                    target_leg_length,
-                    start_index,
-                )
-            )
-
-    unique_orders: List[Tuple[int, ...]] = []
-    seen_orders: Set[Tuple[int, ...]] = set()
-    for order in order_indices:
-        if order in seen_orders:
-            continue
-        seen_orders.add(order)
-        unique_orders.append(order)
-
-    candidates: List[TouchNodeOrderCandidate] = []
-    for order in unique_orders:
-        metrics = evaluate_node_order(order, start_distances, end_distances, pair_distances)
-        max_length_error, total_length_error, _ = _target_length_score(metrics, target_leg_length)
-        candidates.append(
-            TouchNodeOrderCandidate(
-                ordered_nodes=_nodes_from_order_indices(touch_nodes, order),
-                metrics=metrics,
-                max_length_error=max_length_error,
-                total_length_error=total_length_error,
-            )
-        )
-
-    candidates.sort(
-        key=lambda candidate: (
-            candidate.max_length_error,
-            candidate.total_length_error,
-            candidate.metrics.total_path_length,
-        )
-    )
-    return candidates[:MAX_ORDER_CANDIDATES]
+    ]
 
 
 def _create_touch_node(

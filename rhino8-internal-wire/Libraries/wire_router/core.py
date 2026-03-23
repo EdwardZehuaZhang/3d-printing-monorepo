@@ -217,15 +217,19 @@ def _build_fill_corridor(
         and cell not in excluded
     }
 
-    # If the bounding-box corridor is too small relative to the
-    # target, fall back to all valid cells (minus highway layers) so
-    # the serpentine can exploit all available fill space in the grid.
+    # Keep the corridor bounded to its assigned domain. We intentionally
+    # do not fall back to the full valid-cell set because deterministic
+    # layer-cake routing must stay inside the segment's allocated band.
     min_cells_needed = int(target_length * 1.5)
     if len(corridor) < min_cells_needed:
-        fallback_excluded = set(hard_excluded)
-        if not relax_soft_exclusions_on_fallback:
-            fallback_excluded.update(soft_excluded)
-        corridor = set(valid_cells) - fallback_excluded
+        if relax_soft_exclusions_on_fallback and soft_excluded:
+            corridor = {
+                cell for cell in valid_cells
+                if min_x <= cell[0] <= max_x
+                and min_y <= cell[1] <= max_y
+                and min_z <= cell[2] <= max_z
+                and cell not in hard_excluded
+            }
 
     return corridor
 
@@ -253,17 +257,19 @@ def _generate_serpentine_fill(
     row_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
     layer_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
 
-    # Choose sweep axes: sweep along the longest corridor dimension,
-    # layer through the shortest, rows in the middle.
-    coords = list(zip(*corridor))  # ([x …], [y …], [z …])
-    axis_ranges = []
-    for axis in range(3):
-        vals = coords[axis]
-        axis_ranges.append((max(vals) - min(vals), axis))
-    axis_ranges.sort(key=lambda r: r[0])
-    layer_axis = axis_ranges[0][1]  # thinnest
-    row_axis = axis_ranges[1][1]
-    sweep_axis = axis_ranges[2][1]  # longest
+    # Deterministic layering: always fill from bottom to top in world Z.
+    # Sweeps are performed in XY only.
+    xs = [cell[0] for cell in corridor]
+    ys = [cell[1] for cell in corridor]
+    x_range = max(xs) - min(xs)
+    y_range = max(ys) - min(ys)
+    layer_axis = 2
+    if x_range >= y_range:
+        sweep_axis = 0
+        row_axis = 1
+    else:
+        sweep_axis = 1
+        row_axis = 0
 
     # Group corridor cells by (layer, row) → list of sweep values.
     layer_rows: Dict[int, Dict[int, List[int]]] = {}
@@ -273,10 +279,8 @@ def _generate_serpentine_fill(
         sv = cell[sweep_axis]
         layer_rows.setdefault(lv, {}).setdefault(rv, []).append(sv)
 
-    # Select layers with spacing, ordered from start toward goal.
+    # Select layers with spacing, always bottom-up (ascending Z).
     all_layers = sorted(layer_rows.keys())
-    if start[layer_axis] > goal[layer_axis]:
-        all_layers = list(reversed(all_layers))
     selected_layers: List[int] = []
     for lv in all_layers:
         if not selected_layers or abs(lv - selected_layers[-1]) >= layer_spacing:
@@ -1313,16 +1317,7 @@ def _segment_candidate_paths(
     direct_length = _path_length(direct_path)
     hard_excluded = set(fill_hard_excluded_cells or set())
     soft_excluded = set(fill_soft_excluded_cells or set())
-    aggressive_growth_valid = set(valid_cells) - hard_excluded
-    aggressive_growth_valid.add(start)
-    aggressive_growth_valid.add(goal)
     target_ratio = target_length / max(1.0, direct_length)
-    if (
-        not allow_diagonals
-        and target_ratio >= AGGRESSIVE_CANDIDATE_EXPAND_RATIO
-        and len(candidate_valid_cells) < int(len(aggressive_growth_valid) * 0.95)
-    ):
-        candidate_valid_cells = aggressive_growth_valid
 
     # ---- Serpentine fill (primary strategy for large targets) ----
     # Inspired by trace_filling from 3dp-singlewire-sensing.
@@ -1332,7 +1327,7 @@ def _segment_candidate_paths(
             min_self_spacing=min_self_spacing,
             fill_hard_excluded_cells=hard_excluded,
             fill_soft_excluded_cells=soft_excluded,
-            relax_soft_exclusions_on_fallback=True,
+            relax_soft_exclusions_on_fallback=False,
         )
         serpentine = _generate_serpentine_fill(
             fill_corridor, valid_cells, start, goal, target_length, self_avoid_radius,
@@ -1341,19 +1336,7 @@ def _segment_candidate_paths(
         if serpentine is not None:
             candidates.append(serpentine)
             serpentine_length = _path_length(serpentine)
-            # If the corridor-based fill fell short, try again with
-            # the full valid cell set (minus highway layers) so the
-            # serpentine can exploit all available fill space.
-            fill_full = set(valid_cells) - hard_excluded
-            if serpentine_length < target_length * serpentine_early_exit_ratio and len(fill_corridor) < len(fill_full):
-                full_serpentine = _generate_serpentine_fill(
-                    fill_full, valid_cells, start, goal, target_length,
-                    self_avoid_radius, min_self_spacing=min_self_spacing,
-                )
-                if full_serpentine is not None:
-                    candidates.append(full_serpentine)
-                    serpentine_length = max(serpentine_length, _path_length(full_serpentine))
-            fill_headroom = max(0, len(fill_full) - len(fill_corridor))
+            fill_headroom = 0
             headroom_threshold = max(
                 AGGRESSIVE_HEADROOM_MIN_CELLS,
                 int(len(fill_corridor) * AGGRESSIVE_HEADROOM_RATIO),
@@ -1465,7 +1448,7 @@ def _segment_candidate_paths(
                     break
                 try:
                     mixed = _route_through_waypoints(
-                        valid_cells=aggressive_growth_valid,
+                        valid_cells=candidate_valid_cells,
                         waypoint_sequence=(start, waypoint, goal),
                         penalty_cells=penalty_cells,
                         penalty_weight=penalty_weight,
@@ -1484,7 +1467,7 @@ def _segment_candidate_paths(
                     max(0, self_avoid_radius),
                     roominess_map,
                     bottleneck_threshold,
-                    growth_valid_cells=aggressive_growth_valid,
+                    growth_valid_cells=candidate_valid_cells,
                     min_self_spacing=min_self_spacing,
                 )
                 candidates.append(mixed)
@@ -1511,12 +1494,10 @@ def _segment_candidate_paths(
             )
             for path in short_candidates
         ]
-        # Second pass: if corridor growth fell short, grow using all
-        # valid cells so the wire can expand into unused space.
+        # Second pass: retry within the same constrained candidate domain.
         still_short = [
             path for path in grown_candidates
             if _path_length(path) < target_length * 0.95
-            and len(candidate_valid_cells) < len(aggressive_growth_valid)
         ]
         if still_short:
             grown_candidates.extend(
@@ -1527,7 +1508,7 @@ def _segment_candidate_paths(
                     max(0, self_avoid_radius),
                     roominess_map,
                     bottleneck_threshold,
-                    growth_valid_cells=aggressive_growth_valid,
+                    growth_valid_cells=candidate_valid_cells,
                     min_self_spacing=min_self_spacing,
                 )
                 for path in still_short
@@ -1547,7 +1528,7 @@ def _segment_candidate_paths(
                     max(0, self_avoid_radius),
                     roominess_map,
                     bottleneck_threshold,
-                    growth_valid_cells=aggressive_growth_valid,
+                    growth_valid_cells=candidate_valid_cells,
                     min_self_spacing=min_self_spacing,
                 )
                 for path in extra_short
@@ -2095,48 +2076,17 @@ def route_node_sequence(
 
     num_segments = len(node_sequence) - 1
 
-    # Compute highway Z-levels: evenly-spaced Z values that serpentine fills
-    # must avoid.  These layers act as transit corridors so inter-node paths
-    # always have clear routes even after earlier segments have densely filled
-    # their own Z-slices.  Only applied when target lengths are requested and
-    # blocked_radius is active (i.e. real multi-segment routing with spacing).
+    # Legacy transit-highway allocation is disabled in deterministic
+    # layered mode. Serpentine fill is constrained only by per-segment
+    # band zones and hard no-go reservations.
     highway_cells: Set[GridIndex] = set()
-    if segment_target_lengths is not None and blocked_radius > 0:
-        all_z = sorted(set(c[2] for c in valid_cells))
-        highway_step = max(2, blocked_radius * 2 + 2)
-        target_pressure = 0.0
-        numeric_targets = [
-            float(length)
-            for length in segment_target_lengths
-            if length is not None and length > 0.0
-        ]
-        if numeric_targets and all_z:
-            avg_target = sum(numeric_targets) / float(len(numeric_targets))
-            target_pressure = avg_target / max(1.0, float(len(all_z)))
-            if target_pressure > 24.0:
-                highway_step += 4
-            elif target_pressure > 16.0:
-                highway_step += 3
-            elif target_pressure > 10.0:
-                highway_step += 2
-            elif target_pressure > 6.0:
-                highway_step += 1
-            if num_segments >= 8 and target_pressure < 8.0:
-                highway_step = max(2, highway_step - 1)
-        disable_highways_for_short_chain = (
-            num_segments <= AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_MAX_SEGMENTS
-            and target_pressure >= AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_TARGET_PRESSURE
-        )
-        if not disable_highways_for_short_chain and len(all_z) >= highway_step * 3:
-            highway_z_set = set(all_z[i] for i in range(0, len(all_z), highway_step))
-            highway_cells = {c for c in valid_cells if c[2] in highway_z_set}
 
     # Per-segment fill zones for serpentine growth. Internal node-pair
     # segments get bottom-up "layer-cake" Z-bands with proportional band
     # thickness by target demand and upward-only spill.
     segment_fill_zones: Optional[List[Set[GridIndex]]] = None
     if segment_target_lengths is not None and blocked_radius > 0 and num_segments > 2:
-        fill_pool = (valid_cells - highway_cells) - reserved
+        fill_pool = set(valid_cells) - reserved
         all_z = sorted(set(cell[2] for cell in fill_pool))
         internal_segment_indices = [index for index in range(1, num_segments - 1)]
 
