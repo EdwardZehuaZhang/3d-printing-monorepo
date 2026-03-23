@@ -1,7 +1,7 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{17b2b8e4-030d-4607-ace4-9004a6203486}") = "internal wire", "internal wire\internal wire.csproj", "{5a4e7400-dd8c-4ac6-b4f4-287a8829fa2d}"
+Project("{17b2b8e4-030d-4607-ace4-9004a6203486}") = "internal wire", "internal wire\internal wire.csproj", "{8dac4726-2de9-4e4d-a14b-262b9ffcb77c}"
 EndProject
 
 Global
@@ -10,9 +10,9 @@ Global
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{5a4e7400-dd8c-4ac6-b4f4-287a8829fa2d}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{5a4e7400-dd8c-4ac6-b4f4-287a8829fa2d}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{5a4e7400-dd8c-4ac6-b4f4-287a8829fa2d}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{5a4e7400-dd8c-4ac6-b4f4-287a8829fa2d}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8dac4726-2de9-4e4d-a14b-262b9ffcb77c}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8dac4726-2de9-4e4d-a14b-262b9ffcb77c}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8dac4726-2de9-4e4d-a14b-262b9ffcb77c}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8dac4726-2de9-4e4d-a14b-262b9ffcb77c}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
