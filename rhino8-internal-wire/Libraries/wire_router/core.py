@@ -332,7 +332,11 @@ def _generate_serpentine_fill(
     # Build ordered cell sequence (the abstract serpentine schedule).
     ordered: List[GridIndex] = []
     flip_row = False
-    flip_sweep = False
+    sweep_values = [cell[sweep_axis] for cell in corridor]
+    sweep_midpoint = (min(sweep_values) + max(sweep_values)) * 0.5
+    # Entry-first coil behavior: begin sweeping away from the bridge-entry
+    # side toward the farther edge, then alternate row directions.
+    flip_sweep = start[sweep_axis] >= sweep_midpoint
 
     for lv in selected_layers:
         rows = layer_rows[lv]
@@ -1335,6 +1339,7 @@ def _segment_candidate_paths(
     fill_soft_excluded_cells: Optional[Set[GridIndex]] = None,
     serpentine_early_exit_ratio: float = AGGRESSIVE_SERPENTINE_EARLY_EXIT_RATIO,
     strict_layercake_mode: bool = False,
+    strict_completion_ratio: float = STRICT_INTERNAL_TARGET_RATIO,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1391,19 +1396,32 @@ def _segment_candidate_paths(
         if serpentine is not None:
             candidates.append(serpentine)
             serpentine_length = _path_length(serpentine)
-            if strict_layercake_mode and serpentine_length < target_length * serpentine_early_exit_ratio:
-                grown = _grow_path_toward_target(
-                    serpentine,
-                    valid_cells,
-                    target_length,
-                    max(0, self_avoid_radius),
-                    roominess_map,
-                    bottleneck_threshold,
-                    growth_valid_cells=valid_cells,
-                    min_self_spacing=min_self_spacing,
-                )
-                candidates.append(grown)
             if strict_layercake_mode:
+                best_strict = serpentine
+                best_strict_length = serpentine_length
+                growth_attempt = serpentine
+                max_growth_passes = max(4, AGGRESSIVE_EXTRA_GROWTH_PASSES + 4)
+                for _ in range(max_growth_passes):
+                    if best_strict_length + 1e-9 >= target_length * strict_completion_ratio:
+                        break
+                    growth_attempt = _grow_path_toward_target(
+                        growth_attempt,
+                        valid_cells,
+                        target_length,
+                        max(0, self_avoid_radius),
+                        roominess_map,
+                        bottleneck_threshold,
+                        growth_valid_cells=valid_cells,
+                        min_self_spacing=min_self_spacing,
+                    )
+                    growth_attempt = _remove_path_reversals(growth_attempt)
+                    grown_length = _path_length(growth_attempt)
+                    candidates.append(growth_attempt)
+                    if grown_length <= best_strict_length + 1e-9:
+                        break
+                    best_strict = growth_attempt
+                    best_strict_length = grown_length
+
                 cleaned_candidates = [_remove_path_reversals(path) for path in candidates]
                 unique_candidates = _dedupe_paths(cleaned_candidates)
                 return _sort_candidate_paths(
@@ -2501,6 +2519,7 @@ def route_node_sequence(
                     fill_hard_excluded_cells=fill_hard_excluded,
                     fill_soft_excluded_cells=fill_soft_excluded,
                     strict_layercake_mode=strict_internal_target,
+                    strict_completion_ratio=STRICT_INTERNAL_TARGET_RATIO,
                 )
             except RoutingError:
                 candidate_paths = []
