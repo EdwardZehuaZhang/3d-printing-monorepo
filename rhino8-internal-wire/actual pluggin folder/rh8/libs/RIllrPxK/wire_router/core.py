@@ -2564,11 +2564,15 @@ def route_node_sequence(
                     strict_layercake_mode=strict_internal_target,
                 )
                 if bridge_conduit_cells:
+                    other_segment_bridge_cells = set(bridge_conduit_cells)
+                    other_segment_bridge_cells.difference_update(
+                        bridge_conduit_cells_by_segment.get(segment_index, set())
+                    )
                     endpoint_bridge_safe = dilate_cells(
                         {start, goal}, bridge_endpoint_exemption_radius
                     )
                     fill_hard_excluded.update(
-                        bridge_conduit_cells - endpoint_bridge_safe
+                        other_segment_bridge_cells - endpoint_bridge_safe
                     )
                 candidate_paths = _segment_candidate_paths(
                     valid_cells=segment_valid_cells,
