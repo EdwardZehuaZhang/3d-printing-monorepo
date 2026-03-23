@@ -1533,8 +1533,9 @@ def _add_output_geometry(
             return False
         terminal_breps.extend(solids)
 
-    conductive_path = list(path_breps) + list(terminal_breps)
+    conductive_path = _boolean_union(path_breps + terminal_breps, doc.ModelAbsoluteTolerance)
     conductive_nodes = _boolean_union(touch_node_breps, doc.ModelAbsoluteTolerance)
+    conductive_path = _boolean_difference(conductive_path, conductive_nodes, doc.ModelAbsoluteTolerance)
 
     path_added = _add_breps(doc, conductive_path, "GenerateInternalWire_ConductivePath")
     node_added = _add_breps(doc, conductive_nodes, "GenerateInternalWire_ConductivePathwayNodes")

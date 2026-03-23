@@ -2342,6 +2342,7 @@ def route_node_sequence(
 
     internal_segment_indices: Set[int] = set(range(1, max(1, num_segments - 1)))
     has_internal_segments = len(internal_segment_indices) > 0
+    first_internal_segment_index = min(internal_segment_indices) if internal_segment_indices else None
     terminal_segment_indices: Set[int] = set()
     if has_internal_segments and num_segments >= 1:
         terminal_segment_indices.add(0)
@@ -2357,6 +2358,7 @@ def route_node_sequence(
     bridge_paths: Dict[int, List[GridIndex]] = {}
     bridge_conduit_cells: Set[GridIndex] = set()
     bridge_conduit_cells_by_segment: Dict[int, Set[GridIndex]] = {}
+    terminal_bridge_blocked_cells: Set[GridIndex] = set()
 
     edge_roominess_cutoff = max(1, bottleneck_threshold)
     preferred_edge_cells = {
@@ -2393,6 +2395,15 @@ def route_node_sequence(
                 segment_valid_cells.add(start)
                 segment_valid_cells.add(goal)
 
+            if segment_index in terminal_segment_indices and terminal_bridge_blocked_cells:
+                local_terminal_blocked = set(terminal_bridge_blocked_cells)
+                local_terminal_blocked.difference_update(
+                    dilate_cells({start, goal}, bridge_endpoint_exemption_radius)
+                )
+                local_terminal_blocked.discard(start)
+                local_terminal_blocked.discard(goal)
+                segment_valid_cells.difference_update(local_terminal_blocked)
+
             segment_penalties: Set[GridIndex] = set()
             if segment_index in terminal_segment_indices:
                 segment_penalties.update(edge_penalty_cells)
@@ -2411,6 +2422,11 @@ def route_node_sequence(
                 boundary_penalty_weight=0.2,
             )
             bridge_paths[segment_index] = bridge_path
+
+            if segment_index in terminal_segment_indices and blocked_radius > 0:
+                terminal_bridge_blocked_cells.update(
+                    dilate_cells(bridge_path, blocked_radius)
+                )
 
             if bridge_conduit_radius > 0:
                 segment_conduit_cells = dilate_cells(bridge_path, bridge_conduit_radius)
@@ -2681,14 +2697,20 @@ def route_node_sequence(
             # into that same endpoint zone. This avoids routing through the
             # same touch-node volume and creating accidental shorts.
             if node_keepout_radius > 0 and len(node_sequence) > 2:
-                if _has_endpoint_keepout_reentry(
-                    routed_segment,
-                    start,
-                    goal,
-                    node_keepout_radius,
-                ):
-                    rejection_counts["endpoint_keepout_reentry"] += 1
-                    continue
+                relax_first_internal_reentry = (
+                    strict_internal_target
+                    and first_internal_segment_index is not None
+                    and segment_index == first_internal_segment_index
+                )
+                if not relax_first_internal_reentry:
+                    if _has_endpoint_keepout_reentry(
+                        routed_segment,
+                        start,
+                        goal,
+                        node_keepout_radius,
+                    ):
+                        rejection_counts["endpoint_keepout_reentry"] += 1
+                        continue
 
             # Post-hoc per-node keepout check: the endpoint_safe exemption
             # during valid_cells filtering may let a path slip through a

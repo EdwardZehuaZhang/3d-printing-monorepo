@@ -2358,7 +2358,6 @@ def route_node_sequence(
     bridge_paths: Dict[int, List[GridIndex]] = {}
     bridge_conduit_cells: Set[GridIndex] = set()
     bridge_conduit_cells_by_segment: Dict[int, Set[GridIndex]] = {}
-    terminal_bridge_blocked_cells: Set[GridIndex] = set()
 
     edge_roominess_cutoff = max(1, bottleneck_threshold)
     preferred_edge_cells = {
@@ -2395,15 +2394,6 @@ def route_node_sequence(
                 segment_valid_cells.add(start)
                 segment_valid_cells.add(goal)
 
-            if segment_index in terminal_segment_indices and terminal_bridge_blocked_cells:
-                local_terminal_blocked = set(terminal_bridge_blocked_cells)
-                local_terminal_blocked.difference_update(
-                    dilate_cells({start, goal}, bridge_endpoint_exemption_radius)
-                )
-                local_terminal_blocked.discard(start)
-                local_terminal_blocked.discard(goal)
-                segment_valid_cells.difference_update(local_terminal_blocked)
-
             segment_penalties: Set[GridIndex] = set()
             if segment_index in terminal_segment_indices:
                 segment_penalties.update(edge_penalty_cells)
@@ -2422,11 +2412,6 @@ def route_node_sequence(
                 boundary_penalty_weight=0.2,
             )
             bridge_paths[segment_index] = bridge_path
-
-            if segment_index in terminal_segment_indices and blocked_radius > 0:
-                terminal_bridge_blocked_cells.update(
-                    dilate_cells(bridge_path, blocked_radius)
-                )
 
             if bridge_conduit_radius > 0:
                 segment_conduit_cells = dilate_cells(bridge_path, bridge_conduit_radius)

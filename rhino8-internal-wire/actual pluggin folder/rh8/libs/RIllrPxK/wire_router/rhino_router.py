@@ -49,9 +49,9 @@ PROTO_PASTA_BASE_DIAMETER_MM = 1.5
 PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (4.8, 5.0)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-ROUTER_BUILD_VERSION = "v37 layered logic"
-ROUTER_BUILD_DATE = "2026-03-23"
-ROUTER_ROUTING_PROFILE = "deterministic-layercake-bridge-lock"
+ROUTER_BUILD_VERSION = "v38 strict-bottomup bridge-aware"
+ROUTER_BUILD_DATE = "2026-03-24"
+ROUTER_ROUTING_PROFILE = "deterministic-layercake-bridge-guard"
 ROUTER_BUILD_SOURCE = "main-source"
 ROUTER_BUILD_TAG = "{} | {} | {} | {}".format(
     ROUTER_BUILD_VERSION,
@@ -1533,9 +1533,8 @@ def _add_output_geometry(
             return False
         terminal_breps.extend(solids)
 
-    conductive_path = _boolean_union(path_breps + terminal_breps, doc.ModelAbsoluteTolerance)
+    conductive_path = list(path_breps) + list(terminal_breps)
     conductive_nodes = _boolean_union(touch_node_breps, doc.ModelAbsoluteTolerance)
-    conductive_path = _boolean_difference(conductive_path, conductive_nodes, doc.ModelAbsoluteTolerance)
 
     path_added = _add_breps(doc, conductive_path, "GenerateInternalWire_ConductivePath")
     node_added = _add_breps(doc, conductive_nodes, "GenerateInternalWire_ConductivePathwayNodes")
