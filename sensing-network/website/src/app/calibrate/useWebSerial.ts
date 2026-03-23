@@ -77,9 +77,41 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
     console.log("[WebSerial] Read loop ended");
   }, []);
 
-  const connect = useCallback(async () => {
+  // Request port from user gesture (shows browser picker).
+  // Returns the port so the caller can do async work (e.g. flash)
+  // before calling openPort().
+  const requestPort = useCallback(async (): Promise<SerialPort | null> => {
     if (!isSupported) {
       setError("Web Serial API is not supported in this browser. Use Chrome or Edge.");
+      setStatus("error");
+      return null;
+    }
+
+    try {
+      setError(null);
+      console.log("[WebSerial] Opening port picker...");
+      const port = await navigator.serial.requestPort();
+      console.log("[WebSerial] Port selected:", port.getInfo());
+      portRef.current = port;
+      return port;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "NotFoundError") {
+        console.log("[WebSerial] User cancelled port picker");
+        setStatus("disconnected");
+      } else {
+        console.error("[WebSerial] requestPort error:", err);
+        setError(err instanceof Error ? err.message : "Port selection failed");
+        setStatus("error");
+      }
+      return null;
+    }
+  }, [isSupported]);
+
+  // Open a previously-requested port (no user gesture needed).
+  const openPort = useCallback(async () => {
+    const port = portRef.current;
+    if (!port) {
+      setError("No port selected. Call requestPort first.");
       setStatus("error");
       return;
     }
@@ -88,14 +120,32 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
       setStatus("connecting");
       setError(null);
 
-      console.log("[WebSerial] Opening port picker...");
+      console.log("[WebSerial] Opening port at", baudRate, "baud...");
+      await port.open({
+        baudRate,
+        dataBits: 8,
+        parity: "none",
+        stopBits: 1,
+        flowControl: "none",
+      });
 
-      // No filter — UNO R4 WiFi uses Renesas chip, not classic Arduino VID
-      const port = await navigator.serial.requestPort();
+      console.log("[WebSerial] Port opened successfully");
+      setStatus("connected");
+      readLoop(port);
+    } catch (err) {
+      console.error("[WebSerial] openPort error:", err);
+      setError(err instanceof Error ? err.message : "Failed to open port");
+      setStatus("error");
+    }
+  }, [baudRate, readLoop]);
 
-      console.log("[WebSerial] Port selected, opening at", baudRate, "baud...");
-      const info = port.getInfo();
-      console.log("[WebSerial] Port info:", info);
+  // Combined: pick port + open immediately (requires user gesture).
+  const connect = useCallback(async () => {
+    const port = await requestPort();
+    if (!port) return;
+
+    try {
+      setStatus("connecting");
 
       await port.open({
         baudRate,
@@ -106,24 +156,14 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
       });
 
       console.log("[WebSerial] Port opened successfully");
-
-      portRef.current = port;
       setStatus("connected");
-
-      // Start reading
       readLoop(port);
     } catch (err) {
-      if (err instanceof DOMException && err.name === "NotFoundError") {
-        // User cancelled the picker — not an error
-        console.log("[WebSerial] User cancelled port picker");
-        setStatus("disconnected");
-      } else {
-        console.error("[WebSerial] Connect error:", err);
-        setError(err instanceof Error ? err.message : "Connection failed");
-        setStatus("error");
-      }
+      console.error("[WebSerial] Connect error:", err);
+      setError(err instanceof Error ? err.message : "Connection failed");
+      setStatus("error");
     }
-  }, [isSupported, baudRate, readLoop]);
+  }, [requestPort, baudRate, readLoop]);
 
   const disconnect = useCallback(async () => {
     console.log("[WebSerial] Disconnecting...");
@@ -167,5 +207,5 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
     };
   }, []);
 
-  return { status, error, isSupported, connect, disconnect, write };
+  return { status, error, isSupported, connect, requestPort, openPort, disconnect, write };
 }

@@ -87,7 +87,7 @@ export default function HomePage() {
           }}
         />
 
-        <div className="relative mx-auto grid max-w-6xl items-center gap-8 px-6 pt-10 pb-24 md:grid-cols-2 md:pt-16 md:pb-32">
+        <div className="relative mx-auto grid max-w-6xl items-center gap-8 px-6 pt-20 pb-24 md:grid-cols-2 md:pt-26 md:pb-32">
           {/* Left: Text content */}
           <motion.div
             initial="hidden"

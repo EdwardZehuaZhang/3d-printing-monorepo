@@ -23,325 +23,331 @@ const STATUS_CONFIG: Record<
   error: { color: "bg-danger", label: "Error" },
 };
 
-// Calibration config: per-node average capacitive values
-type CalibrationConfig = Record<string, number>;
+// Arduino calibration phases — matched to sketch output
+type CalPhase =
+  | "idle"           // before calibration starts
+  | "phase0-notouch" // Phase 0: don't touch (4s)
+  | "phase0-touch"   // Phase 0: touch any node (4s)
+  | "phase0-enter"   // Phase 0: waiting for ENTER
+  | "phase1"         // Phase 1: baseline measurement
+  | "phase2"         // Phase 2: per-node calibration
+  | "phase3"         // Phase 3: calibration results
+  | "live";          // Live detection loop
+
+const NODE_COLORS = [
+  "#1245A8", "#2563eb", "#16a34a", "#d97706",
+  "#dc2626", "#7c3aed", "#0891b2", "#db2777",
+];
 
 export default function CalibratePage() {
-  const [numNodes, setNumNodes] = useState(4);
   const [baudRate, setBaudRate] = useState(115200);
 
   // Flash state
   const [isFlashing, setIsFlashing] = useState(false);
   const [flashStatus, setFlashStatus] = useState<string | null>(null);
 
-  // Collection state
-  const [isCollecting, setIsCollecting] = useState(false);
-  const [currentNode, setCurrentNode] = useState(-1);
-  const [collectingData, setCollectingData] = useState<
-    { node: number; time: number; value: number }[]
-  >([]);
-  const startTimeRef = useRef(0);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [collectionComplete, setCollectionComplete] = useState(false);
+  // Calibration phase tracking (parsed from Arduino output)
+  const [phase, setPhase] = useState<CalPhase>("idle");
+  const phaseRef = useRef<CalPhase>("idle");
 
-  // Detection state
-  const [isDetecting, setIsDetecting] = useState(false);
+  // Phase 2: which node the Arduino is currently calibrating (1-based)
+  const [calNode, setCalNode] = useState(0);
+  const [calNodeStatus, setCalNodeStatus] = useState<
+    "waiting" | "touching" | "collecting" | "releasing" | "done"
+  >("waiting");
+  const [calNodesCompleted, setCalNodesCompleted] = useState(0);
+  const numNodesRef = useRef(4); // default, updated from Arduino output
+
+  // Live detection: parsed from Arduino output
   const [detectedNode, setDetectedNode] = useState<number | null>(null);
-  const [config, setConfig] = useState<CalibrationConfig | null>(null);
-  const capBufferRef = useRef<number[]>([]);
-  const nodeBufferRef = useRef<number[]>([]);
-  const prevNodeRef = useRef(-1);
 
-  // Live sensor value for chart area
-  const [liveValues, setLiveValues] = useState<number[]>([]);
-  const MAX_LIVE = 100;
+  // Live sensor values for chart (sum values)
+  const [liveValues, setLiveValues] = useState<{ time: number; value: number; node?: number }[]>([]);
+  const MAX_LIVE = 200;
+  const startTimeRef = useRef(0);
 
   // Serial monitor log
   const [serialLog, setSerialLog] = useState<string[]>([]);
-  const MAX_LOG = 200;
+  const MAX_LOG = 300;
+  const serialLogRef = useRef<HTMLDivElement>(null);
 
-  // Current collecting node ref (for use inside serial callback)
-  const currentNodeRef = useRef(-1);
-  const modeRef = useRef<"idle" | "collection" | "detection">("idle");
-  const collectingDataRef = useRef<
-    { node: number; time: number; value: number }[]
-  >([]);
+  // Auto-scroll serial monitor
+  useEffect(() => {
+    if (serialLogRef.current) {
+      serialLogRef.current.scrollTop = serialLogRef.current.scrollHeight;
+    }
+  }, [serialLog]);
 
-  const handleSerialData = useCallback(
-    (raw: string) => {
-      // Log all serial output to the serial monitor
-      setSerialLog((prev) => {
-        const next = [...prev, raw];
-        return next.length > MAX_LOG ? next.slice(-MAX_LOG) : next;
-      });
+  const handleSerialData = useCallback((raw: string) => {
+    // Log to serial monitor
+    setSerialLog((prev) => {
+      const next = [...prev, raw];
+      return next.length > MAX_LOG ? next.slice(-MAX_LOG) : next;
+    });
 
-      // Try to parse as a plain number (wifi_connection sketch)
-      // or extract the last number from debug lines (four_node_sensor sketch)
-      let value = NaN;
-      const plain = parseFloat(raw);
-      if (!isNaN(plain) && raw.trim() === String(plain)) {
-        // Plain numeric line (e.g. "1234")
-        value = plain;
-      } else {
-        // Try to extract a numeric value — look for known patterns
-        // e.g. "sum=1234" or last number on the line
-        const sumMatch = raw.match(/sum[=:]\s*(-?\d+)/);
-        if (sumMatch) {
-          value = parseFloat(sumMatch[1]);
-        } else {
-          // Fall back to last number on the line
-          const nums = raw.match(/-?\d+\.?\d*/g);
-          if (nums && nums.length > 0) {
-            value = parseFloat(nums[nums.length - 1]);
-          }
-        }
-      }
-      if (isNaN(value)) return;
+    // ── Phase detection from Arduino output ──────────────────────
+    if (raw.includes("[PHASE 0]")) {
+      phaseRef.current = "phase0-notouch";
+      setPhase("phase0-notouch");
+      startTimeRef.current = performance.now();
+      setLiveValues([]);
+      setCalNodesCompleted(0);
+      setDetectedNode(null);
+      return;
+    }
 
-      // Update live chart
+    if (raw.includes("TOUCH ANY NODE FIRMLY")) {
+      phaseRef.current = "phase0-touch";
+      setPhase("phase0-touch");
+      return;
+    }
+
+    if (raw.includes("Press ENTER to continue")) {
+      phaseRef.current = "phase0-enter";
+      setPhase("phase0-enter");
+      return;
+    }
+
+    if (raw.includes("[PHASE 1]")) {
+      phaseRef.current = "phase1";
+      setPhase("phase1");
+      return;
+    }
+
+    if (raw.includes("[PHASE 2]")) {
+      phaseRef.current = "phase2";
+      setPhase("phase2");
+      setCalNode(0);
+      setCalNodeStatus("waiting");
+      return;
+    }
+
+    if (raw.includes("[PHASE 3]")) {
+      phaseRef.current = "phase3";
+      setPhase("phase3");
+      return;
+    }
+
+    if (raw.includes("LIVE DETECTION")) {
+      phaseRef.current = "live";
+      setPhase("live");
+      setDetectedNode(null);
+      return;
+    }
+
+    // ── Phase 2: per-node calibration tracking ───────────────────
+    const touchHoldMatch = raw.match(/TOUCH AND HOLD\s+Node\s+(\d+)/);
+    if (touchHoldMatch) {
+      const n = parseInt(touchHoldMatch[1]);
+      setCalNode(n);
+      setCalNodeStatus("waiting");
+      // Update numNodes if we see a higher node number
+      if (n > numNodesRef.current) numNodesRef.current = n;
+      return;
+    }
+
+    if (raw.includes("Touch detected!")) {
+      setCalNodeStatus("collecting");
+      return;
+    }
+
+    if (raw.includes("collecting Node")) {
+      setCalNodeStatus("collecting");
+    }
+
+    if (raw.includes("RELEASE NOW")) {
+      setCalNodeStatus("releasing");
+      return;
+    }
+
+    if (raw.includes("Released.")) {
+      setCalNodeStatus("done");
+      setCalNodesCompleted((prev) => prev + 1);
+      return;
+    }
+
+    // ── Live detection: parse pressed/released/switch ────────────
+    const pressedMatch = raw.match(/>>> Node (\d+) PRESSED <<</);
+    if (pressedMatch) {
+      setDetectedNode(parseInt(pressedMatch[1]));
+      return;
+    }
+
+    if (raw.includes("[RELEASE]")) {
+      setDetectedNode(null);
+      return;
+    }
+
+    const switchMatch = raw.match(/\[SWITCH → Node (\d+)\]/);
+    if (switchMatch) {
+      setDetectedNode(parseInt(switchMatch[1]));
+      return;
+    }
+
+    // ── Parse sum= values for live chart ─────────────────────────
+    const sumMatch = raw.match(/sum=\s*(-?\d+)/);
+    if (sumMatch) {
+      const value = parseInt(sumMatch[1]);
+      const time = performance.now() - startTimeRef.current;
+
+      // Parse current node from [NX] in debug output
+      let node: number | undefined;
+      const nodeMatch = raw.match(/\[N(\d+)\]/);
+      if (nodeMatch) node = parseInt(nodeMatch[1]);
+
       setLiveValues((prev) => {
-        const next = [...prev, value];
+        const next = [...prev, { time, value, node }];
         return next.length > MAX_LIVE ? next.slice(-MAX_LIVE) : next;
       });
-
-      if (modeRef.current === "collection") {
-        const time = performance.now() - startTimeRef.current;
-        collectingDataRef.current.push({
-          node: currentNodeRef.current,
-          time,
-          value,
-        });
-      } else if (modeRef.current === "detection" && config) {
-        capBufferRef.current.push(value);
-        if (capBufferRef.current.length > 10) {
-          capBufferRef.current.shift();
-          const avg =
-            capBufferRef.current.reduce((s, v) => s + v, 0) /
-            capBufferRef.current.length;
-
-          // Find closest node
-          let bestNode = -1;
-          let minDiff = Infinity;
-          for (const [nodeStr, refVal] of Object.entries(config)) {
-            const diff = Math.abs(refVal - avg);
-            if (diff < minDiff) {
-              minDiff = diff;
-              bestNode = parseInt(nodeStr);
-            }
-          }
-
-          nodeBufferRef.current.push(bestNode);
-          if (nodeBufferRef.current.length > 10) {
-            nodeBufferRef.current.shift();
-
-            // Consensus: 80% agreement
-            const counts: Record<number, number> = {};
-            for (const n of nodeBufferRef.current) {
-              counts[n] = (counts[n] || 0) + 1;
-            }
-            const sorted = Object.entries(counts).sort(
-              ([, a], [, b]) => b - a
-            );
-            const [topNode, topCount] = sorted[0];
-
-            if (topCount > 8) {
-              setDetectedNode(parseInt(topNode));
-              prevNodeRef.current = parseInt(topNode);
-              capBufferRef.current.length = 0;
-            } else {
-              setDetectedNode(prevNodeRef.current === -1 ? null : prevNodeRef.current);
-            }
-          }
-        }
-      }
-    },
-    [config]
-  );
+    }
+  }, []);
 
   const serial = useWebSerial({
     baudRate,
     onData: handleSerialData,
   });
 
-  // Process collected data into config
-  const processData = useCallback(
-    (data: { node: number; time: number; value: number }[]) => {
-      const cutThreshold = 1500; // ms
-      const byNode: Record<number, { times: number[]; values: number[] }> = {};
+  // Send ENTER to Arduino (for Phase 0 continue prompt)
+  // readSerialLine() requires a non-empty trimmed string before \n
+  const sendEnter = useCallback(async () => {
+    await serial.write("1\n");
+  }, [serial]);
 
-      for (const d of data) {
-        if (!byNode[d.node]) byNode[d.node] = { times: [], values: [] };
-        byNode[d.node].times.push(d.time);
-        byNode[d.node].values.push(d.value);
-      }
-
-      const cfg: CalibrationConfig = {};
-      for (const nodeStr in byNode) {
-        const node = parseInt(nodeStr);
-        const { times, values } = byNode[node];
-        const lastPrevTime =
-          node > 0 && byNode[node - 1]
-            ? byNode[node - 1].times[byNode[node - 1].times.length - 1]
-            : 0;
-
-        let sum = 0;
-        let count = 0;
-        for (let i = 0; i < times.length; i++) {
-          if (times[i] >= lastPrevTime + cutThreshold) {
-            sum += values[i];
-            count++;
-          }
-        }
-        cfg[nodeStr] = count > 0 ? sum / count : 0;
-      }
-
-      setConfig(cfg);
-      return cfg;
-    },
-    []
-  );
-
-  // Start data collection
-  const startCollection = useCallback(async () => {
-    if (serial.status !== "connected") return;
-
-    setIsCollecting(true);
-    setCollectionComplete(false);
-    setConfig(null);
-    setLiveValues([]);
-    collectingDataRef.current = [];
-    currentNodeRef.current = -1;
-    setCurrentNode(-1);
-    startTimeRef.current = performance.now();
-    modeRef.current = "collection";
-
-    // Send start signal to Arduino
-    await serial.write("1");
-
-    let nodeCounter = -1;
-    intervalRef.current = setInterval(() => {
-      nodeCounter++;
-      currentNodeRef.current = nodeCounter;
-      setCurrentNode(nodeCounter);
-
-      if (nodeCounter >= numNodes) {
-        // Collection done
-        clearInterval(intervalRef.current!);
-        intervalRef.current = null;
-        modeRef.current = "idle";
-        setIsCollecting(false);
-        setCollectionComplete(true);
-        setCollectingData([...collectingDataRef.current]);
-
-        const cfg = processData(collectingDataRef.current);
-        // Download config as JSON
-        const blob = new Blob([JSON.stringify(cfg, null, 2)], {
-          type: "application/json",
-        });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "calibration-config.json";
-        a.click();
-        URL.revokeObjectURL(url);
-      }
-    }, 5000);
-  }, [serial, numNodes, processData]);
-
-  // Start detection
-  const startDetection = useCallback(async () => {
-    if (serial.status !== "connected" || !config) return;
-
-    capBufferRef.current = [];
-    nodeBufferRef.current = [];
-    prevNodeRef.current = -1;
-    setDetectedNode(null);
-    setIsDetecting(true);
-    modeRef.current = "detection";
-
-    await serial.write("1");
-  }, [serial, config]);
-
-  const stopDetection = useCallback(() => {
-    setIsDetecting(false);
-    modeRef.current = "idle";
-  }, []);
-
-  // Cleanup interval on unmount
-  useEffect(() => {
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, []);
-
-  const statusInfo = STATUS_CONFIG[serial.status];
-  const step2Active = collectionComplete && config !== null;
-
-  // Sparkline for live values
+  // ── Chart rendering ──────────────────────────────────────────────
   const sparklinePath = (() => {
     if (liveValues.length < 2) return "";
-    const min = Math.min(...liveValues);
-    const max = Math.max(...liveValues);
+    const vals = liveValues.map((v) => v.value);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
     const range = max - min || 1;
     const w = 100;
     const h = 100;
     return liveValues
       .map((v, i) => {
         const x = (i / (liveValues.length - 1)) * w;
-        const y = h - ((v - min) / range) * h;
+        const y = h - ((v.value - min) / range) * h;
         return `${i === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
       })
       .join(" ");
   })();
 
-  // Node colors for the collected data chart
-  const NODE_COLORS = [
-    "#1245A8", "#2563eb", "#16a34a", "#d97706",
-    "#dc2626", "#7c3aed", "#0891b2", "#db2777",
-    "#65a30d", "#ea580c", "#4f46e5", "#0d9488",
-  ];
+  // Build per-node colored chart paths (for live detection mode)
+  const nodeChartPaths = (() => {
+    if (phaseRef.current !== "live" || liveValues.length < 2) return null;
 
-  // Build per-node SVG paths from collected data
-  const collectedChartData = (() => {
-    if (collectingData.length < 2) return null;
+    const vals = liveValues.map((v) => v.value);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const range = max - min || 1;
 
-    const allValues = collectingData.map((d) => d.value);
-    const minVal = Math.min(...allValues);
-    const maxVal = Math.max(...allValues);
-    const rangeVal = maxVal - minVal || 1;
-    const maxTime = Math.max(...collectingData.map((d) => d.time));
-    const minTime = Math.min(...collectingData.map((d) => d.time));
-    const rangeTime = maxTime - minTime || 1;
+    // Group consecutive points by node
+    const segments: { node: number | undefined; points: { x: number; y: number }[] }[] = [];
+    let currentSeg: typeof segments[0] | null = null;
 
-    // Group by node
-    const byNode: Record<number, { time: number; value: number }[]> = {};
-    for (const d of collectingData) {
-      if (!byNode[d.node]) byNode[d.node] = [];
-      byNode[d.node].push(d);
+    liveValues.forEach((v, i) => {
+      const x = (i / (liveValues.length - 1)) * 100;
+      const y = 100 - ((v.value - min) / range) * 100;
+      const pt = { x, y };
+
+      if (!currentSeg || currentSeg.node !== v.node) {
+        // Carry over last point for continuity
+        if (currentSeg && currentSeg.points.length > 0) {
+          currentSeg = { node: v.node, points: [currentSeg.points[currentSeg.points.length - 1], pt] };
+        } else {
+          currentSeg = { node: v.node, points: [pt] };
+        }
+        segments.push(currentSeg);
+      } else {
+        currentSeg.points.push(pt);
+      }
+    });
+
+    return segments
+      .filter((s) => s.points.length >= 2)
+      .map((s, i) => ({
+        key: i,
+        color: s.node ? NODE_COLORS[((s.node - 1) % NODE_COLORS.length + NODE_COLORS.length) % NODE_COLORS.length] : "var(--color-text-tertiary)",
+        d: s.points
+          .map((p, j) => `${j === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`)
+          .join(" "),
+      }));
+  })();
+
+  const latestSum = liveValues.length > 0 ? liveValues[liveValues.length - 1].value : null;
+  const numNodes = numNodesRef.current;
+
+  // Phase-specific status message
+  const phaseMessage = (() => {
+    switch (phase) {
+      case "idle":
+        return serial.status === "connected"
+          ? "Arduino is starting up... waiting for calibration to begin"
+          : null;
+      case "phase0-notouch":
+        return "Phase 0: DON'T TOUCH the sensor — measuring baseline signal";
+      case "phase0-touch":
+        return "Phase 0: TOUCH ANY NODE firmly and hold for 4 seconds";
+      case "phase0-enter":
+        return "Phase 0 complete — press Continue to proceed";
+      case "phase1":
+        return "Phase 1: Measuring baseline — HANDS OFF completely";
+      case "phase2":
+        if (calNodeStatus === "waiting")
+          return `Phase 2: TOUCH AND HOLD Node ${calNode}`;
+        if (calNodeStatus === "collecting")
+          return `Phase 2: Keep touching Node ${calNode} — collecting data (7s)`;
+        if (calNodeStatus === "releasing")
+          return `Phase 2: RELEASE Node ${calNode} now`;
+        if (calNodeStatus === "done")
+          return `Phase 2: Node ${calNode} complete`;
+        return "Phase 2: Per-node calibration";
+      case "phase3":
+        return "Phase 3: Calibration results — review quality below";
+      case "live":
+        return "Live detection active — touch nodes to test";
+      default:
+        return null;
+    }
+  })();
+
+  const isCalibrating = ["phase0-notouch", "phase0-touch", "phase0-enter", "phase1", "phase2", "phase3"].includes(phase);
+
+  // ── Full progress steps ────────────────────────────────────────────
+  // Each step: { label, status: "done" | "active" | "pending" }
+  const progressSteps = (() => {
+    const steps: { label: string; status: "done" | "active" | "pending" }[] = [];
+
+    // Phase 0: Signal Test
+    const p0Done = ["phase1", "phase2", "phase3", "live"].includes(phase);
+    const p0Active = ["phase0-notouch", "phase0-touch", "phase0-enter"].includes(phase);
+    steps.push({ label: "Signal Test", status: p0Done ? "done" : p0Active ? "active" : "pending" });
+
+    // Phase 1: Baseline
+    const p1Done = ["phase2", "phase3", "live"].includes(phase);
+    const p1Active = phase === "phase1";
+    steps.push({ label: "Baseline", status: p1Done ? "done" : p1Active ? "active" : "pending" });
+
+    // Phase 2: one step per node
+    for (let i = 1; i <= numNodes; i++) {
+      let status: "done" | "active" | "pending" = "pending";
+      if (phase === "phase2") {
+        if (i < calNode || (i === calNode && calNodeStatus === "done")) {
+          status = "done";
+        } else if (i === calNode && calNodeStatus !== "done") {
+          status = "active";
+        }
+      } else if (["phase3", "live"].includes(phase)) {
+        status = "done";
+      }
+      steps.push({ label: `N${i}`, status });
     }
 
-    const paths: { node: number; color: string; d: string }[] = [];
-    for (const nodeStr in byNode) {
-      const node = parseInt(nodeStr);
-      const points = byNode[node];
-      if (points.length < 2) continue;
+    // Phase 3 / Live
+    const resultsDone = phase === "live";
+    const resultsActive = phase === "phase3";
+    steps.push({ label: "Live", status: resultsDone ? "done" : resultsActive ? "active" : "pending" });
 
-      const pathD = points
-        .map((p, i) => {
-          const x = ((p.time - minTime) / rangeTime) * 100;
-          const y = 100 - ((p.value - minVal) / rangeVal) * 100;
-          return `${i === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
-        })
-        .join(" ");
-
-      paths.push({
-        node,
-        color: NODE_COLORS[((node % NODE_COLORS.length) + NODE_COLORS.length) % NODE_COLORS.length],
-        d: pathD,
-      });
-    }
-
-    return paths;
+    return steps;
   })();
 
   return (
@@ -350,7 +356,6 @@ export default function CalibratePage() {
       <section className="border-b-2 border-border">
         <div className="mx-auto max-w-6xl px-6 py-12">
           <motion.div initial="hidden" animate="visible" className="flex items-start justify-between gap-6">
-            {/* Left: title & description */}
             <div>
               <motion.h1
                 variants={fadeUp}
@@ -364,13 +369,13 @@ export default function CalibratePage() {
                 custom={2}
                 className="max-w-2xl text-sm text-text-secondary"
               >
-                Connect your SenseBoard via USB to get started. The tool will
-                collect capacitive data from each node and generate a calibration
-                profile.
+                Connect your SenseBoard via USB. The Arduino runs the full
+                calibration sequence — this page guides you through each step
+                and visualizes the results.
               </motion.p>
             </div>
 
-            {/* Right: connect / disconnect button */}
+            {/* Connect / disconnect */}
             <motion.div variants={fadeUp} custom={1} className="flex shrink-0 flex-col items-end gap-2 pt-6">
               <div className="flex items-center gap-2">
                 {serial.status !== "connected" && !isFlashing && (
@@ -393,6 +398,10 @@ export default function CalibratePage() {
                 ) : (
                   <button
                     onClick={async () => {
+                      // 1. Request port NOW (in user gesture context)
+                      const port = await serial.requestPort();
+                      if (!port) return; // user cancelled picker
+
                       setIsFlashing(true);
                       setFlashStatus("Compiling & uploading sketch...");
                       try {
@@ -404,10 +413,15 @@ export default function CalibratePage() {
                           return;
                         }
                         setFlashStatus("Flashed! Waiting for board to restart...");
-                        // Arduino resets after flash — give it time to boot
                         await new Promise((r) => setTimeout(r, 2500));
                         setFlashStatus("Connecting to serial...");
-                        await serial.connect();
+                        setPhase("idle");
+                        phaseRef.current = "idle";
+                        setSerialLog([]);
+                        setLiveValues([]);
+                        setDetectedNode(null);
+                        // 2. Open the already-selected port (no gesture needed)
+                        await serial.openPort();
                         setFlashStatus(null);
                       } catch (err) {
                         setFlashStatus(
@@ -457,7 +471,7 @@ export default function CalibratePage() {
       <section className="bg-surface-raised">
         <div className="mx-auto max-w-6xl px-6 py-8">
           <div className="grid gap-6 lg:grid-cols-[1.4fr_0.6fr]">
-            {/* Step 1: Data Collection */}
+            {/* Left: Calibration Progress & Chart */}
             <motion.div
               initial="hidden"
               animate="visible"
@@ -466,141 +480,111 @@ export default function CalibratePage() {
               className="rounded-2xl border-2 border-border border-t-[3px] border-t-primary bg-surface p-6"
             >
               <div className="mb-3 flex items-center gap-3">
-                <span className="rounded-full bg-primary px-3 py-0.5 text-[11px] font-semibold uppercase tracking-widest text-white">
-                  Step 01
+                <span className={`rounded-full px-3 py-0.5 text-[11px] font-semibold uppercase tracking-widest text-white ${
+                  phase === "live" ? "bg-success" : isCalibrating ? "bg-primary animate-pulse" : "bg-text-tertiary"
+                }`}>
+                  {phase === "live" ? "Live" : isCalibrating ? "Calibrating" : "Waiting"}
                 </span>
-                <span className="text-lg font-semibold">Data Collection</span>
+                <span className="text-lg font-semibold">
+                  {phase === "live" ? "Live Detection" : "Calibration"}
+                </span>
               </div>
 
               <div className="mb-4 h-px bg-border" />
 
-              <div className="mb-4 flex flex-wrap items-center gap-3">
-                <label className="text-xs font-medium uppercase tracking-wider text-text-secondary">
-                  Nodes
-                </label>
-                <input
-                  type="number"
-                  value={numNodes}
-                  onChange={(e) =>
-                    setNumNodes(
-                      Math.max(1, Math.min(1000, parseInt(e.target.value) || 1))
-                    )
-                  }
-                  min={1}
-                  max={1000}
-                  disabled={isCollecting}
-                  className="w-20 rounded-lg border-2 border-border bg-surface-inset px-3 py-2 text-sm font-semibold focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-50"
-                />
-                <button
-                  onClick={startCollection}
-                  disabled={serial.status !== "connected" || isCollecting}
-                  className="rounded-lg border-2 border-primary bg-primary px-4 py-2 text-xs font-semibold uppercase tracking-widest text-white transition-all hover:-translate-y-0.5 hover:bg-primary-dark hover:shadow-lg hover:shadow-primary/20 disabled:opacity-50 disabled:hover:translate-y-0"
-                >
-                  {isCollecting ? "Capturing..." : "Start Capture"}
-                </button>
-              </div>
-
-              {/* Status message */}
+              {/* Phase status message */}
               <AnimatePresence mode="wait">
-                {isCollecting && currentNode >= 0 && (
-                  <motion.p
-                    key={`collecting-${currentNode}`}
+                {phaseMessage && (
+                  <motion.div
+                    key={phase + calNode + calNodeStatus}
                     initial={{ opacity: 0, y: -8 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 8 }}
-                    className="mb-3 text-sm font-semibold text-primary"
+                    className="mb-4"
                   >
-                    Touch Node {currentNode} now ({currentNode + 1} of{" "}
-                    {numNodes})
-                  </motion.p>
-                )}
-                {isCollecting && currentNode === -1 && (
-                  <motion.p
-                    key="initializing"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="mb-3 text-sm text-text-secondary"
-                  >
-                    Initializing... release all nodes
-                  </motion.p>
-                )}
-                {!isCollecting && collectionComplete && (
-                  <motion.p
-                    key="complete"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="mb-3 text-sm font-semibold text-success"
-                  >
-                    Collection complete — config downloaded
-                  </motion.p>
-                )}
-                {!isCollecting && !collectionComplete && serial.status === "connected" && (
-                  <motion.p
-                    key="waiting"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="mb-3 text-sm text-text-secondary"
-                  >
-                    Ready — click Start Capture to begin
-                  </motion.p>
+                    <p className={`text-sm font-semibold ${
+                      phase === "phase0-touch" || (phase === "phase2" && calNodeStatus === "waiting")
+                        ? "text-warning"
+                        : phase === "phase0-notouch" || phase === "phase1" || (phase === "phase2" && calNodeStatus === "releasing")
+                          ? "text-danger"
+                          : phase === "live" || phase === "phase3"
+                            ? "text-success"
+                            : "text-primary"
+                    }`}>
+                      {phaseMessage}
+                    </p>
+
+                    {/* Continue button for Phase 0 */}
+                    {phase === "phase0-enter" && (
+                      <button
+                        onClick={sendEnter}
+                        className="mt-2 rounded-lg border-2 border-primary bg-primary px-4 py-2 text-xs font-semibold uppercase tracking-widest text-white transition-all hover:-translate-y-0.5 hover:bg-primary-dark hover:shadow-lg hover:shadow-primary/20"
+                      >
+                        Continue
+                      </button>
+                    )}
+                  </motion.div>
                 )}
               </AnimatePresence>
 
-              {/* Progress bar */}
-              <div className="mb-4 flex items-center gap-3">
-                <span className="text-[11px] font-medium uppercase tracking-wider text-text-tertiary">
-                  Progress
-                </span>
-                <div className="flex flex-1 gap-1">
-                  {Array.from({ length: numNodes }).map((_, i) => (
-                    <div
-                      key={i}
-                      className={`h-1.5 flex-1 rounded-full border transition-colors duration-300 ${
-                        isCollecting && i < currentNode
-                          ? "border-primary bg-primary"
-                          : isCollecting && i === currentNode
-                            ? "border-primary bg-primary/40 animate-pulse"
-                            : collectionComplete
-                              ? "border-success bg-success"
-                              : "border-border bg-surface-inset"
-                      }`}
-                    />
-                  ))}
+              {/* Progress bar — full calibration pipeline */}
+              {serial.status === "connected" && phase !== "idle" && (
+                <div className="mb-4">
+                  <div className="mb-1.5 flex gap-0.5">
+                    {progressSteps.map((step, i) => (
+                      <div
+                        key={i}
+                        className={`h-1.5 flex-1 rounded-full transition-colors duration-300 ${
+                          step.status === "done"
+                            ? "bg-primary"
+                            : step.status === "active"
+                              ? "bg-primary animate-pulse"
+                              : "bg-border"
+                        }`}
+                      />
+                    ))}
+                  </div>
+                  <div className="flex gap-0.5">
+                    {progressSteps.map((step, i) => (
+                      <span
+                        key={i}
+                        className={`flex-1 text-center text-[9px] font-medium uppercase tracking-wider ${
+                          step.status === "done"
+                            ? "text-primary"
+                            : step.status === "active"
+                              ? "text-primary"
+                              : "text-text-tertiary"
+                        }`}
+                      >
+                        {step.label}
+                      </span>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
 
               {/* Sensor chart */}
               <div className="flex min-h-[300px] items-center justify-center rounded-xl border border-border bg-surface-inset p-4">
-                {collectionComplete && collectedChartData && collectedChartData.length > 0 ? (
-                  /* Collected data chart — shown after collection completes */
+                {phase === "live" && nodeChartPaths && nodeChartPaths.length > 0 ? (
                   <div className="h-full w-full">
                     <div className="mb-2 flex items-center justify-between">
                       <span className="text-[10px] font-medium uppercase tracking-widest text-text-tertiary">
-                        Calibration Data
+                        Live Sensor Data (sum)
                       </span>
-                      <div className="flex flex-wrap gap-3">
-                        {collectedChartData.map(({ node, color }) => (
-                          <span
-                            key={node}
-                            className="flex items-center gap-1 text-[10px] font-medium"
-                          >
-                            <span
-                              className="inline-block h-2 w-2 rounded-full"
-                              style={{ backgroundColor: color }}
-                            />
-                            {node === -1 ? "Baseline" : `Node ${node}`}
-                          </span>
-                        ))}
-                      </div>
+                      {latestSum !== null && (
+                        <span className="font-mono text-sm font-bold text-primary">
+                          {latestSum}
+                        </span>
+                      )}
                     </div>
                     <svg
                       viewBox="0 0 100 100"
                       preserveAspectRatio="none"
                       className="h-[260px] w-full"
                     >
-                      {collectedChartData.map(({ node, color, d }) => (
+                      {nodeChartPaths.map(({ key, color, d }) => (
                         <path
-                          key={node}
+                          key={key}
                           d={d}
                           fill="none"
                           stroke={color}
@@ -611,15 +595,16 @@ export default function CalibratePage() {
                     </svg>
                   </div>
                 ) : liveValues.length > 1 ? (
-                  /* Live sparkline — shown during collection */
                   <div className="h-full w-full">
                     <div className="mb-2 flex items-center justify-between">
                       <span className="text-[10px] font-medium uppercase tracking-widest text-text-tertiary">
-                        Live Sensor Data
+                        Live Sensor Data (sum)
                       </span>
-                      <span className="font-mono text-sm font-bold text-primary">
-                        {liveValues[liveValues.length - 1]?.toFixed(0)}
-                      </span>
+                      {latestSum !== null && (
+                        <span className="font-mono text-sm font-bold text-primary">
+                          {latestSum}
+                        </span>
+                      )}
                     </div>
                     <svg
                       viewBox="0 0 100 100"
@@ -636,7 +621,6 @@ export default function CalibratePage() {
                     </svg>
                   </div>
                 ) : (
-                  /* Empty state */
                   <div className="text-center">
                     <div className="mb-3 text-4xl text-text-tertiary">
                       {serial.status === "connected" ? "~" : "\u25CE"}
@@ -644,47 +628,38 @@ export default function CalibratePage() {
                     <p className="text-sm text-text-tertiary">
                       {serial.status === "connected"
                         ? "Waiting for sensor data..."
-                        : "Sensor data will appear here during capture"}
+                        : "Sensor data will appear here after connecting"}
                     </p>
                   </div>
                 )}
               </div>
             </motion.div>
 
-            {/* Step 2: Node Detection */}
+            {/* Right: Node Detection */}
             <motion.div
               initial="hidden"
               animate="visible"
               variants={fadeUp}
               custom={1}
               className={`rounded-2xl border-2 border-border border-t-[3px] border-t-secondary bg-surface p-6 transition-opacity duration-500 ${
-                step2Active ? "opacity-100" : "opacity-40"
+                phase === "live" ? "opacity-100" : "opacity-40"
               }`}
             >
               <div className="mb-3 flex items-center gap-3">
-                <span className="rounded-full bg-secondary px-3 py-0.5 text-[11px] font-semibold uppercase tracking-widest text-white">
-                  Step 02
+                <span className={`rounded-full px-3 py-0.5 text-[11px] font-semibold uppercase tracking-widest text-white ${
+                  phase === "live" ? "bg-secondary" : "bg-text-tertiary"
+                }`}>
+                  {phase === "live" ? "Active" : "Waiting"}
                 </span>
                 <span className="text-lg font-semibold">Node Detection</span>
               </div>
 
               <div className="mb-4 h-px bg-border" />
 
-              {isDetecting ? (
-                <button
-                  onClick={stopDetection}
-                  className="mb-4 rounded-lg border-2 border-danger bg-danger/10 px-4 py-2 text-xs font-semibold uppercase tracking-widest text-danger transition-all hover:-translate-y-0.5 hover:bg-danger/20"
-                >
-                  Stop Detection
-                </button>
-              ) : (
-                <button
-                  onClick={startDetection}
-                  disabled={!step2Active || serial.status !== "connected"}
-                  className="mb-4 rounded-lg border-2 border-secondary bg-secondary px-4 py-2 text-xs font-semibold uppercase tracking-widest text-white transition-all hover:-translate-y-0.5 hover:bg-secondary-dark hover:shadow-lg hover:shadow-secondary/20 disabled:opacity-50 disabled:hover:translate-y-0"
-                >
-                  Start Detection
-                </button>
+              {phase !== "live" && (
+                <p className="mb-4 text-xs text-text-tertiary">
+                  Detection activates automatically after calibration completes.
+                </p>
               )}
 
               <div className="flex flex-1 flex-col gap-3">
@@ -733,7 +708,10 @@ export default function CalibratePage() {
                   Clear
                 </button>
               </div>
-              <div className="max-h-[200px] overflow-y-auto rounded-lg bg-[#1a1a2e] p-3 font-mono text-xs leading-relaxed text-green-400">
+              <div
+                ref={serialLogRef}
+                className="max-h-[200px] overflow-y-auto rounded-lg bg-[#1a1a2e] p-3 font-mono text-xs leading-relaxed text-green-400"
+              >
                 {serialLog.length === 0 ? (
                   <span className="text-text-tertiary">
                     Waiting for data from Arduino...
@@ -761,12 +739,14 @@ export default function CalibratePage() {
               How does calibration work?
             </p>
             <p className="text-sm leading-relaxed text-text-secondary">
-              During data collection, touch each node in sequence for 5 seconds.
-              The tool records capacitive sensor values and calculates average
-              readings per node. These averages become reference values for
-              real-time detection. During detection, incoming sensor values are
-              compared against references using a buffered consensus algorithm
-              that requires 80% agreement over the last 10 readings.
+              The Arduino runs a 3-phase calibration sequence automatically.
+              Phase 0 tests signal strength (don&apos;t touch, then touch any node).
+              Phase 1 measures the untouched baseline.
+              Phase 2 calibrates each node individually — touch and hold when
+              prompted, then release. The Arduino collects bidirectional (fwd/rev)
+              data for 7 seconds per node to build a 2D signature. After
+              calibration, live detection uses nearest-centroid scoring with
+              debouncing for reliable node identification.
             </p>
             <div className="mt-4 h-px bg-secondary/20" />
             <p className="mt-3 text-xs leading-relaxed text-text-tertiary">
