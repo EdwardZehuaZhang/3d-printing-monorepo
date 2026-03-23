@@ -2678,14 +2678,16 @@ def route_node_sequence(
             if blocked_radius > 0 and current_segments:
                 prev_seg = current_segments[-1]
                 shared = start
+                cross_segment_radius = blocked_radius
                 cross_segment_node_adjacency = max(2, blocked_radius + 1)
-                if strict_internal_target:
+                if strict_internal_target and routed_length + 1e-9 >= strict_target_threshold:
+                    cross_segment_radius = max(1, blocked_radius - 1)
                     cross_segment_node_adjacency = max(
                         cross_segment_node_adjacency,
-                        blocked_exemption_radius + 3,
+                        blocked_exemption_radius + 4,
                     )
                 if _cross_segment_near_approach(
-                    prev_seg, routed_segment, blocked_radius, shared,
+                    prev_seg, routed_segment, cross_segment_radius, shared,
                     node_adjacency=cross_segment_node_adjacency,
                 ):
                     rejection_counts["cross_segment_overlap"] += 1
