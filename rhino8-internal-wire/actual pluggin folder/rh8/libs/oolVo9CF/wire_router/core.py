@@ -191,27 +191,6 @@ def _axis_walk(
     return result
 
 
-def _connected_component(cells: Set[GridIndex], seed: GridIndex) -> Set[GridIndex]:
-    if seed not in cells:
-        return set()
-    component: Set[GridIndex] = set()
-    queue: List[GridIndex] = [seed]
-    seen: Set[GridIndex] = {seed}
-    while queue:
-        current = queue.pop()
-        component.add(current)
-        for offset, _ in _AXIAL_NEIGHBOR_OFFSETS:
-            neighbor = (
-                current[0] + offset[0],
-                current[1] + offset[1],
-                current[2] + offset[2],
-            )
-            if neighbor in cells and neighbor not in seen:
-                seen.add(neighbor)
-                queue.append(neighbor)
-    return component
-
-
 def _build_fill_corridor(
     pipe_path: Sequence[GridIndex],
     valid_cells: Set[GridIndex],
@@ -221,19 +200,8 @@ def _build_fill_corridor(
     fill_hard_excluded_cells: Optional[Set[GridIndex]] = None,
     fill_soft_excluded_cells: Optional[Set[GridIndex]] = None,
     relax_soft_exclusions_on_fallback: bool = False,
-    use_full_domain: bool = False,
 ) -> Set[GridIndex]:
     """Build a corridor around the pipe wide enough for a serpentine fill."""
-    hard_excluded = set(fill_hard_excluded_cells or set())
-    soft_excluded = set(fill_soft_excluded_cells or set())
-    excluded = hard_excluded | soft_excluded
-
-    if use_full_domain:
-        corridor = {cell for cell in valid_cells if cell not in excluded}
-        if relax_soft_exclusions_on_fallback and soft_excluded and not corridor:
-            corridor = {cell for cell in valid_cells if cell not in hard_excluded}
-        return corridor
-
     # Use the same spacing as _generate_serpentine_fill so the radius
     # estimate is consistent with the actual row/layer layout.
     row_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
@@ -252,6 +220,9 @@ def _build_fill_corridor(
     max_y = max(pipe_ys) + radius
     min_z = min(pipe_zs) - radius
     max_z = max(pipe_zs) + radius
+    hard_excluded = set(fill_hard_excluded_cells or set())
+    soft_excluded = set(fill_soft_excluded_cells or set())
+    excluded = hard_excluded | soft_excluded
     corridor = {
         cell for cell in valid_cells
         if min_x <= cell[0] <= max_x
@@ -408,16 +379,6 @@ def _generate_serpentine_fill(
                     best_ordered = trial
     ordered = best_ordered
 
-    if not ordered:
-        return None
-
-    # Reachable-region-only mode: keep only the connected component that
-    # contains the selected entry cell. This enforces deterministic
-    # layer-by-layer filling within the currently reachable fill front.
-    entry_cell = ordered[0]
-    reachable_component = _connected_component(corridor, entry_cell)
-    if reachable_component:
-        ordered = [cell for cell in ordered if cell in reachable_component]
     if not ordered:
         return None
 
@@ -1334,7 +1295,6 @@ def _segment_candidate_paths(
     fill_hard_excluded_cells: Optional[Set[GridIndex]] = None,
     fill_soft_excluded_cells: Optional[Set[GridIndex]] = None,
     serpentine_early_exit_ratio: float = AGGRESSIVE_SERPENTINE_EARLY_EXIT_RATIO,
-    strict_layercake_mode: bool = False,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1354,7 +1314,7 @@ def _segment_candidate_paths(
         boundary_penalty_weight=boundary_penalty_weight,
     )
     candidate_valid_cells = valid_cells
-    if target_length is not None and not allow_diagonals and not strict_layercake_mode:
+    if target_length is not None and not allow_diagonals:
         candidate_valid_cells = _build_pipe_corridor(
             pipe_path,
             valid_cells,
@@ -1382,7 +1342,6 @@ def _segment_candidate_paths(
             fill_hard_excluded_cells=hard_excluded,
             fill_soft_excluded_cells=soft_excluded,
             relax_soft_exclusions_on_fallback=False,
-            use_full_domain=strict_layercake_mode,
         )
         serpentine = _generate_serpentine_fill(
             fill_corridor, valid_cells, start, goal, target_length, self_avoid_radius,
@@ -1391,28 +1350,6 @@ def _segment_candidate_paths(
         if serpentine is not None:
             candidates.append(serpentine)
             serpentine_length = _path_length(serpentine)
-            if strict_layercake_mode and serpentine_length < target_length * serpentine_early_exit_ratio:
-                grown = _grow_path_toward_target(
-                    serpentine,
-                    valid_cells,
-                    target_length,
-                    max(0, self_avoid_radius),
-                    roominess_map,
-                    bottleneck_threshold,
-                    growth_valid_cells=valid_cells,
-                    min_self_spacing=min_self_spacing,
-                )
-                candidates.append(grown)
-            if strict_layercake_mode:
-                cleaned_candidates = [_remove_path_reversals(path) for path in candidates]
-                unique_candidates = _dedupe_paths(cleaned_candidates)
-                return _sort_candidate_paths(
-                    unique_candidates,
-                    target_length,
-                    roominess_map=roominess_map,
-                    valid_cells=valid_cells,
-                    bottleneck_threshold=bottleneck_threshold,
-                )[:max_candidates]
             fill_headroom = 0
             headroom_threshold = max(
                 AGGRESSIVE_HEADROOM_MIN_CELLS,
@@ -2500,7 +2437,6 @@ def route_node_sequence(
                     min_self_spacing=min_self_spacing,
                     fill_hard_excluded_cells=fill_hard_excluded,
                     fill_soft_excluded_cells=fill_soft_excluded,
-                    strict_layercake_mode=strict_internal_target,
                 )
             except RoutingError:
                 candidate_paths = []
