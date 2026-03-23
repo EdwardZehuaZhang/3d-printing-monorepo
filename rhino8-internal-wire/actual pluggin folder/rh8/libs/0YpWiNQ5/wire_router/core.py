@@ -2563,13 +2563,6 @@ def route_node_sequence(
                     segment_fill_zones, segment_index, valid_cells, highway_cells,
                     strict_layercake_mode=strict_internal_target,
                 )
-                if bridge_conduit_cells:
-                    endpoint_bridge_safe = dilate_cells(
-                        {start, goal}, bridge_endpoint_exemption_radius
-                    )
-                    fill_hard_excluded.update(
-                        bridge_conduit_cells - endpoint_bridge_safe
-                    )
                 candidate_paths = _segment_candidate_paths(
                     valid_cells=segment_valid_cells,
                     start=start,
