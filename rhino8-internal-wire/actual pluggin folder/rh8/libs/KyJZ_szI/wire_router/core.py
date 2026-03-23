@@ -168,9 +168,7 @@ def _build_fill_corridor(
     target_length: float,
     self_avoid_radius: int,
     min_self_spacing: int = 0,
-    fill_hard_excluded_cells: Optional[Set[GridIndex]] = None,
-    fill_soft_excluded_cells: Optional[Set[GridIndex]] = None,
-    relax_soft_exclusions_on_fallback: bool = False,
+    fill_excluded_cells: Optional[Set[GridIndex]] = None,
 ) -> Set[GridIndex]:
     """Build a corridor around the pipe wide enough for a serpentine fill."""
     # Use the same spacing as _generate_serpentine_fill so the radius
@@ -191,9 +189,7 @@ def _build_fill_corridor(
     max_y = max(pipe_ys) + radius
     min_z = min(pipe_zs) - radius
     max_z = max(pipe_zs) + radius
-    hard_excluded = set(fill_hard_excluded_cells or set())
-    soft_excluded = set(fill_soft_excluded_cells or set())
-    excluded = hard_excluded | soft_excluded
+    excluded = fill_excluded_cells or set()
     corridor = {
         cell for cell in valid_cells
         if min_x <= cell[0] <= max_x
@@ -207,10 +203,7 @@ def _build_fill_corridor(
     # the serpentine can exploit all available fill space in the grid.
     min_cells_needed = int(target_length * 1.5)
     if len(corridor) < min_cells_needed:
-        fallback_excluded = set(hard_excluded)
-        if not relax_soft_exclusions_on_fallback:
-            fallback_excluded.update(soft_excluded)
-        corridor = set(valid_cells) - fallback_excluded
+        corridor = set(valid_cells) - excluded
 
     return corridor
 
@@ -1259,9 +1252,7 @@ def _segment_candidate_paths(
     beam_max_waypoints: int = 3,
     deadline: Optional[float] = None,
     min_self_spacing: int = 0,
-    fill_hard_excluded_cells: Optional[Set[GridIndex]] = None,
-    fill_soft_excluded_cells: Optional[Set[GridIndex]] = None,
-    serpentine_early_exit_ratio: float = 0.85,
+    fill_excluded_cells: Optional[Set[GridIndex]] = None,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1300,14 +1291,10 @@ def _segment_candidate_paths(
     # ---- Serpentine fill (primary strategy for large targets) ----
     # Inspired by trace_filling from 3dp-singlewire-sensing.
     if not allow_diagonals and target_length > direct_length * 1.2:
-        hard_excluded = set(fill_hard_excluded_cells or set())
-        soft_excluded = set(fill_soft_excluded_cells or set())
         fill_corridor = _build_fill_corridor(
             pipe_path, valid_cells, target_length, self_avoid_radius,
             min_self_spacing=min_self_spacing,
-            fill_hard_excluded_cells=hard_excluded,
-            fill_soft_excluded_cells=soft_excluded,
-            relax_soft_exclusions_on_fallback=True,
+            fill_excluded_cells=fill_excluded_cells,
         )
         serpentine = _generate_serpentine_fill(
             fill_corridor, valid_cells, start, goal, target_length, self_avoid_radius,
@@ -1319,7 +1306,7 @@ def _segment_candidate_paths(
             # If the corridor-based fill fell short, try again with
             # the full valid cell set (minus highway layers) so the
             # serpentine can exploit all available fill space.
-            fill_full = set(valid_cells) - hard_excluded
+            fill_full = set(valid_cells) - (fill_excluded_cells or set())
             if serpentine_length < target_length * 0.85 and len(fill_corridor) < len(fill_full):
                 full_serpentine = _generate_serpentine_fill(
                     fill_full, valid_cells, start, goal, target_length,
@@ -1328,9 +1315,7 @@ def _segment_candidate_paths(
                 if full_serpentine is not None:
                     candidates.append(full_serpentine)
                     serpentine_length = max(serpentine_length, _path_length(full_serpentine))
-            fill_headroom = max(0, len(fill_full) - len(fill_corridor))
-            has_meaningful_headroom = fill_headroom > max(50, int(len(fill_corridor) * 0.15))
-            if serpentine_length >= target_length * serpentine_early_exit_ratio and not has_meaningful_headroom:
+            if serpentine_length >= target_length * 0.85:
                 # Serpentine reached the target — skip the expensive beam search.
                 unique = _dedupe_paths(candidates)
                 return _sort_candidate_paths(
@@ -1895,18 +1880,19 @@ def _segment_excluded_fill(
     segment_index: int,
     valid_cells: Set[GridIndex],
     highway_cells: Set[GridIndex],
-) -> Tuple[Set[GridIndex], Set[GridIndex]]:
-    """Return hard/soft exclusions for this segment's serpentine fill.
+) -> Optional[Set[GridIndex]]:
+    """Return the set of cells this segment's serpentine fill must avoid.
 
-    Hard exclusions are always applied (highway transit cells).
-    Soft exclusions are relaxable during fallback (non-owned Voronoi cells).
+    When Voronoi fill zones are active, the segment may only fill its own
+    zone — everything else (other zones + highway cells) is excluded.
+    Falls back to highway-only exclusion when zones are not available.
     """
-    hard_excluded = set(highway_cells)
     if segment_fill_zones is not None:
         own_zone = segment_fill_zones[segment_index]
-        soft_excluded = (valid_cells - own_zone) - hard_excluded
-        return hard_excluded, soft_excluded
-    return hard_excluded, set()
+        return (valid_cells - own_zone) | highway_cells
+    if highway_cells:
+        return highway_cells
+    return None
 
 
 def route_node_sequence(
@@ -2112,9 +2098,6 @@ def route_node_sequence(
             segment_target_length = segment_target_lengths[segment_index]
 
         try:
-            fill_hard_excluded, fill_soft_excluded = _segment_excluded_fill(
-                segment_fill_zones, segment_index, valid_cells, highway_cells,
-            )
             candidate_paths = _segment_candidate_paths(
                 valid_cells=segment_valid_cells,
                 start=start,
@@ -2133,8 +2116,9 @@ def route_node_sequence(
                 beam_max_waypoints=seg_beam_max_waypoints,
                 deadline=deadline,
                 min_self_spacing=min_self_spacing,
-                fill_hard_excluded_cells=fill_hard_excluded,
-                fill_soft_excluded_cells=fill_soft_excluded,
+                fill_excluded_cells=_segment_excluded_fill(
+                    segment_fill_zones, segment_index, valid_cells, highway_cells,
+                ),
             )
         except RoutingError:
             candidate_paths = []
@@ -2188,7 +2172,7 @@ def route_node_sequence(
             # Reject segments that leave an endpoint keepout and then loop back
             # into that same endpoint zone. This avoids routing through the
             # same touch-node volume and creating accidental shorts.
-            if node_keepout_radius > 0 and len(node_sequence) > 2:
+            if node_keepout_radius > 0:
                 if _has_endpoint_keepout_reentry(
                     routed_segment,
                     start,
