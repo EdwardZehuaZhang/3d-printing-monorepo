@@ -1,7 +1,20 @@
 "use client";
 
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import { motion } from "framer-motion";
+
+const ModelViewer = dynamic(() => import("@/components/ModelViewer"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex h-full w-full items-center justify-center rounded-2xl border-2 border-dashed border-border bg-surface-inset">
+      <div className="text-center">
+        <div className="mb-2 text-4xl text-text-tertiary">◎</div>
+        <p className="text-xs text-text-tertiary">Loading 3D model...</p>
+      </div>
+    </div>
+  ),
+});
 
 const fadeUp = {
   hidden: { opacity: 0, y: 24 },
@@ -63,7 +76,7 @@ export default function HomePage() {
   return (
     <div>
       {/* Hero */}
-      <section className="relative overflow-hidden border-b-2 border-border">
+      <section className="relative border-b-2 border-border">
         {/* Background grid pattern */}
         <div
           className="absolute inset-0 opacity-[0.03]"
@@ -74,11 +87,11 @@ export default function HomePage() {
           }}
         />
 
-        <div className="relative mx-auto max-w-6xl px-6 py-24 md:py-32">
+        <div className="relative mx-auto grid max-w-6xl items-center gap-8 px-6 pt-10 pb-24 md:grid-cols-2 md:pt-16 md:pb-32">
+          {/* Left: Text content */}
           <motion.div
             initial="hidden"
             animate="visible"
-            className="max-w-3xl"
           >
             <motion.div
               variants={fadeUp}
@@ -127,17 +140,15 @@ export default function HomePage() {
             </motion.div>
           </motion.div>
 
-          {/* Abstract decorative element */}
-          <div className="absolute -right-20 top-1/2 hidden -translate-y-1/2 md:block">
-            <div className="relative h-80 w-80">
-              <div className="absolute inset-0 rounded-3xl border-2 border-dashed border-primary/20 rotate-12" />
-              <div className="absolute inset-8 rounded-3xl border-2 border-secondary/20 -rotate-6" />
-              <div className="absolute inset-16 rounded-3xl border-2 border-primary/30 rotate-3" />
-              <div className="absolute inset-24 flex items-center justify-center rounded-3xl bg-primary/5 text-6xl font-bold text-primary/20">
-                ◉
-              </div>
-            </div>
-          </div>
+          {/* Right: 3D Model Viewer */}
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ delay: 0.3, duration: 0.6, ease: "easeOut" as const }}
+            className="relative hidden h-[480px] overflow-visible md:block"
+          >
+            <ModelViewer />
+          </motion.div>
         </div>
       </section>
 
