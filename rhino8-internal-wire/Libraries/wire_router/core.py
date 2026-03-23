@@ -285,6 +285,8 @@ def _generate_serpentine_fill(
     target_length: float,
     self_avoid_radius: int,
     min_self_spacing: int = 0,
+    target_stop_ratio: float = 1.0,
+    limit_to_entry_component: bool = True,
 ) -> Optional[List[GridIndex]]:
     """Fill *corridor* with a dense serpentine path to reach *target_length*.
 
@@ -415,15 +417,16 @@ def _generate_serpentine_fill(
     if not ordered:
         return None
 
-    # Reachable-region-only mode: keep only the connected component that
-    # contains the selected entry cell. This enforces deterministic
-    # layer-by-layer filling within the currently reachable fill front.
-    entry_cell = ordered[0]
-    reachable_component = _connected_component(corridor, entry_cell)
-    if reachable_component:
-        ordered = [cell for cell in ordered if cell in reachable_component]
-    if not ordered:
-        return None
+    if limit_to_entry_component:
+        # Reachable-region-only mode: keep only the connected component that
+        # contains the selected entry cell. This enforces deterministic
+        # layer-by-layer filling within the currently reachable fill front.
+        entry_cell = ordered[0]
+        reachable_component = _connected_component(corridor, entry_cell)
+        if reachable_component:
+            ordered = [cell for cell in ordered if cell in reachable_component]
+        if not ordered:
+            return None
 
     # ---- Build a connected grid path ----
     path: List[GridIndex] = []
@@ -511,7 +514,8 @@ def _generate_serpentine_fill(
 
         # Early stop once the serpentine has generated enough length.
         est_remaining = _distance(path[-1], goal)
-        if running_length + est_remaining >= target_length:
+        target_stop = max(target_length, target_length * max(1.0, target_stop_ratio))
+        if running_length + est_remaining >= target_stop:
             break
 
     # 3) Route from the serpentine exit to *goal*.
@@ -1397,18 +1401,55 @@ def _segment_candidate_paths(
             candidates.append(serpentine)
             serpentine_length = _path_length(serpentine)
             if strict_layercake_mode:
+                strict_variants: List[List[GridIndex]] = [serpentine]
+
                 reverse_serpentine = _generate_serpentine_fill(
-                    fill_corridor, valid_cells, goal, start, target_length, self_avoid_radius,
+                    fill_corridor,
+                    valid_cells,
+                    goal,
+                    start,
+                    target_length,
+                    self_avoid_radius,
                     min_self_spacing=min_self_spacing,
+                    target_stop_ratio=1.25,
+                    limit_to_entry_component=True,
                 )
                 if reverse_serpentine is not None:
-                    reverse_candidate = list(reversed(reverse_serpentine))
-                    candidates.append(reverse_candidate)
-                    serpentine_length = max(serpentine_length, _path_length(reverse_candidate))
+                    strict_variants.append(list(reversed(reverse_serpentine)))
 
-                best_strict = serpentine
-                best_strict_length = serpentine_length
-                growth_attempt = serpentine
+                expanded_serpentine = _generate_serpentine_fill(
+                    fill_corridor,
+                    valid_cells,
+                    start,
+                    goal,
+                    target_length,
+                    self_avoid_radius,
+                    min_self_spacing=min_self_spacing,
+                    target_stop_ratio=1.25,
+                    limit_to_entry_component=False,
+                )
+                if expanded_serpentine is not None:
+                    strict_variants.append(expanded_serpentine)
+
+                reverse_expanded = _generate_serpentine_fill(
+                    fill_corridor,
+                    valid_cells,
+                    goal,
+                    start,
+                    target_length,
+                    self_avoid_radius,
+                    min_self_spacing=min_self_spacing,
+                    target_stop_ratio=1.25,
+                    limit_to_entry_component=False,
+                )
+                if reverse_expanded is not None:
+                    strict_variants.append(list(reversed(reverse_expanded)))
+
+                candidates.extend(strict_variants[1:])
+                best_strict = max(strict_variants, key=_path_length)
+                best_strict_length = _path_length(best_strict)
+                serpentine_length = max(serpentine_length, best_strict_length)
+                growth_attempt = best_strict
                 max_growth_passes = max(4, AGGRESSIVE_EXTRA_GROWTH_PASSES + 4)
                 for _ in range(max_growth_passes):
                     if best_strict_length + 1e-9 >= target_length * strict_completion_ratio:
