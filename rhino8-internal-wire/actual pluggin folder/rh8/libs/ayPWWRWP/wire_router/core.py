@@ -24,8 +24,6 @@ AGGRESSIVE_WAYPOINT_LIMIT = 20
 AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_MAX_SEGMENTS = 5
 AGGRESSIVE_SHORT_CHAIN_DISABLE_HIGHWAYS_TARGET_PRESSURE = 8.0
 AGGRESSIVE_TOUCH_SEGMENT_PRIORITY_BONUS = 1.5
-STRICT_INTERNAL_TARGET_RATIO = 0.98
-BRIDGE_CONDUIT_RADIUS_MULTIPLIER = 4
 
 
 class RoutingError(RuntimeError):
@@ -2183,33 +2181,20 @@ def route_node_sequence(
     fixed_initial_blocked_cells: Set[GridIndex] = set()
     fixed_initial_approach: Dict[GridIndex, GridIndex] = {}
 
-    internal_segment_indices: Set[int] = set(range(1, max(1, num_segments - 1)))
-    has_internal_segments = len(internal_segment_indices) > 0
-    terminal_segment_indices: Set[int] = set()
-    if has_internal_segments and num_segments >= 1:
-        terminal_segment_indices.add(0)
-    if has_internal_segments and num_segments >= 2:
-        terminal_segment_indices.add(num_segments - 1)
+    terminal_segment_indices: List[int] = []
+    if num_segments > 2 and blocked_radius > 0:
+        terminal_segment_indices = [0, num_segments - 1]
 
-    bridge_conduit_radius = (
-        max(1, blocked_radius * BRIDGE_CONDUIT_RADIUS_MULTIPLIER)
-        if has_internal_segments and blocked_radius > 0
-        else 0
-    )
-    bridge_endpoint_exemption_radius = max(1, blocked_exemption_radius, blocked_radius)
-    bridge_paths: Dict[int, List[GridIndex]] = {}
-    bridge_conduit_cells: Set[GridIndex] = set()
+    if terminal_segment_indices:
+        edge_roominess_cutoff = max(1, bottleneck_threshold)
+        preferred_edge_cells = {
+            cell
+            for cell, roominess in roominess_map.items()
+            if roominess <= edge_roominess_cutoff
+        }
+        edge_penalty_cells = (set(valid_cells) - preferred_edge_cells) if preferred_edge_cells else set()
 
-    edge_roominess_cutoff = max(1, bottleneck_threshold)
-    preferred_edge_cells = {
-        cell
-        for cell, roominess in roominess_map.items()
-        if roominess <= edge_roominess_cutoff
-    }
-    edge_penalty_cells = (set(valid_cells) - preferred_edge_cells) if preferred_edge_cells else set()
-
-    if has_internal_segments:
-        for segment_index in range(num_segments):
+        for segment_index in terminal_segment_indices:
             start = node_sequence[segment_index]
             goal = node_sequence[segment_index + 1]
             segment_valid_cells = set(valid_cells)
@@ -2223,8 +2208,20 @@ def route_node_sequence(
                 local_reserved.discard(goal)
                 segment_valid_cells.difference_update(local_reserved)
 
+            if fixed_initial_blocked_cells:
+                local_blocked = set(fixed_initial_blocked_cells)
+                if blocked_exemption_radius > 0:
+                    local_blocked.difference_update(
+                        dilate_cells({start, goal}, blocked_exemption_radius)
+                    )
+                local_blocked.discard(start)
+                local_blocked.discard(goal)
+                segment_valid_cells.difference_update(local_blocked)
+
             if per_node_keepout:
-                endpoint_safe = dilate_cells({start, goal}, max(1, blocked_radius))
+                endpoint_safe = dilate_cells(
+                    {start, goal}, max(1, blocked_radius)
+                )
                 for node in node_sequence:
                     if node == start or node == goal:
                         continue
@@ -2235,60 +2232,70 @@ def route_node_sequence(
                 segment_valid_cells.add(start)
                 segment_valid_cells.add(goal)
 
-            segment_penalties: Set[GridIndex] = set()
-            if segment_index in terminal_segment_indices:
-                segment_penalties.update(edge_penalty_cells)
-            segment_penalties.discard(start)
-            segment_penalties.discard(goal)
+            segment_target_length = None
+            if segment_target_lengths is not None:
+                segment_target_length = segment_target_lengths[segment_index]
 
-            bridge_path = astar_path(
+            terminal_penalties = set(fixed_initial_penalty_cells)
+            terminal_penalties.update(edge_penalty_cells)
+            terminal_penalties.discard(start)
+            terminal_penalties.discard(goal)
+
+            terminal_candidates = _segment_candidate_paths(
                 valid_cells=segment_valid_cells,
                 start=start,
                 goal=goal,
-                penalty_cells=segment_penalties,
+                penalty_cells=terminal_penalties,
                 penalty_weight=max(0.1, penalty_weight),
                 allow_diagonals=allow_diagonals,
+                target_length=segment_target_length,
+                self_avoid_radius=max(0, blocked_radius),
                 vertical_move_penalty=vertical_move_penalty,
+                roominess_map=roominess_map,
+                bottleneck_threshold=bottleneck_threshold,
                 boundary_penalty_cells=boundary_penalty_cells,
                 boundary_penalty_weight=0.2,
+                beam_width=seg_beam_width,
+                beam_max_waypoints=seg_beam_max_waypoints,
+                deadline=deadline,
+                min_self_spacing=min_self_spacing,
             )
-            bridge_paths[segment_index] = bridge_path
+            if not terminal_candidates:
+                if node_labels is not None:
+                    raise RoutingError(
+                        "Pathway between {} and {} could not fit the current routing constraints.".format(
+                            node_labels[segment_index],
+                            node_labels[segment_index + 1],
+                        )
+                    )
+                raise RoutingError(
+                    "No route found between {} and {}.".format(start, goal)
+                )
 
-            if bridge_conduit_radius > 0:
-                bridge_conduit_cells.update(dilate_cells(bridge_path, bridge_conduit_radius))
+            routed_terminal = terminal_candidates[0]
+            fixed_segment = compress_index_path(routed_terminal)
+            fixed_terminal_segments[segment_index] = fixed_segment
 
-    for segment_index in terminal_segment_indices:
-        bridge_path = bridge_paths.get(segment_index)
-        if bridge_path is None:
-            continue
-        start = node_sequence[segment_index]
-        goal = node_sequence[segment_index + 1]
-        fixed_segment = compress_index_path(bridge_path)
-        fixed_terminal_segments[segment_index] = fixed_segment
+            if penalty_radius > 0:
+                fixed_initial_penalty_cells.update(
+                    dilate_cells(routed_terminal, penalty_radius)
+                )
+            fixed_initial_penalty_cells.discard(start)
+            fixed_initial_penalty_cells.discard(goal)
 
-        if penalty_radius > 0:
-            fixed_initial_penalty_cells.update(dilate_cells(bridge_path, penalty_radius))
-        fixed_initial_penalty_cells.discard(start)
-        fixed_initial_penalty_cells.discard(goal)
-
-        if blocked_radius > 0:
-            fixed_initial_blocked_cells.update(dilate_cells(bridge_path, blocked_radius))
-
-        arrival_dir = _approach_direction(fixed_segment, from_end=True)
-        if arrival_dir is not None:
-            fixed_initial_approach[goal] = arrival_dir
-
-    if has_internal_segments and bridge_conduit_cells:
-        fixed_initial_blocked_cells.update(bridge_conduit_cells)
-
-    if has_internal_segments and segment_fill_zones is not None and bridge_conduit_cells:
-        for segment_index in internal_segment_indices:
-            start = node_sequence[segment_index]
-            goal = node_sequence[segment_index + 1]
-            endpoint_bridge_safe = dilate_cells({start, goal}, bridge_endpoint_exemption_radius)
-            segment_fill_zones[segment_index].difference_update(
-                bridge_conduit_cells - endpoint_bridge_safe
+            fixed_initial_blocked_cells.update(
+                dilate_cells(routed_terminal, blocked_radius)
             )
+
+            arrival_dir = _approach_direction(fixed_segment, from_end=True)
+            if arrival_dir is not None:
+                fixed_initial_approach[goal] = arrival_dir
+
+        if segment_fill_zones is not None and fixed_initial_blocked_cells:
+            for segment_index in range(1, max(1, num_segments - 1)):
+                if segment_index >= num_segments - 1:
+                    break
+                segment_fill_zones[segment_index].difference_update(fixed_initial_blocked_cells)
 
     # Track the furthest segment reached so far (shared mutable state)
     # so that _search can enforce the backtracking-depth limit.
@@ -2330,9 +2337,9 @@ def route_node_sequence(
 
         if current_blocked_cells:
             local_blocked = set(current_blocked_cells)
-            if bridge_endpoint_exemption_radius > 0:
+            if blocked_exemption_radius > 0:
                 local_blocked.difference_update(
-                    dilate_cells({start, goal}, bridge_endpoint_exemption_radius)
+                    dilate_cells({start, goal}, blocked_exemption_radius)
                 )
             local_blocked.discard(start)
             local_blocked.discard(goal)
@@ -2380,16 +2387,6 @@ def route_node_sequence(
         segment_target_length = None
         if segment_target_lengths is not None:
             segment_target_length = segment_target_lengths[segment_index]
-        strict_internal_target = (
-            segment_index in internal_segment_indices
-            and segment_target_length is not None
-            and segment_target_length > 0.0
-        )
-        strict_target_threshold = (
-            float(segment_target_length) * STRICT_INTERNAL_TARGET_RATIO
-            if strict_internal_target
-            else 0.0
-        )
 
         if segment_index in fixed_terminal_segments:
             candidate_paths = [fixed_terminal_segments[segment_index]]
@@ -2444,13 +2441,7 @@ def route_node_sequence(
                 non_adjacent_blocked.difference_update(node_exempt)
 
         last_error: Optional[RoutingError] = None
-        best_internal_length = 0.0
         for routed_segment in candidate_paths:
-            if strict_internal_target:
-                best_internal_length = max(best_internal_length, _path_length(routed_segment))
-                if best_internal_length + 1e-9 < strict_target_threshold:
-                    continue
-
             # Cross-segment overlap check: verify the new segment does
             # not run parallel to the previous segment near the shared
             # node.  The blocked_exemption_radius is deliberately NOT
@@ -2535,26 +2526,6 @@ def route_node_sequence(
 
         if last_error is not None:
             raise last_error
-
-        if strict_internal_target:
-            target_length_value = float(segment_target_length or 0.0)
-            if node_labels is not None:
-                raise RoutingError(
-                    "Internal pathway between {} and {} could not reach target length ({:.1f}/{:.1f} cells).".format(
-                        node_labels[segment_index],
-                        node_labels[segment_index + 1],
-                        best_internal_length,
-                        target_length_value,
-                    )
-                )
-            raise RoutingError(
-                "Internal route between {} and {} failed strict target ({:.1f}/{:.1f} cells).".format(
-                    start,
-                    goal,
-                    best_internal_length,
-                    target_length_value,
-                )
-            )
 
         if node_labels is not None:
             raise RoutingError(
