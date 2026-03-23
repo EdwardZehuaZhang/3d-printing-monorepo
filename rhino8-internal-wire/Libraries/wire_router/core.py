@@ -4,11 +4,17 @@ import heapq
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, FrozenSet, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 GridIndex = Tuple[int, int, int]
 FloatPoint = Tuple[float, float, float]
 RoominessMap = Dict[GridIndex, int]
+
+AGGRESSIVE_SERPENTINE_EARLY_EXIT_RATIO = 0.92
+AGGRESSIVE_BEAM_WIDTH_BONUS = 2
+AGGRESSIVE_BEAM_WAYPOINT_BONUS = 1
+AGGRESSIVE_EXTRA_GROWTH_PASSES = 2
+AGGRESSIVE_MIXED_STAGE_SHORTFALL_RATIO = 0.9
 
 
 class RoutingError(RuntimeError):
@@ -1261,7 +1267,7 @@ def _segment_candidate_paths(
     min_self_spacing: int = 0,
     fill_hard_excluded_cells: Optional[Set[GridIndex]] = None,
     fill_soft_excluded_cells: Optional[Set[GridIndex]] = None,
-    serpentine_early_exit_ratio: float = 0.85,
+    serpentine_early_exit_ratio: float = AGGRESSIVE_SERPENTINE_EARLY_EXIT_RATIO,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1296,12 +1302,15 @@ def _segment_candidate_paths(
         return candidates
 
     direct_length = _path_length(direct_path)
+    hard_excluded = set(fill_hard_excluded_cells or set())
+    soft_excluded = set(fill_soft_excluded_cells or set())
+    aggressive_growth_valid = set(valid_cells) - hard_excluded
+    aggressive_growth_valid.add(start)
+    aggressive_growth_valid.add(goal)
 
     # ---- Serpentine fill (primary strategy for large targets) ----
     # Inspired by trace_filling from 3dp-singlewire-sensing.
     if not allow_diagonals and target_length > direct_length * 1.2:
-        hard_excluded = set(fill_hard_excluded_cells or set())
-        soft_excluded = set(fill_soft_excluded_cells or set())
         fill_corridor = _build_fill_corridor(
             pipe_path, valid_cells, target_length, self_avoid_radius,
             min_self_spacing=min_self_spacing,
@@ -1320,7 +1329,7 @@ def _segment_candidate_paths(
             # the full valid cell set (minus highway layers) so the
             # serpentine can exploit all available fill space.
             fill_full = set(valid_cells) - hard_excluded
-            if serpentine_length < target_length * 0.85 and len(fill_corridor) < len(fill_full):
+            if serpentine_length < target_length * serpentine_early_exit_ratio and len(fill_corridor) < len(fill_full):
                 full_serpentine = _generate_serpentine_fill(
                     fill_full, valid_cells, start, goal, target_length,
                     self_avoid_radius, min_self_spacing=min_self_spacing,
@@ -1416,6 +1425,38 @@ def _segment_candidate_paths(
         if deadline is not None and time.monotonic() > deadline:
             break
 
+    if target_length is not None and not allow_diagonals and candidate_waypoints:
+        best_candidate_length = max(_path_length(path) for path in candidates)
+        if best_candidate_length < target_length * AGGRESSIVE_MIXED_STAGE_SHORTFALL_RATIO:
+            for waypoint in candidate_waypoints[: min(4, len(candidate_waypoints))]:
+                if deadline is not None and time.monotonic() > deadline:
+                    break
+                try:
+                    mixed = _route_through_waypoints(
+                        valid_cells=aggressive_growth_valid,
+                        waypoint_sequence=(start, waypoint, goal),
+                        penalty_cells=penalty_cells,
+                        penalty_weight=penalty_weight,
+                        allow_diagonals=allow_diagonals,
+                        self_avoid_radius=self_avoid_radius,
+                        vertical_move_penalty=target_first_vertical_penalty,
+                        boundary_penalty_cells=boundary_penalty_cells,
+                        boundary_penalty_weight=boundary_penalty_weight,
+                    )
+                except RoutingError:
+                    continue
+                mixed = _grow_path_toward_target(
+                    mixed,
+                    valid_cells,
+                    target_length,
+                    max(0, self_avoid_radius),
+                    roominess_map,
+                    bottleneck_threshold,
+                    growth_valid_cells=aggressive_growth_valid,
+                    min_self_spacing=min_self_spacing,
+                )
+                candidates.append(mixed)
+
     # Clean every candidate: remove self-overlapping loops, then dedupe.
     cleaned_candidates = [_remove_path_reversals(path) for path in candidates]
     unique_candidates = _dedupe_paths(cleaned_candidates)
@@ -1443,7 +1484,7 @@ def _segment_candidate_paths(
         still_short = [
             path for path in grown_candidates
             if _path_length(path) < target_length * 0.95
-            and len(candidate_valid_cells) < len(valid_cells)
+            and len(candidate_valid_cells) < len(aggressive_growth_valid)
         ]
         if still_short:
             grown_candidates.extend(
@@ -1454,10 +1495,30 @@ def _segment_candidate_paths(
                     max(0, self_avoid_radius),
                     roominess_map,
                     bottleneck_threshold,
-                    growth_valid_cells=valid_cells,
+                    growth_valid_cells=aggressive_growth_valid,
                     min_self_spacing=min_self_spacing,
                 )
                 for path in still_short
+            )
+        for _ in range(AGGRESSIVE_EXTRA_GROWTH_PASSES):
+            extra_short = [
+                path for path in grown_candidates
+                if _path_length(path) < target_length * 0.95
+            ]
+            if not extra_short:
+                break
+            grown_candidates.extend(
+                _grow_path_toward_target(
+                    path,
+                    valid_cells,
+                    target_length,
+                    max(0, self_avoid_radius),
+                    roominess_map,
+                    bottleneck_threshold,
+                    growth_valid_cells=aggressive_growth_valid,
+                    min_self_spacing=min_self_spacing,
+                )
+                for path in extra_short
             )
         grown_cleaned = [_remove_path_reversals(path) for path in grown_candidates]
         unique_candidates = _dedupe_paths(unique_candidates + grown_cleaned)
@@ -1950,6 +2011,24 @@ def route_node_sequence(
     if segment_target_lengths is not None and blocked_radius > 0:
         all_z = sorted(set(c[2] for c in valid_cells))
         highway_step = max(2, blocked_radius * 2 + 2)
+        numeric_targets = [
+            float(length)
+            for length in segment_target_lengths
+            if length is not None and length > 0.0
+        ]
+        if numeric_targets and all_z:
+            avg_target = sum(numeric_targets) / float(len(numeric_targets))
+            target_pressure = avg_target / max(1.0, float(len(all_z)))
+            if target_pressure > 24.0:
+                highway_step += 4
+            elif target_pressure > 16.0:
+                highway_step += 3
+            elif target_pressure > 10.0:
+                highway_step += 2
+            elif target_pressure > 6.0:
+                highway_step += 1
+            if num_segments >= 8 and target_pressure < 8.0:
+                highway_step = max(2, highway_step - 1)
         if len(all_z) >= highway_step * 3:
             highway_z_set = set(all_z[i] for i in range(0, len(all_z), highway_step))
             highway_cells = {c for c in valid_cells if c[2] in highway_z_set}
@@ -1960,6 +2039,22 @@ def route_node_sequence(
     segment_fill_zones: Optional[List[Set[GridIndex]]] = None
     if segment_target_lengths is not None and blocked_radius > 0 and num_segments > 2:
         fill_pool = valid_cells - highway_cells  # cells available for fills
+        segment_pressure_weights: List[float] = []
+        for segment_index in range(num_segments):
+            segment_target = segment_target_lengths[segment_index]
+            if segment_target is None or segment_target <= 0.0:
+                segment_pressure_weights.append(1.0)
+                continue
+            direct_length = max(
+                1.0,
+                _movement_distance(
+                    node_sequence[segment_index],
+                    node_sequence[segment_index + 1],
+                    allow_diagonals,
+                ),
+            )
+            pressure_weight = max(1.0, min(4.0, float(segment_target) / direct_length))
+            segment_pressure_weights.append(pressure_weight)
         # Midpoint of each segment (average of its two endpoint nodes).
         midpoints = []
         for si in range(num_segments):
@@ -1974,8 +2069,9 @@ def route_node_sequence(
             cx, cy, cz = cell
             for si, mid in enumerate(midpoints):
                 d = (cx - mid[0]) ** 2 + (cy - mid[1]) ** 2 + (cz - mid[2]) ** 2
-                if d < best_dist:
-                    best_dist = d
+                weighted = d / segment_pressure_weights[si]
+                if weighted < best_dist:
+                    best_dist = weighted
                     best_seg = si
             segment_fill_zones[best_seg].add(cell)
 
@@ -2002,6 +2098,9 @@ def route_node_sequence(
     else:
         seg_beam_width = 8
         seg_beam_max_waypoints = 3
+    if segment_target_lengths is not None:
+        seg_beam_width = min(12, seg_beam_width + AGGRESSIVE_BEAM_WIDTH_BONUS)
+        seg_beam_max_waypoints = min(4, seg_beam_max_waypoints + AGGRESSIVE_BEAM_WAYPOINT_BONUS)
 
     # Maximum number of segments to backtrack when a downstream segment
     # fails.  Deep backtracking is exponentially expensive and rarely
