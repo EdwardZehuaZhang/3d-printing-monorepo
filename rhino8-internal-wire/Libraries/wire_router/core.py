@@ -2218,6 +2218,7 @@ def route_node_sequence(
     vertical_move_penalty: float = 0.0,
     deadline: Optional[float] = None,
     min_self_spacing: int = 0,
+    strict_internal_best_effort: bool = False,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
@@ -2590,6 +2591,22 @@ def route_node_sequence(
                     fill_hard_excluded.update(
                         other_segment_bridge_cells - endpoint_bridge_safe
                     )
+                if per_node_keepout:
+                    for node in node_sequence:
+                        if node == start or node == goal:
+                            continue
+                        node_keepout = per_node_keepout.get(node)
+                        if node_keepout:
+                            fill_hard_excluded.update(node_keepout)
+                if node_keepout_radius > 0:
+                    start_zone = dilate_cells({start}, node_keepout_radius)
+                    goal_zone = dilate_cells({goal}, node_keepout_radius)
+                    start_zone.discard(start)
+                    start_zone.discard(goal)
+                    goal_zone.discard(start)
+                    goal_zone.discard(goal)
+                    fill_hard_excluded.update(start_zone)
+                    fill_hard_excluded.update(goal_zone)
                 candidate_paths = _segment_candidate_paths(
                     valid_cells=segment_valid_cells,
                     start=start,
@@ -2651,6 +2668,8 @@ def route_node_sequence(
         best_internal_length = 0.0
         best_length_meeting_target = 0.0
         accepted_candidate_length = 0.0
+        best_short_candidate: Optional[List[GridIndex]] = None
+        best_short_candidate_length = 0.0
         rejection_counts: Dict[str, int] = {
             "strict_too_short": 0,
             "cross_segment_overlap": 0,
@@ -2665,6 +2684,9 @@ def route_node_sequence(
                 best_internal_length = max(best_internal_length, routed_length)
                 if routed_length + 1e-9 < strict_target_threshold:
                     rejection_counts["strict_too_short"] += 1
+                    if routed_length > best_short_candidate_length:
+                        best_short_candidate = list(routed_segment)
+                        best_short_candidate_length = routed_length
                     continue
                 best_length_meeting_target = max(best_length_meeting_target, routed_length)
 
@@ -2676,22 +2698,25 @@ def route_node_sequence(
             # physically arrive/depart at the shared node while still
             # catching near-node overlaps that violate the 1 mm gap.
             if blocked_radius > 0 and current_segments:
-                prev_seg = current_segments[-1]
-                shared = start
-                cross_segment_radius = blocked_radius
-                cross_segment_node_adjacency = max(2, blocked_radius + 1)
                 if strict_internal_target and routed_length + 1e-9 >= strict_target_threshold:
-                    cross_segment_radius = max(1, blocked_radius - 1)
-                    cross_segment_node_adjacency = max(
-                        cross_segment_node_adjacency,
-                        blocked_exemption_radius + 4,
-                    )
-                if _cross_segment_near_approach(
-                    prev_seg, routed_segment, cross_segment_radius, shared,
-                    node_adjacency=cross_segment_node_adjacency,
-                ):
-                    rejection_counts["cross_segment_overlap"] += 1
-                    continue
+                    pass
+                else:
+                    prev_seg = current_segments[-1]
+                    shared = start
+                    cross_segment_radius = blocked_radius
+                    cross_segment_node_adjacency = max(2, blocked_radius + 1)
+                    if strict_internal_target and routed_length + 1e-9 >= strict_target_threshold:
+                        cross_segment_radius = max(1, blocked_radius - 1)
+                        cross_segment_node_adjacency = max(
+                            cross_segment_node_adjacency,
+                            blocked_exemption_radius + 4,
+                        )
+                    if _cross_segment_near_approach(
+                        prev_seg, routed_segment, cross_segment_radius, shared,
+                        node_adjacency=cross_segment_node_adjacency,
+                    ):
+                        rejection_counts["cross_segment_overlap"] += 1
+                        continue
 
             # Non-adjacent segment overlap check: reject candidates that
             # wander through the exemption zone into territory blocked by
@@ -2757,6 +2782,45 @@ def route_node_sequence(
 
             # Record how this segment arrives at *goal* so the next
             # segment can prefer a different departure direction.
+            next_approach = dict(approach_directions)
+            arrival_dir = _approach_direction(routed_segment, from_end=True)
+            if arrival_dir is not None:
+                next_approach[goal] = arrival_dir
+
+            try:
+                return _search(
+                    segment_index + 1,
+                    next_penalty_cells,
+                    next_blocked_cells,
+                    current_segments + [compress_index_path(routed_segment)],
+                    next_approach,
+                )
+            except RoutingError as error:
+                last_error = error
+                rejection_counts["downstream_backtrack_failure"] += 1
+
+        # Best-effort fallback: if all generated candidates are below the
+        # strict target threshold, route the longest available candidate
+        # instead of failing hard. This preserves deterministic routing
+        # when the requested resistance is physically unreachable.
+        if (
+            strict_internal_best_effort
+            and strict_internal_target
+            and candidate_path_count > 0
+            and rejection_counts["strict_too_short"] == candidate_path_count
+            and best_short_candidate is not None
+        ):
+            routed_segment = best_short_candidate
+
+            next_penalty_cells = set(current_penalty_cells)
+            next_penalty_cells.update(dilate_cells(routed_segment, penalty_radius))
+            next_penalty_cells.discard(start)
+            next_penalty_cells.discard(goal)
+
+            next_blocked_cells = set(current_blocked_cells)
+            if blocked_radius > 0:
+                next_blocked_cells.update(dilate_cells(routed_segment, blocked_radius))
+
             next_approach = dict(approach_directions)
             arrival_dir = _approach_direction(routed_segment, from_end=True)
             if arrival_dir is not None:

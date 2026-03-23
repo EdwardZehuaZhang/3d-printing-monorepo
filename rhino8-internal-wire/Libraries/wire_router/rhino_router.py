@@ -1727,6 +1727,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                 vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
                 deadline=deadline,
                 min_self_spacing=min_self_spacing,
+                strict_internal_best_effort=True,
             )
         except RoutingError as error:
             attempted_sequence = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]

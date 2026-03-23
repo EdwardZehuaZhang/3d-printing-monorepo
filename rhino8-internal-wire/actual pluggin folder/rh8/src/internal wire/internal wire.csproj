@@ -5,7 +5,7 @@
     <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
     <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
     <AssemblyName>internal wire</AssemblyName>
-    <AssemblyVersion>0.5.6.1643</AssemblyVersion>
+    <AssemblyVersion>0.5.6.4020</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>
