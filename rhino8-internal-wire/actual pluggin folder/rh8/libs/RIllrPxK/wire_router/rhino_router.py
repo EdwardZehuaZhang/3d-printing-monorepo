@@ -388,16 +388,91 @@ def _target_order_candidates(
     if not preferred_bottom_up:
         return []
 
-    metrics = evaluate_node_order(preferred_bottom_up, start_distances, end_distances, pair_distances)
-    max_length_error, total_length_error, _ = _target_length_score(metrics, target_leg_length)
-    return [
-        TouchNodeOrderCandidate(
-            ordered_nodes=_nodes_from_order_indices(touch_nodes, preferred_bottom_up),
-            metrics=metrics,
-            max_length_error=max_length_error,
-            total_length_error=total_length_error,
+    candidate_orders: List[Tuple[int, ...]] = []
+    seen: Set[Tuple[int, ...]] = set()
+
+    def _append_order(order: Tuple[int, ...]) -> None:
+        if not order:
+            return
+        if len(order) != len(touch_nodes):
+            return
+        if len(set(order)) != len(touch_nodes):
+            return
+        if order in seen:
+            return
+        seen.add(order)
+        candidate_orders.append(order)
+
+    _append_order(preferred_bottom_up)
+
+    _append_order(
+        optimize_node_order_for_target_leg_length(
+            start_distances,
+            end_distances,
+            pair_distances,
+            target_leg_length,
+            max_exact_nodes=max_exact_nodes,
         )
-    ]
+    )
+
+    seed_indices = sorted(
+        range(len(touch_nodes)),
+        key=lambda index: (
+            abs(start_distances[index] - target_leg_length),
+            start_distances[index],
+            end_distances[index],
+        ),
+    )
+    for start_index in seed_indices[: min(len(seed_indices), max(2, MAX_ORDER_CANDIDATES * 2))]:
+        _append_order(
+            _greedy_target_order(
+                start_distances,
+                end_distances,
+                pair_distances,
+                target_leg_length,
+                start_index,
+            )
+        )
+
+    preferred_mutable = list(preferred_bottom_up)
+    for index in range(len(preferred_mutable) - 1):
+        swapped = list(preferred_mutable)
+        swapped[index], swapped[index + 1] = swapped[index + 1], swapped[index]
+        _append_order(tuple(swapped))
+
+    _append_order(tuple(reversed(preferred_bottom_up)))
+
+    scored: List[TouchNodeOrderCandidate] = []
+    for order in candidate_orders:
+        metrics = evaluate_node_order(order, start_distances, end_distances, pair_distances)
+        max_length_error, total_length_error, _ = _target_length_score(metrics, target_leg_length)
+        scored.append(
+            TouchNodeOrderCandidate(
+                ordered_nodes=_nodes_from_order_indices(touch_nodes, order),
+                metrics=metrics,
+                max_length_error=max_length_error,
+                total_length_error=total_length_error,
+            )
+        )
+
+    ranked = sorted(
+        scored,
+        key=lambda candidate: (
+            candidate.max_length_error,
+            candidate.total_length_error,
+            candidate.metrics.total_path_length,
+        ),
+    )
+
+    preferred_candidate = next(
+        (candidate for candidate in ranked if candidate.metrics.order == preferred_bottom_up),
+        None,
+    )
+    if preferred_candidate is None:
+        return ranked[:MAX_ORDER_CANDIDATES]
+
+    others = [candidate for candidate in ranked if candidate.metrics.order != preferred_bottom_up]
+    return [preferred_candidate] + others[: max(0, MAX_ORDER_CANDIDATES - 1)]
 
 
 def _create_touch_node(
@@ -1254,6 +1329,19 @@ def _write_failure_debug(
             _fmt_value("candidate_max_length_cells", " cells"),
         )
     )
+
+    rejection_counts = diagnostics.get("rejection_counts")
+    if isinstance(rejection_counts, dict) and rejection_counts:
+        Rhino.RhinoApp.WriteLine(
+            "  rejects short={} cross={} nonAdjacent={} keepoutReentry={} nodeKeepout={} downstream={}".format(
+                rejection_counts.get("strict_too_short", 0),
+                rejection_counts.get("cross_segment_overlap", 0),
+                rejection_counts.get("non_adjacent_overlap", 0),
+                rejection_counts.get("endpoint_keepout_reentry", 0),
+                rejection_counts.get("non_endpoint_node_keepout", 0),
+                rejection_counts.get("downstream_backtrack_failure", 0),
+            )
+        )
 
     accepted_prefix_segments = diagnostics.get("accepted_prefix_segments_cells")
     prefix_segments_count = len(accepted_prefix_segments) if isinstance(accepted_prefix_segments, list) else 0

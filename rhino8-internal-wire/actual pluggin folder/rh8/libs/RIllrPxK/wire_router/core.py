@@ -1344,6 +1344,7 @@ def _segment_candidate_paths(
     serpentine_early_exit_ratio: float = AGGRESSIVE_SERPENTINE_EARLY_EXIT_RATIO,
     strict_layercake_mode: bool = False,
     strict_completion_ratio: float = STRICT_INTERNAL_TARGET_RATIO,
+    preferred_pipe_path: Optional[Sequence[GridIndex]] = None,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1351,17 +1352,27 @@ def _segment_candidate_paths(
         bottleneck_threshold = _bottleneck_threshold(roominess_map)
     target_first_vertical_penalty = 0.0 if target_length is not None else vertical_move_penalty
 
-    pipe_path = astar_path(
-        valid_cells=valid_cells,
-        start=start,
-        goal=goal,
-        penalty_cells=penalty_cells,
-        penalty_weight=penalty_weight,
-        allow_diagonals=allow_diagonals,
-        vertical_move_penalty=vertical_move_penalty,
-        boundary_penalty_cells=boundary_penalty_cells,
-        boundary_penalty_weight=boundary_penalty_weight,
-    )
+    pipe_path: List[GridIndex]
+    preferred = list(preferred_pipe_path) if preferred_pipe_path is not None else []
+    if (
+        preferred
+        and preferred[0] == start
+        and preferred[-1] == goal
+        and all(cell in valid_cells for cell in preferred)
+    ):
+        pipe_path = preferred
+    else:
+        pipe_path = astar_path(
+            valid_cells=valid_cells,
+            start=start,
+            goal=goal,
+            penalty_cells=penalty_cells,
+            penalty_weight=penalty_weight,
+            allow_diagonals=allow_diagonals,
+            vertical_move_penalty=vertical_move_penalty,
+            boundary_penalty_cells=boundary_penalty_cells,
+            boundary_penalty_weight=boundary_penalty_weight,
+        )
     candidate_valid_cells = valid_cells
     if target_length is not None and not allow_diagonals and not strict_layercake_mode:
         candidate_valid_cells = _build_pipe_corridor(
@@ -2114,6 +2125,7 @@ def _segment_excluded_fill(
     segment_index: int,
     valid_cells: Set[GridIndex],
     highway_cells: Set[GridIndex],
+    strict_layercake_mode: bool = False,
 ) -> Tuple[Set[GridIndex], Set[GridIndex]]:
     """Return hard/soft exclusions for this segment's serpentine fill.
 
@@ -2123,6 +2135,8 @@ def _segment_excluded_fill(
     hard_excluded = set(highway_cells)
     if segment_fill_zones is not None:
         own_zone = segment_fill_zones[segment_index]
+        if strict_layercake_mode:
+            return hard_excluded, set()
         soft_excluded = (valid_cells - own_zone) - hard_excluded
         return hard_excluded, soft_excluded
     return hard_excluded, set()
@@ -2547,6 +2561,7 @@ def route_node_sequence(
             try:
                 fill_hard_excluded, fill_soft_excluded = _segment_excluded_fill(
                     segment_fill_zones, segment_index, valid_cells, highway_cells,
+                    strict_layercake_mode=strict_internal_target,
                 )
                 candidate_paths = _segment_candidate_paths(
                     valid_cells=segment_valid_cells,
@@ -2570,6 +2585,7 @@ def route_node_sequence(
                     fill_soft_excluded_cells=fill_soft_excluded,
                     strict_layercake_mode=strict_internal_target,
                     strict_completion_ratio=STRICT_INTERNAL_TARGET_RATIO,
+                    preferred_pipe_path=bridge_paths.get(segment_index),
                 )
             except RoutingError:
                 candidate_paths = []
@@ -2606,12 +2622,24 @@ def route_node_sequence(
 
         last_error: Optional[RoutingError] = None
         best_internal_length = 0.0
+        best_length_meeting_target = 0.0
+        accepted_candidate_length = 0.0
+        rejection_counts: Dict[str, int] = {
+            "strict_too_short": 0,
+            "cross_segment_overlap": 0,
+            "non_adjacent_overlap": 0,
+            "endpoint_keepout_reentry": 0,
+            "non_endpoint_node_keepout": 0,
+            "downstream_backtrack_failure": 0,
+        }
         for routed_segment in candidate_paths:
             if strict_internal_target:
                 routed_length = _path_length(routed_segment)
                 best_internal_length = max(best_internal_length, routed_length)
                 if routed_length + 1e-9 < strict_target_threshold:
+                    rejection_counts["strict_too_short"] += 1
                     continue
+                best_length_meeting_target = max(best_length_meeting_target, routed_length)
 
             # Cross-segment overlap check: verify the new segment does
             # not run parallel to the previous segment near the shared
@@ -2627,6 +2655,7 @@ def route_node_sequence(
                     prev_seg, routed_segment, blocked_radius, shared,
                     node_adjacency=max(2, blocked_radius + 1),
                 ):
+                    rejection_counts["cross_segment_overlap"] += 1
                     continue
 
             # Non-adjacent segment overlap check: reject candidates that
@@ -2634,6 +2663,7 @@ def route_node_sequence(
             # segments that do not directly connect to start or goal.
             if non_adjacent_blocked is not None:
                 if any(cell in non_adjacent_blocked for cell in routed_segment):
+                    rejection_counts["non_adjacent_overlap"] += 1
                     continue
 
             # Reject segments that leave an endpoint keepout and then loop back
@@ -2646,6 +2676,7 @@ def route_node_sequence(
                     goal,
                     node_keepout_radius,
                 ):
+                    rejection_counts["endpoint_keepout_reentry"] += 1
                     continue
 
             # Post-hoc per-node keepout check: the endpoint_safe exemption
@@ -2666,7 +2697,13 @@ def route_node_sequence(
                             node_violation = True
                             break
                 if node_violation:
+                    rejection_counts["non_endpoint_node_keepout"] += 1
                     continue
+
+            accepted_candidate_length = max(
+                accepted_candidate_length,
+                _path_length(routed_segment),
+            )
 
             next_penalty_cells = set(current_penalty_cells)
             next_penalty_cells.update(dilate_cells(routed_segment, penalty_radius))
@@ -2694,6 +2731,7 @@ def route_node_sequence(
                 )
             except RoutingError as error:
                 last_error = error
+                rejection_counts["downstream_backtrack_failure"] += 1
 
         if last_error is not None:
             raise last_error
@@ -2717,6 +2755,9 @@ def route_node_sequence(
                 "candidate_path_count": candidate_path_count,
                 "candidate_min_length_cells": candidate_min_length,
                 "candidate_max_length_cells": candidate_max_length,
+                "best_length_meeting_target_cells": best_length_meeting_target,
+                "accepted_candidate_length_cells": accepted_candidate_length,
+                "rejection_counts": dict(rejection_counts),
                 "bridge_path_cells": bridge_paths.get(segment_index, []),
                 "best_candidate_path_cells": best_candidate_path_cells,
                 "accepted_prefix_segments_cells": [list(segment) for segment in current_segments],
@@ -2727,6 +2768,16 @@ def route_node_sequence(
                 failure_diagnostics["fill_zone_sample_cells"] = _sample_preview_cells(own_zone)
                 failure_diagnostics["fill_zone_layer_count"] = len({cell[2] for cell in own_zone})
             if node_labels is not None:
+                if best_length_meeting_target + 1e-9 >= strict_target_threshold:
+                    raise RoutingError(
+                        "Internal pathway between {} and {} satisfied length but violated spacing/clearance constraints (best {:.1f}/{:.1f} cells).".format(
+                            node_labels[segment_index],
+                            node_labels[segment_index + 1],
+                            best_length_meeting_target,
+                            target_length_value,
+                        ),
+                        diagnostics=failure_diagnostics,
+                    )
                 raise RoutingError(
                     "Internal pathway between {} and {} could not reach target length ({:.1f}/{:.1f} cells).".format(
                         node_labels[segment_index],
