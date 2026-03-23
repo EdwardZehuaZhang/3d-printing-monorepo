@@ -10,15 +10,11 @@ GridIndex = Tuple[int, int, int]
 FloatPoint = Tuple[float, float, float]
 RoominessMap = Dict[GridIndex, int]
 
-AGGRESSIVE_SERPENTINE_EARLY_EXIT_RATIO = 0.88
+AGGRESSIVE_SERPENTINE_EARLY_EXIT_RATIO = 0.92
 AGGRESSIVE_BEAM_WIDTH_BONUS = 2
 AGGRESSIVE_BEAM_WAYPOINT_BONUS = 1
 AGGRESSIVE_EXTRA_GROWTH_PASSES = 2
-AGGRESSIVE_MIXED_STAGE_SHORTFALL_RATIO = 0.95
-AGGRESSIVE_HEADROOM_RATIO = 0.10
-AGGRESSIVE_HEADROOM_MIN_CELLS = 50
-AGGRESSIVE_FORCE_BEAM_MAX_HEADROOM = 200
-AGGRESSIVE_PRESSURE_WEIGHT_CAP = 8.0
+AGGRESSIVE_MIXED_STAGE_SHORTFALL_RATIO = 0.9
 
 
 class RoutingError(RuntimeError):
@@ -1342,20 +1338,8 @@ def _segment_candidate_paths(
                     candidates.append(full_serpentine)
                     serpentine_length = max(serpentine_length, _path_length(full_serpentine))
             fill_headroom = max(0, len(fill_full) - len(fill_corridor))
-            headroom_threshold = max(
-                AGGRESSIVE_HEADROOM_MIN_CELLS,
-                int(len(fill_corridor) * AGGRESSIVE_HEADROOM_RATIO),
-            )
-            has_meaningful_headroom = fill_headroom > headroom_threshold
-            force_beam_pass = (
-                serpentine_length < target_length
-                and 0 < fill_headroom <= AGGRESSIVE_FORCE_BEAM_MAX_HEADROOM
-            )
-            if (
-                serpentine_length >= target_length * serpentine_early_exit_ratio
-                and not has_meaningful_headroom
-                and not force_beam_pass
-            ):
+            has_meaningful_headroom = fill_headroom > max(50, int(len(fill_corridor) * 0.15))
+            if serpentine_length >= target_length * serpentine_early_exit_ratio and not has_meaningful_headroom:
                 # Serpentine reached the target — skip the expensive beam search.
                 unique = _dedupe_paths(candidates)
                 return _sort_candidate_paths(
@@ -2069,7 +2053,7 @@ def route_node_sequence(
                     allow_diagonals,
                 ),
             )
-            pressure_weight = max(1.0, min(AGGRESSIVE_PRESSURE_WEIGHT_CAP, float(segment_target) / direct_length))
+            pressure_weight = max(1.0, min(4.0, float(segment_target) / direct_length))
             segment_pressure_weights.append(pressure_weight)
         # Midpoint of each segment (average of its two endpoint nodes).
         midpoints = []
