@@ -7,6 +7,8 @@ if str(LIBRARIES) not in sys.path:
     sys.path.insert(0, str(LIBRARIES))
 
 from wire_router.core import (
+    _allocate_proportional_layer_counts,
+    _internal_layer_band_allocation,
     evaluate_node_order,
     optimize_node_order_for_maximum_spacing,
     optimize_node_order_for_path,
@@ -60,6 +62,35 @@ class CoreRouterTests(unittest.TestCase):
                 ) <= radius:
                     return True
         return False
+
+    def test_allocate_proportional_layer_counts_guarantees_coverage(self) -> None:
+        counts = _allocate_proportional_layer_counts(total_layers=10, weights=[1.0, 2.0, 3.0])
+        self.assertEqual(sum(counts), 10)
+        self.assertTrue(all(count >= 1 for count in counts))
+        self.assertGreaterEqual(counts[2], counts[1])
+        self.assertGreaterEqual(counts[1], counts[0])
+
+    def test_internal_layer_band_allocation_is_bottom_up_contiguous(self) -> None:
+        z_levels = [0, 1, 2, 3, 4, 5]
+        bands = _internal_layer_band_allocation(
+            z_levels=z_levels,
+            internal_segment_indices=[1, 2],
+            segment_demands={1: 1.0, 2: 1.0},
+        )
+        self.assertEqual(bands[1], {0, 1, 2})
+        self.assertEqual(bands[2], {3, 4, 5})
+
+    def test_internal_layer_band_allocation_biases_higher_demand(self) -> None:
+        z_levels = [0, 1, 2, 3, 4, 5, 6]
+        bands = _internal_layer_band_allocation(
+            z_levels=z_levels,
+            internal_segment_indices=[1, 2, 3],
+            segment_demands={1: 1.0, 2: 4.0, 3: 1.0},
+        )
+        self.assertGreaterEqual(len(bands[2]), len(bands[1]))
+        self.assertGreaterEqual(len(bands[2]), len(bands[3]))
+        all_assigned = bands[1] | bands[2] | bands[3]
+        self.assertEqual(all_assigned, set(z_levels))
 
     def test_path_optimizer_prefers_shortest_total_route(self) -> None:
         order = optimize_node_order_for_path(
@@ -411,6 +442,34 @@ class CoreRouterTests(unittest.TestCase):
         self.assertEqual(len(segments), 2)
         self.assertGreaterEqual(self._segment_length(segments[0]), 40.0)
         self.assertGreaterEqual(self._segment_length(segments[1]), 40.0)
+
+    def test_terminal_segments_are_reserved_no_go_for_internal_fill(self) -> None:
+        valid_cells = {(x, y, 0) for x in range(15) for y in range(7)}
+        node_sequence = [(0, 3, 0), (4, 3, 0), (10, 3, 0), (14, 3, 0)]
+        segments = route_node_sequence(
+            valid_cells=valid_cells,
+            node_sequence=node_sequence,
+            segment_target_lengths=[None, 18.0, None],
+            penalty_radius=0,
+            penalty_weight=0.0,
+            blocked_radius=1,
+            blocked_exemption_radius=1,
+            allow_diagonals=False,
+        )
+
+        self.assertEqual(len(segments), 3)
+        first_terminal = set(self._expand_segment(segments[0]))
+        internal = set(self._expand_segment(segments[1]))
+        last_terminal = set(self._expand_segment(segments[2]))
+
+        terminal_blocked = dilate_cells(first_terminal | last_terminal, 1)
+        shared_endpoint_safe = dilate_cells({node_sequence[1], node_sequence[2]}, 1)
+        forbidden_internal = terminal_blocked - shared_endpoint_safe
+
+        self.assertFalse(
+            internal & forbidden_internal,
+            "Internal segment entered terminal no-go reservation outside shared endpoints.",
+        )
 
     # ---- reversal removal ----
 

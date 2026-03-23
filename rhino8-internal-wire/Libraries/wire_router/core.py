@@ -2002,6 +2002,67 @@ def _segment_excluded_fill(
     return hard_excluded, set()
 
 
+def _allocate_proportional_layer_counts(
+    total_layers: int,
+    weights: Sequence[float],
+) -> List[int]:
+    if total_layers <= 0 or not weights:
+        return [0 for _ in weights]
+
+    segment_count = len(weights)
+    normalized = [max(0.0, float(weight)) for weight in weights]
+    total_weight = sum(normalized)
+    if total_weight <= 0.0:
+        normalized = [1.0 for _ in weights]
+        total_weight = float(segment_count)
+
+    if total_layers >= segment_count:
+        counts = [1 for _ in weights]
+        remaining = total_layers - segment_count
+        ideal_extra = [((weight / total_weight) * total_layers) - 1.0 for weight in normalized]
+    else:
+        counts = [1 if index < total_layers else 0 for index in range(segment_count)]
+        remaining = 0
+        ideal_extra = [0.0 for _ in normalized]
+
+    while remaining > 0:
+        best_index = max(
+            range(segment_count),
+            key=lambda index: (ideal_extra[index], normalized[index], -index),
+        )
+        counts[best_index] += 1
+        ideal_extra[best_index] -= 1.0
+        remaining -= 1
+
+    return counts
+
+
+def _internal_layer_band_allocation(
+    z_levels: Sequence[int],
+    internal_segment_indices: Sequence[int],
+    segment_demands: Dict[int, float],
+) -> Dict[int, Set[int]]:
+    allocation: Dict[int, Set[int]] = {}
+    if not z_levels or not internal_segment_indices:
+        return allocation
+
+    weights = [max(1.0, float(segment_demands.get(index, 1.0))) for index in internal_segment_indices]
+    layer_counts = _allocate_proportional_layer_counts(len(z_levels), weights)
+
+    cursor = 0
+    for internal_order, segment_index in enumerate(internal_segment_indices):
+        layer_count = layer_counts[internal_order]
+        next_cursor = min(len(z_levels), cursor + max(0, layer_count))
+        if next_cursor > cursor:
+            assigned = set(z_levels[cursor:next_cursor])
+        else:
+            assigned = {z_levels[-1]}
+        allocation[segment_index] = assigned
+        cursor = next_cursor
+
+    return allocation
+
+
 def route_node_sequence(
     valid_cells: Set[GridIndex],
     node_sequence: Sequence[GridIndex],
@@ -2070,50 +2131,56 @@ def route_node_sequence(
             highway_z_set = set(all_z[i] for i in range(0, len(all_z), highway_step))
             highway_cells = {c for c in valid_cells if c[2] in highway_z_set}
 
-    # Per-segment Voronoi fill zones: partition non-highway cells so each
-    # segment gets a dedicated fill region closest to its midpoint.  This
-    # prevents earlier segments from filling space that later segments need.
+    # Per-segment fill zones for serpentine growth. Internal node-pair
+    # segments get bottom-up "layer-cake" Z-bands with proportional band
+    # thickness by target demand and upward-only spill.
     segment_fill_zones: Optional[List[Set[GridIndex]]] = None
     if segment_target_lengths is not None and blocked_radius > 0 and num_segments > 2:
-        fill_pool = valid_cells - highway_cells  # cells available for fills
-        segment_pressure_weights: List[float] = []
-        for segment_index in range(num_segments):
-            segment_target = segment_target_lengths[segment_index]
-            if segment_target is None or segment_target <= 0.0:
-                segment_pressure_weights.append(1.0)
-                continue
-            direct_length = max(
-                1.0,
-                _movement_distance(
-                    node_sequence[segment_index],
-                    node_sequence[segment_index + 1],
-                    allow_diagonals,
-                ),
-            )
-            pressure_weight = float(segment_target) / direct_length
-            if 0 < segment_index < (num_segments - 1):
-                pressure_weight *= AGGRESSIVE_TOUCH_SEGMENT_PRIORITY_BONUS
-            pressure_weight = max(1.0, min(AGGRESSIVE_PRESSURE_WEIGHT_CAP, pressure_weight))
-            segment_pressure_weights.append(pressure_weight)
-        # Midpoint of each segment (average of its two endpoint nodes).
-        midpoints = []
-        for si in range(num_segments):
-            a = node_sequence[si]
-            b = node_sequence[si + 1]
-            midpoints.append(((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0))
+        fill_pool = (valid_cells - highway_cells) - reserved
+        all_z = sorted(set(cell[2] for cell in fill_pool))
+        internal_segment_indices = [index for index in range(1, num_segments - 1)]
 
-        segment_fill_zones = [set() for _ in range(num_segments)]
-        for cell in fill_pool:
-            best_seg = 0
-            best_dist = float("inf")
-            cx, cy, cz = cell
-            for si, mid in enumerate(midpoints):
-                d = (cx - mid[0]) ** 2 + (cy - mid[1]) ** 2 + (cz - mid[2]) ** 2
-                weighted = d / segment_pressure_weights[si]
-                if weighted < best_dist:
-                    best_dist = weighted
-                    best_seg = si
-            segment_fill_zones[best_seg].add(cell)
+        segment_fill_zones = [set(fill_pool) for _ in range(num_segments)]
+        if all_z and internal_segment_indices:
+            segment_demands: Dict[int, float] = {}
+            for segment_index in internal_segment_indices:
+                segment_target = segment_target_lengths[segment_index]
+                direct_length = max(
+                    1.0,
+                    _movement_distance(
+                        node_sequence[segment_index],
+                        node_sequence[segment_index + 1],
+                        allow_diagonals,
+                    ),
+                )
+                if segment_target is None or segment_target <= 0.0:
+                    segment_demands[segment_index] = 1.0
+                else:
+                    segment_demands[segment_index] = max(
+                        1.0,
+                        min(
+                            AGGRESSIVE_PRESSURE_WEIGHT_CAP,
+                            float(segment_target) / direct_length,
+                        ),
+                    )
+
+            own_bands = _internal_layer_band_allocation(
+                z_levels=all_z,
+                internal_segment_indices=internal_segment_indices,
+                segment_demands=segment_demands,
+            )
+
+            cumulative_z: Set[int] = set()
+            spill_bands: Dict[int, Set[int]] = {}
+            for segment_index in reversed(internal_segment_indices):
+                cumulative_z |= own_bands.get(segment_index, set())
+                spill_bands[segment_index] = set(cumulative_z)
+
+            for segment_index in internal_segment_indices:
+                allowed_z = spill_bands.get(segment_index, set(all_z))
+                segment_fill_zones[segment_index] = {
+                    cell for cell in fill_pool if cell[2] in allowed_z
+                }
 
     # Precompute node keepout zones: for each node, the set of cells
     # that paths NOT connecting to that node must avoid.  The radius
@@ -2158,6 +2225,127 @@ def route_node_sequence(
             cell for cell, roominess in roominess_map.items()
             if roominess < bottleneck_threshold
         )
+
+    fixed_terminal_segments: Dict[int, List[GridIndex]] = {}
+    fixed_initial_penalty_cells: Set[GridIndex] = set()
+    fixed_initial_blocked_cells: Set[GridIndex] = set()
+    fixed_initial_approach: Dict[GridIndex, GridIndex] = {}
+
+    terminal_segment_indices: List[int] = []
+    if num_segments > 2 and blocked_radius > 0:
+        terminal_segment_indices = [0, num_segments - 1]
+
+    if terminal_segment_indices:
+        edge_roominess_cutoff = max(1, bottleneck_threshold)
+        preferred_edge_cells = {
+            cell
+            for cell, roominess in roominess_map.items()
+            if roominess <= edge_roominess_cutoff
+        }
+        edge_penalty_cells = (set(valid_cells) - preferred_edge_cells) if preferred_edge_cells else set()
+
+        for segment_index in terminal_segment_indices:
+            start = node_sequence[segment_index]
+            goal = node_sequence[segment_index + 1]
+            segment_valid_cells = set(valid_cells)
+
+            if reserved:
+                local_reserved = set(reserved)
+                local_reserved.difference_update(
+                    dilate_cells({start, goal}, max(0, reserved_exemption_radius))
+                )
+                local_reserved.discard(start)
+                local_reserved.discard(goal)
+                segment_valid_cells.difference_update(local_reserved)
+
+            if fixed_initial_blocked_cells:
+                local_blocked = set(fixed_initial_blocked_cells)
+                if blocked_exemption_radius > 0:
+                    local_blocked.difference_update(
+                        dilate_cells({start, goal}, blocked_exemption_radius)
+                    )
+                local_blocked.discard(start)
+                local_blocked.discard(goal)
+                segment_valid_cells.difference_update(local_blocked)
+
+            if per_node_keepout:
+                endpoint_safe = dilate_cells(
+                    {start, goal}, max(1, blocked_radius)
+                )
+                for node in node_sequence:
+                    if node == start or node == goal:
+                        continue
+                    if node in per_node_keepout:
+                        segment_valid_cells.difference_update(
+                            per_node_keepout[node] - endpoint_safe
+                        )
+                segment_valid_cells.add(start)
+                segment_valid_cells.add(goal)
+
+            segment_target_length = None
+            if segment_target_lengths is not None:
+                segment_target_length = segment_target_lengths[segment_index]
+
+            terminal_penalties = set(fixed_initial_penalty_cells)
+            terminal_penalties.update(edge_penalty_cells)
+            terminal_penalties.discard(start)
+            terminal_penalties.discard(goal)
+
+            terminal_candidates = _segment_candidate_paths(
+                valid_cells=segment_valid_cells,
+                start=start,
+                goal=goal,
+                penalty_cells=terminal_penalties,
+                penalty_weight=max(0.1, penalty_weight),
+                allow_diagonals=allow_diagonals,
+                target_length=segment_target_length,
+                self_avoid_radius=max(0, blocked_radius),
+                vertical_move_penalty=vertical_move_penalty,
+                roominess_map=roominess_map,
+                bottleneck_threshold=bottleneck_threshold,
+                boundary_penalty_cells=boundary_penalty_cells,
+                boundary_penalty_weight=0.2,
+                beam_width=seg_beam_width,
+                beam_max_waypoints=seg_beam_max_waypoints,
+                deadline=deadline,
+                min_self_spacing=min_self_spacing,
+            )
+            if not terminal_candidates:
+                if node_labels is not None:
+                    raise RoutingError(
+                        "Pathway between {} and {} could not fit the current routing constraints.".format(
+                            node_labels[segment_index],
+                            node_labels[segment_index + 1],
+                        )
+                    )
+                raise RoutingError(
+                    "No route found between {} and {}.".format(start, goal)
+                )
+
+            routed_terminal = terminal_candidates[0]
+            fixed_segment = compress_index_path(routed_terminal)
+            fixed_terminal_segments[segment_index] = fixed_segment
+
+            if penalty_radius > 0:
+                fixed_initial_penalty_cells.update(
+                    dilate_cells(routed_terminal, penalty_radius)
+                )
+            fixed_initial_penalty_cells.discard(start)
+            fixed_initial_penalty_cells.discard(goal)
+
+            fixed_initial_blocked_cells.update(
+                dilate_cells(routed_terminal, blocked_radius)
+            )
+
+            arrival_dir = _approach_direction(fixed_segment, from_end=True)
+            if arrival_dir is not None:
+                fixed_initial_approach[goal] = arrival_dir
+
+        if segment_fill_zones is not None and fixed_initial_blocked_cells:
+            for segment_index in range(1, max(1, num_segments - 1)):
+                if segment_index >= num_segments - 1:
+                    break
+                segment_fill_zones[segment_index].difference_update(fixed_initial_blocked_cells)
 
     # Track the furthest segment reached so far (shared mutable state)
     # so that _search can enforce the backtracking-depth limit.
@@ -2250,33 +2438,36 @@ def route_node_sequence(
         if segment_target_lengths is not None:
             segment_target_length = segment_target_lengths[segment_index]
 
-        try:
-            fill_hard_excluded, fill_soft_excluded = _segment_excluded_fill(
-                segment_fill_zones, segment_index, valid_cells, highway_cells,
-            )
-            candidate_paths = _segment_candidate_paths(
-                valid_cells=segment_valid_cells,
-                start=start,
-                goal=goal,
-                penalty_cells=local_penalties,
-                penalty_weight=penalty_weight,
-                allow_diagonals=allow_diagonals,
-                target_length=segment_target_length,
-                self_avoid_radius=max(0, blocked_radius),
-                vertical_move_penalty=vertical_move_penalty,
-                roominess_map=roominess_map,
-                bottleneck_threshold=bottleneck_threshold,
-                boundary_penalty_cells=boundary_penalty_cells,
-                boundary_penalty_weight=0.2,
-                beam_width=seg_beam_width,
-                beam_max_waypoints=seg_beam_max_waypoints,
-                deadline=deadline,
-                min_self_spacing=min_self_spacing,
-                fill_hard_excluded_cells=fill_hard_excluded,
-                fill_soft_excluded_cells=fill_soft_excluded,
-            )
-        except RoutingError:
-            candidate_paths = []
+        if segment_index in fixed_terminal_segments:
+            candidate_paths = [fixed_terminal_segments[segment_index]]
+        else:
+            try:
+                fill_hard_excluded, fill_soft_excluded = _segment_excluded_fill(
+                    segment_fill_zones, segment_index, valid_cells, highway_cells,
+                )
+                candidate_paths = _segment_candidate_paths(
+                    valid_cells=segment_valid_cells,
+                    start=start,
+                    goal=goal,
+                    penalty_cells=local_penalties,
+                    penalty_weight=penalty_weight,
+                    allow_diagonals=allow_diagonals,
+                    target_length=segment_target_length,
+                    self_avoid_radius=max(0, blocked_radius),
+                    vertical_move_penalty=vertical_move_penalty,
+                    roominess_map=roominess_map,
+                    bottleneck_threshold=bottleneck_threshold,
+                    boundary_penalty_cells=boundary_penalty_cells,
+                    boundary_penalty_weight=0.2,
+                    beam_width=seg_beam_width,
+                    beam_max_waypoints=seg_beam_max_waypoints,
+                    deadline=deadline,
+                    min_self_spacing=min_self_spacing,
+                    fill_hard_excluded_cells=fill_hard_excluded,
+                    fill_soft_excluded_cells=fill_soft_excluded,
+                )
+            except RoutingError:
+                candidate_paths = []
 
         # Pre-compute blocked zone from non-adjacent prior segments
         # (segments that share no start/goal node with the current one).
@@ -2397,4 +2588,19 @@ def route_node_sequence(
             "No route found between {} and {}.".format(start, goal)
         )
 
-    return _search(0, set(), set(), segments, {})
+    initial_segments: List[List[GridIndex]] = list(segments)
+    initial_penalties: Set[GridIndex] = set(fixed_initial_penalty_cells)
+    initial_blocked: Set[GridIndex] = set(fixed_initial_blocked_cells)
+    initial_approach = dict(fixed_initial_approach)
+    search_start_index = 0
+    if 0 in fixed_terminal_segments:
+        initial_segments.append(fixed_terminal_segments[0])
+        search_start_index = 1
+
+    return _search(
+        search_start_index,
+        initial_penalties,
+        initial_blocked,
+        initial_segments,
+        initial_approach,
+    )

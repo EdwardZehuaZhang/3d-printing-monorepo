@@ -311,6 +311,53 @@ def _greedy_target_order(
     return tuple(ordered)
 
 
+def _preferred_bottom_up_order(
+    touch_nodes: Sequence[TouchNodePlacement],
+) -> Tuple[int, ...]:
+    if not touch_nodes:
+        return ()
+
+    xs = [node.anchor_point.X for node in touch_nodes]
+    ys = [node.anchor_point.Y for node in touch_nodes]
+    min_x = min(xs)
+    max_x = max(xs)
+    min_y = min(ys)
+    max_y = max(ys)
+
+    def _edge_distance(index: int) -> float:
+        point = touch_nodes[index].anchor_point
+        return min(
+            abs(point.X - min_x),
+            abs(max_x - point.X),
+            abs(point.Y - min_y),
+            abs(max_y - point.Y),
+        )
+
+    z_values = [node.anchor_point.Z for node in touch_nodes]
+    all_same_z = (max(z_values) - min(z_values)) <= 1e-9
+
+    ordered_indices = list(range(len(touch_nodes)))
+    if all_same_z:
+        ordered_indices.sort(
+            key=lambda index: (
+                _edge_distance(index),
+                touch_nodes[index].anchor_point.X,
+                touch_nodes[index].anchor_point.Y,
+            )
+        )
+        return tuple(ordered_indices)
+
+    ordered_indices.sort(
+        key=lambda index: (
+            touch_nodes[index].anchor_point.Z,
+            _edge_distance(index),
+            touch_nodes[index].anchor_point.X,
+            touch_nodes[index].anchor_point.Y,
+        )
+    )
+    return tuple(ordered_indices)
+
+
 def _target_order_candidates(
     start: TerminalPlacement,
     touch_nodes: Sequence[TouchNodePlacement],
@@ -339,6 +386,11 @@ def _target_order_candidates(
 
     order_indices: List[Tuple[int, ...]] = []
     node_count = len(touch_nodes)
+
+    preferred_bottom_up = _preferred_bottom_up_order(touch_nodes)
+    if preferred_bottom_up:
+        order_indices.append(preferred_bottom_up)
+
     if node_count <= max_exact_nodes:
         order_indices.extend(tuple(order) for order in itertools.permutations(range(node_count)))
     else:
