@@ -1182,76 +1182,6 @@ def _draw_infeasible_internal_preview(
         )
 
 
-def _write_failure_debug(
-    diagnostics: Dict[str, object],
-    step: float,
-) -> None:
-    Rhino.RhinoApp.WriteLine("Routing debug (internal segment diagnostics):")
-
-    segment_index = diagnostics.get("segment_index")
-    start = diagnostics.get("start")
-    goal = diagnostics.get("goal")
-    failure_type = diagnostics.get("type")
-    Rhino.RhinoApp.WriteLine(
-        "  type={} segment={} start={} goal={}".format(
-            failure_type,
-            segment_index,
-            start,
-            goal,
-        )
-    )
-
-    def _fmt_value(key: str, suffix: str = "") -> str:
-        value = diagnostics.get(key)
-        if isinstance(value, (int, float)):
-            return "{:.1f}{}".format(float(value), suffix)
-        return "n/a"
-
-    Rhino.RhinoApp.WriteLine(
-        "  target={} achieved={} shortfall={} required={} direct={}".format(
-            _fmt_value("target_length_cells", " cells"),
-            _fmt_value("achieved_length_cells", " cells"),
-            _fmt_value("shortfall_cells", " cells"),
-            _fmt_value("required_length_cells", " cells"),
-            _fmt_value("direct_distance_cells", " cells"),
-        )
-    )
-
-    ratio = diagnostics.get("required_ratio")
-    if isinstance(ratio, (int, float)):
-        Rhino.RhinoApp.WriteLine("  strict_ratio={:.2f}".format(float(ratio)))
-
-    Rhino.RhinoApp.WriteLine(
-        "  domain valid={} blocked={} penalty={} candidates={} minCand={} maxCand={}".format(
-            diagnostics.get("segment_valid_cell_count", "n/a"),
-            diagnostics.get("current_blocked_cell_count", "n/a"),
-            diagnostics.get("current_penalty_cell_count", "n/a"),
-            diagnostics.get("candidate_path_count", "n/a"),
-            _fmt_value("candidate_min_length_cells", " cells"),
-            _fmt_value("candidate_max_length_cells", " cells"),
-        )
-    )
-
-    bridge_cells = diagnostics.get("bridge_path_cells")
-    bridge_len = len(bridge_cells) if isinstance(bridge_cells, list) else 0
-    Rhino.RhinoApp.WriteLine(
-        "  bridge_path_cells={} (~{:.1f} model-units)".format(
-            bridge_len,
-            bridge_len * step,
-        )
-    )
-
-    fill_count = diagnostics.get("fill_zone_cell_count")
-    fill_layers = diagnostics.get("fill_zone_layer_count")
-    Rhino.RhinoApp.WriteLine(
-        "  fill_zone_cells={} fill_zone_layers={} sampled_points={}".format(
-            fill_count if isinstance(fill_count, int) else "n/a",
-            fill_layers if isinstance(fill_layers, int) else "n/a",
-            len(diagnostics.get("fill_zone_sample_cells", [])) if isinstance(diagnostics.get("fill_zone_sample_cells"), list) else "n/a",
-        )
-    )
-
-
 def _cumulative_anchor_lengths(
     polyline_points: Sequence[rg.Point3d],
     anchor_points: Sequence[rg.Point3d],
@@ -1683,13 +1613,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                 min_self_spacing=min_self_spacing,
             )
         except RoutingError as error:
-            attempted_sequence = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
-            Rhino.RhinoApp.WriteLine(
-                "Order attempt failed: {} | reason: {}".format(
-                    " -> ".join(attempted_sequence),
-                    str(error),
-                )
-            )
             if first_failure_reason is None:
                 first_failure_reason = str(error)
                 first_failure_order = [node.label for node in ordered_touch_nodes]
@@ -1721,7 +1644,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             )
             if first_failure_diagnostics:
                 _draw_infeasible_internal_preview(doc, first_failure_diagnostics, grid)
-                _write_failure_debug(first_failure_diagnostics, step)
         else:
             Rhino.RhinoApp.WriteLine(
                 "No valid route could be found with the current geometry and spacing rules."

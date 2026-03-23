@@ -2524,11 +2524,6 @@ def route_node_sequence(
             except RoutingError:
                 candidate_paths = []
 
-        candidate_path_count = len(candidate_paths)
-        candidate_lengths = [_path_length(path) for path in candidate_paths]
-        candidate_max_length = max(candidate_lengths) if candidate_lengths else 0.0
-        candidate_min_length = min(candidate_lengths) if candidate_lengths else 0.0
-
         # Pre-compute blocked zone from non-adjacent prior segments
         # (segments that share no start/goal node with the current one).
         # The blocked_exemption_radius around start/goal allows A* to
@@ -2652,23 +2647,14 @@ def route_node_sequence(
                 "goal": goal,
                 "target_length_cells": target_length_value,
                 "achieved_length_cells": best_internal_length,
-                "shortfall_cells": max(0.0, target_length_value - best_internal_length),
                 "required_ratio": STRICT_INTERNAL_TARGET_RATIO,
                 "required_length_cells": strict_target_threshold,
-                "direct_distance_cells": _distance(start, goal),
-                "segment_valid_cell_count": len(segment_valid_cells),
-                "current_blocked_cell_count": len(current_blocked_cells),
-                "current_penalty_cell_count": len(current_penalty_cells),
-                "candidate_path_count": candidate_path_count,
-                "candidate_min_length_cells": candidate_min_length,
-                "candidate_max_length_cells": candidate_max_length,
                 "bridge_path_cells": bridge_paths.get(segment_index, []),
             }
             if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
                 own_zone = segment_fill_zones[segment_index]
                 failure_diagnostics["fill_zone_cell_count"] = len(own_zone)
                 failure_diagnostics["fill_zone_sample_cells"] = _sample_preview_cells(own_zone)
-                failure_diagnostics["fill_zone_layer_count"] = len({cell[2] for cell in own_zone})
             if node_labels is not None:
                 raise RoutingError(
                     "Internal pathway between {} and {} could not reach target length ({:.1f}/{:.1f} cells).".format(
@@ -2697,20 +2683,12 @@ def route_node_sequence(
                     "segment_index": segment_index,
                     "start": start,
                     "goal": goal,
-                    "direct_distance_cells": _distance(start, goal),
-                    "segment_valid_cell_count": len(segment_valid_cells),
-                    "current_blocked_cell_count": len(current_blocked_cells),
-                    "current_penalty_cell_count": len(current_penalty_cells),
-                    "candidate_path_count": candidate_path_count,
-                    "candidate_min_length_cells": candidate_min_length,
-                    "candidate_max_length_cells": candidate_max_length,
                     "bridge_path_cells": bridge_paths.get(segment_index, []),
                 }
                 if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
                     own_zone = segment_fill_zones[segment_index]
                     failure_diagnostics["fill_zone_cell_count"] = len(own_zone)
                     failure_diagnostics["fill_zone_sample_cells"] = _sample_preview_cells(own_zone)
-                    failure_diagnostics["fill_zone_layer_count"] = len({cell[2] for cell in own_zone})
             raise RoutingError(
                 "Pathway between {} and {} could not fit the current routing constraints.".format(
                     node_labels[segment_index],
@@ -2725,20 +2703,12 @@ def route_node_sequence(
                 "segment_index": segment_index,
                 "start": start,
                 "goal": goal,
-                "direct_distance_cells": _distance(start, goal),
-                "segment_valid_cell_count": len(segment_valid_cells),
-                "current_blocked_cell_count": len(current_blocked_cells),
-                "current_penalty_cell_count": len(current_penalty_cells),
-                "candidate_path_count": candidate_path_count,
-                "candidate_min_length_cells": candidate_min_length,
-                "candidate_max_length_cells": candidate_max_length,
                 "bridge_path_cells": bridge_paths.get(segment_index, []),
             }
             if segment_fill_zones is not None and segment_index < len(segment_fill_zones):
                 own_zone = segment_fill_zones[segment_index]
                 failure_diagnostics["fill_zone_cell_count"] = len(own_zone)
                 failure_diagnostics["fill_zone_sample_cells"] = _sample_preview_cells(own_zone)
-                failure_diagnostics["fill_zone_layer_count"] = len({cell[2] for cell in own_zone})
         raise RoutingError(
             "No route found between {} and {}.".format(start, goal),
             diagnostics=failure_diagnostics,
