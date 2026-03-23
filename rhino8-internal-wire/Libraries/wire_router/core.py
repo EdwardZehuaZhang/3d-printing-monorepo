@@ -652,6 +652,47 @@ def _cross_segment_near_approach(
     return False
 
 
+def _has_endpoint_keepout_reentry(
+    path: Sequence[GridIndex],
+    start: GridIndex,
+    goal: GridIndex,
+    radius: int,
+) -> bool:
+    """Return True when a routed segment re-enters its own endpoint keepout.
+
+    A valid segment may begin inside the start-node keepout and end inside the
+    goal-node keepout, but once it leaves either endpoint keepout it should not
+    return to that same endpoint zone. Re-entry creates a loop near the node and
+    can short the pathway through the same touch node volume.
+    """
+    if radius <= 0 or len(path) < 3:
+        return False
+
+    start_zone = dilate_cells({start}, radius)
+    goal_zone = dilate_cells({goal}, radius)
+
+    # Ignore overlap between endpoint keepouts to avoid false positives when
+    # nodes are very close.
+    start_only = start_zone - goal_zone
+    goal_only = goal_zone - start_zone
+
+    if start_only:
+        index = 0
+        while index < len(path) and path[index] in start_only:
+            index += 1
+        if any(cell in start_only for cell in path[index:]):
+            return True
+
+    if goal_only:
+        index = len(path) - 1
+        while index >= 0 and path[index] in goal_only:
+            index -= 1
+        if any(cell in goal_only for cell in path[: index + 1]):
+            return True
+
+    return False
+
+
 def _approach_direction(
     path: Sequence[GridIndex],
     from_end: bool,
@@ -2126,6 +2167,18 @@ def route_node_sequence(
             # segments that do not directly connect to start or goal.
             if non_adjacent_blocked is not None:
                 if any(cell in non_adjacent_blocked for cell in routed_segment):
+                    continue
+
+            # Reject segments that leave an endpoint keepout and then loop back
+            # into that same endpoint zone. This avoids routing through the
+            # same touch-node volume and creating accidental shorts.
+            if node_keepout_radius > 0:
+                if _has_endpoint_keepout_reentry(
+                    routed_segment,
+                    start,
+                    goal,
+                    node_keepout_radius,
+                ):
                     continue
 
             # Post-hoc per-node keepout check: the endpoint_safe exemption

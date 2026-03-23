@@ -1028,7 +1028,8 @@ def _segment_solids(
         if pipes:
             solids.extend(pipe for pipe in pipes if pipe is not None and pipe.IsValid)
 
-    junction_radius = max(radius_xy, radius_z)
+    # Keep junction spheres at horizontal radius to avoid oversized overlap/shorting at joints.
+    junction_radius = radius_xy
     for point in points:
         sphere = rg.Sphere(point, junction_radius).ToBrep()
         if sphere is not None and sphere.IsValid:
