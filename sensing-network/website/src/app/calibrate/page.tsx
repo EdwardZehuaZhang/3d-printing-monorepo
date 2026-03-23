@@ -27,7 +27,12 @@ const STATUS_CONFIG: Record<
 type CalibrationConfig = Record<string, number>;
 
 export default function CalibratePage() {
-  const [numNodes, setNumNodes] = useState(20);
+  const [numNodes, setNumNodes] = useState(4);
+  const [baudRate, setBaudRate] = useState(115200);
+
+  // Flash state
+  const [isFlashing, setIsFlashing] = useState(false);
+  const [flashStatus, setFlashStatus] = useState<string | null>(null);
 
   // Collection state
   const [isCollecting, setIsCollecting] = useState(false);
@@ -51,6 +56,10 @@ export default function CalibratePage() {
   const [liveValues, setLiveValues] = useState<number[]>([]);
   const MAX_LIVE = 100;
 
+  // Serial monitor log
+  const [serialLog, setSerialLog] = useState<string[]>([]);
+  const MAX_LOG = 200;
+
   // Current collecting node ref (for use inside serial callback)
   const currentNodeRef = useRef(-1);
   const modeRef = useRef<"idle" | "collection" | "detection">("idle");
@@ -60,7 +69,33 @@ export default function CalibratePage() {
 
   const handleSerialData = useCallback(
     (raw: string) => {
-      const value = parseFloat(raw);
+      // Log all serial output to the serial monitor
+      setSerialLog((prev) => {
+        const next = [...prev, raw];
+        return next.length > MAX_LOG ? next.slice(-MAX_LOG) : next;
+      });
+
+      // Try to parse as a plain number (wifi_connection sketch)
+      // or extract the last number from debug lines (four_node_sensor sketch)
+      let value = NaN;
+      const plain = parseFloat(raw);
+      if (!isNaN(plain) && raw.trim() === String(plain)) {
+        // Plain numeric line (e.g. "1234")
+        value = plain;
+      } else {
+        // Try to extract a numeric value — look for known patterns
+        // e.g. "sum=1234" or last number on the line
+        const sumMatch = raw.match(/sum[=:]\s*(-?\d+)/);
+        if (sumMatch) {
+          value = parseFloat(sumMatch[1]);
+        } else {
+          // Fall back to last number on the line
+          const nums = raw.match(/-?\d+\.?\d*/g);
+          if (nums && nums.length > 0) {
+            value = parseFloat(nums[nums.length - 1]);
+          }
+        }
+      }
       if (isNaN(value)) return;
 
       // Update live chart
@@ -124,7 +159,7 @@ export default function CalibratePage() {
   );
 
   const serial = useWebSerial({
-    baudRate: 9600,
+    baudRate,
     onData: handleSerialData,
   });
 
@@ -259,68 +294,154 @@ export default function CalibratePage() {
       .join(" ");
   })();
 
+  // Node colors for the collected data chart
+  const NODE_COLORS = [
+    "#1245A8", "#2563eb", "#16a34a", "#d97706",
+    "#dc2626", "#7c3aed", "#0891b2", "#db2777",
+    "#65a30d", "#ea580c", "#4f46e5", "#0d9488",
+  ];
+
+  // Build per-node SVG paths from collected data
+  const collectedChartData = (() => {
+    if (collectingData.length < 2) return null;
+
+    const allValues = collectingData.map((d) => d.value);
+    const minVal = Math.min(...allValues);
+    const maxVal = Math.max(...allValues);
+    const rangeVal = maxVal - minVal || 1;
+    const maxTime = Math.max(...collectingData.map((d) => d.time));
+    const minTime = Math.min(...collectingData.map((d) => d.time));
+    const rangeTime = maxTime - minTime || 1;
+
+    // Group by node
+    const byNode: Record<number, { time: number; value: number }[]> = {};
+    for (const d of collectingData) {
+      if (!byNode[d.node]) byNode[d.node] = [];
+      byNode[d.node].push(d);
+    }
+
+    const paths: { node: number; color: string; d: string }[] = [];
+    for (const nodeStr in byNode) {
+      const node = parseInt(nodeStr);
+      const points = byNode[node];
+      if (points.length < 2) continue;
+
+      const pathD = points
+        .map((p, i) => {
+          const x = ((p.time - minTime) / rangeTime) * 100;
+          const y = 100 - ((p.value - minVal) / rangeVal) * 100;
+          return `${i === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+        })
+        .join(" ");
+
+      paths.push({
+        node,
+        color: NODE_COLORS[((node % NODE_COLORS.length) + NODE_COLORS.length) % NODE_COLORS.length],
+        d: pathD,
+      });
+    }
+
+    return paths;
+  })();
+
   return (
     <div>
       {/* Header */}
       <section className="border-b-2 border-border">
         <div className="mx-auto max-w-6xl px-6 py-12">
-          <motion.div initial="hidden" animate="visible">
-            <motion.div
-              variants={fadeUp}
-              custom={0}
-              className="mb-3 flex items-center gap-3"
-            >
-              <span className="text-xs font-semibold uppercase tracking-widest text-primary">
-                Calibration Tool
-              </span>
-              <div className="flex items-center gap-2 rounded-full border border-border bg-surface-inset px-3 py-1">
-                <span className="text-xs text-text-secondary">
-                  {statusInfo.label}
-                </span>
-                <div className={`h-2 w-2 rounded-full ${statusInfo.color}`} />
-              </div>
-            </motion.div>
-            <motion.h1
-              variants={fadeUp}
-              custom={1}
-              className="mb-2 text-3xl font-bold tracking-tight"
-            >
-              <span className="text-primary">//</span> Calibration Tool
-            </motion.h1>
-            <motion.p
-              variants={fadeUp}
-              custom={2}
-              className="max-w-xl text-sm text-text-secondary"
-            >
-              Connect your SenseBoard via USB to get started. The tool will
-              collect capacitive data from each node and generate a calibration
-              profile.
-            </motion.p>
+          <motion.div initial="hidden" animate="visible" className="flex items-start justify-between gap-6">
+            {/* Left: title & description */}
+            <div>
+              <motion.h1
+                variants={fadeUp}
+                custom={1}
+                className="mb-2 text-3xl font-bold tracking-tight"
+              >
+                <span className="text-primary">//</span> Calibration Tool
+              </motion.h1>
+              <motion.p
+                variants={fadeUp}
+                custom={2}
+                className="max-w-2xl text-sm text-text-secondary"
+              >
+                Connect your SenseBoard via USB to get started. The tool will
+                collect capacitive data from each node and generate a calibration
+                profile.
+              </motion.p>
+            </div>
 
-            {/* Connect / Disconnect button */}
-            <motion.div variants={fadeUp} custom={3} className="mt-4 flex items-center gap-3">
-              {serial.status === "connected" ? (
-                <button
-                  onClick={serial.disconnect}
-                  className="rounded-lg border-2 border-danger bg-danger/10 px-4 py-2 text-xs font-semibold uppercase tracking-widest text-danger transition-all hover:-translate-y-0.5 hover:bg-danger/20"
-                >
-                  Disconnect
-                </button>
-              ) : (
-                <button
-                  onClick={serial.connect}
-                  disabled={!serial.isSupported || serial.status === "connecting"}
-                  className="rounded-lg border-2 border-primary bg-primary px-4 py-2 text-xs font-semibold uppercase tracking-widest text-white transition-all hover:-translate-y-0.5 hover:bg-primary-dark hover:shadow-lg hover:shadow-primary/20 disabled:opacity-50 disabled:hover:translate-y-0"
-                >
-                  {serial.status === "connecting"
-                    ? "Connecting..."
-                    : "Connect Arduino"}
-                </button>
+            {/* Right: connect / disconnect button */}
+            <motion.div variants={fadeUp} custom={1} className="flex shrink-0 flex-col items-end gap-2 pt-6">
+              <div className="flex items-center gap-2">
+                {serial.status !== "connected" && !isFlashing && (
+                  <select
+                    value={baudRate}
+                    onChange={(e) => setBaudRate(parseInt(e.target.value))}
+                    className="appearance-none rounded-lg border-2 border-border bg-surface-inset bg-[url('data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236b7280%22%20d%3D%22M3%205l3%203%203-3%22%2F%3E%3C%2Fsvg%3E')] bg-[length:12px] bg-[position:right_8px_center] bg-no-repeat py-2 pl-3 pr-8 text-xs font-semibold focus:border-primary focus:outline-none"
+                  >
+                    <option value={9600}>9600</option>
+                    <option value={115200}>115200</option>
+                  </select>
+                )}
+                {serial.status === "connected" ? (
+                  <button
+                    onClick={serial.disconnect}
+                    className="rounded-lg border-2 border-danger bg-danger/10 px-4 py-2 text-xs font-semibold uppercase tracking-widest text-danger transition-all hover:-translate-y-0.5 hover:bg-danger/20"
+                  >
+                    Disconnect
+                  </button>
+                ) : (
+                  <button
+                    onClick={async () => {
+                      setIsFlashing(true);
+                      setFlashStatus("Compiling & uploading sketch...");
+                      try {
+                        const res = await fetch("/api/flash", { method: "POST" });
+                        const data = await res.json();
+                        if (!res.ok) {
+                          setFlashStatus(`Flash failed: ${data.error}`);
+                          setIsFlashing(false);
+                          return;
+                        }
+                        setFlashStatus("Flashed! Waiting for board to restart...");
+                        // Arduino resets after flash — give it time to boot
+                        await new Promise((r) => setTimeout(r, 2500));
+                        setFlashStatus("Connecting to serial...");
+                        await serial.connect();
+                        setFlashStatus(null);
+                      } catch (err) {
+                        setFlashStatus(
+                          `Error: ${err instanceof Error ? err.message : "Unknown error"}`
+                        );
+                      } finally {
+                        setIsFlashing(false);
+                      }
+                    }}
+                    disabled={!serial.isSupported || serial.status === "connecting" || isFlashing}
+                    className="rounded-lg border-2 border-primary bg-primary px-4 py-2 text-xs font-semibold uppercase tracking-widest text-white transition-all hover:-translate-y-0.5 hover:bg-primary-dark hover:shadow-lg hover:shadow-primary/20 disabled:opacity-50 disabled:hover:translate-y-0"
+                  >
+                    {isFlashing
+                      ? "Flashing..."
+                      : serial.status === "connecting"
+                        ? "Connecting..."
+                        : "Flash & Connect"}
+                  </button>
+                )}
+              </div>
+
+              {isFlashing && flashStatus && (
+                <span className="text-xs font-medium text-warning animate-pulse">
+                  {flashStatus}
+                </span>
+              )}
+
+              {!isFlashing && flashStatus && (
+                <span className="text-xs text-danger">{flashStatus}</span>
               )}
 
               {!serial.isSupported && (
                 <span className="text-xs text-danger">
-                  Web Serial API not supported. Use Chrome or Edge.
+                  Web Serial not supported. Use Chrome or Edge.
                 </span>
               )}
 
@@ -413,16 +534,14 @@ export default function CalibratePage() {
                     Collection complete — config downloaded
                   </motion.p>
                 )}
-                {!isCollecting && !collectionComplete && (
+                {!isCollecting && !collectionComplete && serial.status === "connected" && (
                   <motion.p
                     key="waiting"
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     className="mb-3 text-sm text-text-secondary"
                   >
-                    {serial.status === "connected"
-                      ? "Ready — click Start Capture to begin"
-                      : "Connect the SenseBoard to get started"}
+                    Ready — click Start Capture to begin
                   </motion.p>
                 )}
               </AnimatePresence>
@@ -450,9 +569,49 @@ export default function CalibratePage() {
                 </div>
               </div>
 
-              {/* Live sensor chart */}
+              {/* Sensor chart */}
               <div className="flex min-h-[300px] items-center justify-center rounded-xl border border-border bg-surface-inset p-4">
-                {liveValues.length > 1 ? (
+                {collectionComplete && collectedChartData && collectedChartData.length > 0 ? (
+                  /* Collected data chart — shown after collection completes */
+                  <div className="h-full w-full">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-[10px] font-medium uppercase tracking-widest text-text-tertiary">
+                        Calibration Data
+                      </span>
+                      <div className="flex flex-wrap gap-3">
+                        {collectedChartData.map(({ node, color }) => (
+                          <span
+                            key={node}
+                            className="flex items-center gap-1 text-[10px] font-medium"
+                          >
+                            <span
+                              className="inline-block h-2 w-2 rounded-full"
+                              style={{ backgroundColor: color }}
+                            />
+                            {node === -1 ? "Baseline" : `Node ${node}`}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <svg
+                      viewBox="0 0 100 100"
+                      preserveAspectRatio="none"
+                      className="h-[260px] w-full"
+                    >
+                      {collectedChartData.map(({ node, color, d }) => (
+                        <path
+                          key={node}
+                          d={d}
+                          fill="none"
+                          stroke={color}
+                          strokeWidth="0.4"
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      ))}
+                    </svg>
+                  </div>
+                ) : liveValues.length > 1 ? (
+                  /* Live sparkline — shown during collection */
                   <div className="h-full w-full">
                     <div className="mb-2 flex items-center justify-between">
                       <span className="text-[10px] font-medium uppercase tracking-widest text-text-tertiary">
@@ -477,18 +636,15 @@ export default function CalibratePage() {
                     </svg>
                   </div>
                 ) : (
+                  /* Empty state */
                   <div className="text-center">
                     <div className="mb-3 text-4xl text-text-tertiary">
-                      {serial.status === "connected" ? "~" : "&#x25CE;"}
+                      {serial.status === "connected" ? "~" : "\u25CE"}
                     </div>
                     <p className="text-sm text-text-tertiary">
                       {serial.status === "connected"
                         ? "Waiting for sensor data..."
                         : "Sensor data will appear here during capture"}
-                    </p>
-                    <p className="mt-1 text-xs text-text-tertiary">
-                      {serial.status !== "connected" &&
-                        "Connect SenseBoard via USB to begin"}
                     </p>
                   </div>
                 )}
@@ -557,12 +713,48 @@ export default function CalibratePage() {
             </motion.div>
           </div>
 
+          {/* Serial Monitor */}
+          {serial.status === "connected" && (
+            <motion.div
+              initial="hidden"
+              animate="visible"
+              variants={fadeUp}
+              custom={2}
+              className="mt-6 rounded-2xl border-2 border-border border-t-[3px] border-t-text-tertiary bg-surface p-4"
+            >
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-[11px] font-medium uppercase tracking-widest text-text-tertiary">
+                  Serial Monitor ({baudRate} baud)
+                </span>
+                <button
+                  onClick={() => setSerialLog([])}
+                  className="text-[10px] font-medium uppercase tracking-widest text-text-tertiary hover:text-text-secondary"
+                >
+                  Clear
+                </button>
+              </div>
+              <div className="max-h-[200px] overflow-y-auto rounded-lg bg-[#1a1a2e] p-3 font-mono text-xs leading-relaxed text-green-400">
+                {serialLog.length === 0 ? (
+                  <span className="text-text-tertiary">
+                    Waiting for data from Arduino...
+                  </span>
+                ) : (
+                  serialLog.map((line, i) => (
+                    <div key={i} className="whitespace-pre-wrap break-all">
+                      {line}
+                    </div>
+                  ))
+                )}
+              </div>
+            </motion.div>
+          )}
+
           {/* Info note */}
           <motion.div
             initial="hidden"
             animate="visible"
             variants={fadeUp}
-            custom={2}
+            custom={3}
             className="mt-6 rounded-xl border-2 border-dashed border-secondary/30 bg-secondary/5 p-6"
           >
             <p className="mb-1 text-sm font-semibold text-secondary">
@@ -578,10 +770,10 @@ export default function CalibratePage() {
             </p>
             <div className="mt-4 h-px bg-secondary/20" />
             <p className="mt-3 text-xs leading-relaxed text-text-tertiary">
-              <strong className="text-text-secondary">Browser requirement:</strong>{" "}
-              This tool uses the Web Serial API to communicate directly with your
-              Arduino over USB — no backend server or Arduino IDE needed.
-              Supported in Chrome and Edge (version 89+).
+              <strong className="text-text-secondary">No Arduino IDE needed:</strong>{" "}
+              Clicking &ldquo;Flash &amp; Connect&rdquo; compiles and uploads the
+              sensor sketch automatically, then opens a serial connection — all
+              from the browser. Supported in Chrome and Edge (version 89+).
             </p>
           </motion.div>
         </div>

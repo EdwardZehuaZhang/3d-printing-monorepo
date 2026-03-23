@@ -33,6 +33,8 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
     let buffer = "";
     readingRef.current = true;
 
+    console.log("[WebSerial] Read loop started");
+
     while (port.readable && readingRef.current) {
       const reader = port.readable.getReader();
       readerRef.current = reader;
@@ -40,9 +42,13 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
       try {
         while (readingRef.current) {
           const { value, done } = await reader.read();
-          if (done) break;
+          if (done) {
+            console.log("[WebSerial] Reader done");
+            break;
+          }
 
-          buffer += decoder.decode(value, { stream: true });
+          const chunk = decoder.decode(value, { stream: true });
+          buffer += chunk;
 
           // Split on newlines — Arduino sends "\r\n" delimited values
           const lines = buffer.split(/\r?\n/);
@@ -58,7 +64,7 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
         }
       } catch (err) {
         if (readingRef.current) {
-          console.error("Serial read error:", err);
+          console.error("[WebSerial] Read error:", err);
           setError(err instanceof Error ? err.message : "Read error");
           setStatus("error");
         }
@@ -67,6 +73,8 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
         readerRef.current = null;
       }
     }
+
+    console.log("[WebSerial] Read loop ended");
   }, []);
 
   const connect = useCallback(async () => {
@@ -80,13 +88,14 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
       setStatus("connecting");
       setError(null);
 
-      // Prompt user to select serial port — filters for Arduino Uno R4 WiFi
-      // VID 0x2341 = Arduino, but we also allow any port selection
-      const port = await navigator.serial.requestPort({
-        filters: [
-          { usbVendorId: 0x2341 }, // Arduino
-        ],
-      });
+      console.log("[WebSerial] Opening port picker...");
+
+      // No filter — UNO R4 WiFi uses Renesas chip, not classic Arduino VID
+      const port = await navigator.serial.requestPort();
+
+      console.log("[WebSerial] Port selected, opening at", baudRate, "baud...");
+      const info = port.getInfo();
+      console.log("[WebSerial] Port info:", info);
 
       await port.open({
         baudRate,
@@ -96,6 +105,8 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
         flowControl: "none",
       });
 
+      console.log("[WebSerial] Port opened successfully");
+
       portRef.current = port;
       setStatus("connected");
 
@@ -104,9 +115,10 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
     } catch (err) {
       if (err instanceof DOMException && err.name === "NotFoundError") {
         // User cancelled the picker — not an error
+        console.log("[WebSerial] User cancelled port picker");
         setStatus("disconnected");
       } else {
-        console.error("Serial connect error:", err);
+        console.error("[WebSerial] Connect error:", err);
         setError(err instanceof Error ? err.message : "Connection failed");
         setStatus("error");
       }
@@ -114,6 +126,7 @@ export function useWebSerial({ baudRate = 9600, onData }: UseWebSerialOptions = 
   }, [isSupported, baudRate, readLoop]);
 
   const disconnect = useCallback(async () => {
+    console.log("[WebSerial] Disconnecting...");
     readingRef.current = false;
 
     if (readerRef.current) {
