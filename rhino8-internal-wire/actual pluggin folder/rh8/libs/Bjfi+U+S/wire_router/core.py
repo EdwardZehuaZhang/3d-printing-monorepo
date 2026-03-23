@@ -1485,13 +1485,14 @@ def _segment_candidate_paths(
 
                 cleaned_candidates = [_remove_path_reversals(path) for path in candidates]
                 unique_candidates = _dedupe_paths(cleaned_candidates)
-                return _sort_candidate_paths(
+                strict_sorted = _sort_candidate_paths(
                     unique_candidates,
                     target_length,
                     roominess_map=roominess_map,
                     valid_cells=valid_cells,
                     bottleneck_threshold=bottleneck_threshold,
                 )[:max_candidates]
+                return strict_sorted
             fill_headroom = 0
             headroom_threshold = max(
                 AGGRESSIVE_HEADROOM_MIN_CELLS,
@@ -2259,20 +2260,15 @@ def route_node_sequence(
                 dilate_cells({node}, node_keepout_radius)
             )
 
-    # Adaptive beam search: reduce beam width and waypoint depth for
-    # high node counts to keep per-segment candidate generation fast.
-    if num_segments > 10:
-        seg_beam_width = 3
-        seg_beam_max_waypoints = 1
-    elif num_segments > 8:
-        seg_beam_width = 4
-        seg_beam_max_waypoints = 2
-    else:
-        seg_beam_width = 8
-        seg_beam_max_waypoints = 3
-    if segment_target_lengths is not None:
-        seg_beam_width = min(12, seg_beam_width + AGGRESSIVE_BEAM_WIDTH_BONUS)
-        seg_beam_max_waypoints = min(4, seg_beam_max_waypoints + AGGRESSIVE_BEAM_WAYPOINT_BONUS)
+    seg_beam_width = 8
+    seg_beam_max_waypoints = 3
+    seg_max_candidates = 8
+    if strict_internal_best_effort:
+        seg_beam_width = max(seg_beam_width, 18)
+        seg_beam_max_waypoints = max(seg_beam_max_waypoints, 5)
+        seg_max_candidates = 28
+    elif segment_target_lengths is not None:
+        seg_max_candidates = 12
 
     # Maximum number of segments to backtrack when a downstream segment
     # fails.  Deep backtracking is exponentially expensive and rarely
@@ -2314,6 +2310,7 @@ def route_node_sequence(
     bridge_paths: Dict[int, List[GridIndex]] = {}
     bridge_conduit_cells: Set[GridIndex] = set()
     bridge_conduit_cells_by_segment: Dict[int, Set[GridIndex]] = {}
+    terminal_bridge_conduit_cells: Set[GridIndex] = set()
     terminal_bridge_blocked_cells: Set[GridIndex] = set()
 
     edge_roominess_cutoff = max(1, bottleneck_threshold)
@@ -2389,6 +2386,12 @@ def route_node_sequence(
                 bridge_conduit_cells_by_segment[segment_index] = segment_conduit_cells
                 bridge_conduit_cells.update(segment_conduit_cells)
 
+    if bridge_conduit_cells_by_segment and terminal_segment_indices:
+        for terminal_segment_index in terminal_segment_indices:
+            terminal_bridge_conduit_cells.update(
+                bridge_conduit_cells_by_segment.get(terminal_segment_index, set())
+            )
+
     for segment_index in terminal_segment_indices:
         bridge_path = bridge_paths.get(segment_index)
         if bridge_path is None:
@@ -2410,8 +2413,8 @@ def route_node_sequence(
         if arrival_dir is not None:
             fixed_initial_approach[goal] = arrival_dir
 
-    if has_internal_segments and bridge_conduit_cells:
-        fixed_initial_blocked_cells.update(bridge_conduit_cells)
+    if has_internal_segments and terminal_bridge_conduit_cells:
+        fixed_initial_blocked_cells.update(terminal_bridge_conduit_cells)
 
     if has_internal_segments and segment_fill_zones is not None and bridge_conduit_cells:
         for segment_index in internal_segment_indices:
@@ -2521,6 +2524,8 @@ def route_node_sequence(
             and segment_target_length is not None
             and segment_target_length > 0.0
         )
+        target_length_value = float(segment_target_length or 0.0)
+        direct_distance = _distance(start, goal)
         strict_target_threshold = (
             float(segment_target_length) * STRICT_INTERNAL_TARGET_RATIO
             if strict_internal_target
@@ -2531,20 +2536,31 @@ def route_node_sequence(
             candidate_paths = [fixed_terminal_segments[segment_index]]
         else:
             try:
+                segment_bridge_path = bridge_paths.get(segment_index)
+                if segment_bridge_path is None:
+                    segment_bridge_path = astar_path(
+                        valid_cells=segment_valid_cells,
+                        start=start,
+                        goal=goal,
+                        penalty_cells=set(),
+                        penalty_weight=0.0,
+                        allow_diagonals=allow_diagonals,
+                        vertical_move_penalty=0.0,
+                        boundary_penalty_cells=None,
+                        boundary_penalty_weight=0.0,
+                    )
+                    bridge_paths[segment_index] = segment_bridge_path
+
                 fill_hard_excluded, fill_soft_excluded = _segment_excluded_fill(
                     segment_fill_zones, segment_index, valid_cells, highway_cells,
                     strict_layercake_mode=strict_internal_target,
                 )
-                if bridge_conduit_cells:
-                    other_segment_bridge_cells = set(bridge_conduit_cells)
-                    other_segment_bridge_cells.difference_update(
-                        bridge_conduit_cells_by_segment.get(segment_index, set())
-                    )
+                if terminal_bridge_conduit_cells:
                     endpoint_bridge_safe = dilate_cells(
                         {start, goal}, bridge_endpoint_exemption_radius
                     )
                     fill_hard_excluded.update(
-                        other_segment_bridge_cells - endpoint_bridge_safe
+                        terminal_bridge_conduit_cells - endpoint_bridge_safe
                     )
                 if per_node_keepout:
                     for node in node_sequence:
@@ -2578,13 +2594,14 @@ def route_node_sequence(
                     boundary_penalty_weight=0.2,
                     beam_width=seg_beam_width,
                     beam_max_waypoints=seg_beam_max_waypoints,
+                    max_candidates=seg_max_candidates,
                     deadline=deadline,
                     min_self_spacing=min_self_spacing,
                     fill_hard_excluded_cells=fill_hard_excluded,
                     fill_soft_excluded_cells=fill_soft_excluded,
                     strict_layercake_mode=strict_internal_target,
                     strict_completion_ratio=STRICT_INTERNAL_TARGET_RATIO,
-                    preferred_pipe_path=bridge_paths.get(segment_index),
+                    preferred_pipe_path=segment_bridge_path,
                 )
             except RoutingError:
                 candidate_paths = []
@@ -2653,25 +2670,16 @@ def route_node_sequence(
             # physically arrive/depart at the shared node while still
             # catching near-node overlaps that violate the 1 mm gap.
             if blocked_radius > 0 and current_segments:
-                if strict_internal_target and routed_length + 1e-9 >= strict_target_threshold:
-                    pass
-                else:
-                    prev_seg = current_segments[-1]
-                    shared = start
-                    cross_segment_radius = blocked_radius
-                    cross_segment_node_adjacency = max(2, blocked_radius + 1)
-                    if strict_internal_target and routed_length + 1e-9 >= strict_target_threshold:
-                        cross_segment_radius = max(1, blocked_radius - 1)
-                        cross_segment_node_adjacency = max(
-                            cross_segment_node_adjacency,
-                            blocked_exemption_radius + 4,
-                        )
-                    if _cross_segment_near_approach(
-                        prev_seg, routed_segment, cross_segment_radius, shared,
-                        node_adjacency=cross_segment_node_adjacency,
-                    ):
-                        rejection_counts["cross_segment_overlap"] += 1
-                        continue
+                prev_seg = current_segments[-1]
+                shared = start
+                cross_segment_radius = blocked_radius
+                cross_segment_node_adjacency = max(2, blocked_radius + 1)
+                if _cross_segment_near_approach(
+                    prev_seg, routed_segment, cross_segment_radius, shared,
+                    node_adjacency=cross_segment_node_adjacency,
+                ):
+                    rejection_counts["cross_segment_overlap"] += 1
+                    continue
 
             # Non-adjacent segment overlap check: reject candidates that
             # wander through the exemption zone into territory blocked by
@@ -2721,9 +2729,11 @@ def route_node_sequence(
                     rejection_counts["non_endpoint_node_keepout"] += 1
                     continue
 
+            routed_length = _path_length(routed_segment)
+
             accepted_candidate_length = max(
                 accepted_candidate_length,
-                _path_length(routed_segment),
+                routed_length,
             )
 
             next_penalty_cells = set(current_penalty_cells)
@@ -2797,7 +2807,6 @@ def route_node_sequence(
             raise last_error
 
         if strict_internal_target:
-            target_length_value = float(segment_target_length or 0.0)
             failure_diagnostics: Dict[str, object] = {
                 "type": "strict_internal_target_failure",
                 "segment_index": segment_index,
@@ -2808,7 +2817,7 @@ def route_node_sequence(
                 "shortfall_cells": max(0.0, target_length_value - best_internal_length),
                 "required_ratio": STRICT_INTERNAL_TARGET_RATIO,
                 "required_length_cells": strict_target_threshold,
-                "direct_distance_cells": _distance(start, goal),
+                "direct_distance_cells": direct_distance,
                 "segment_valid_cell_count": len(segment_valid_cells),
                 "current_blocked_cell_count": len(current_blocked_cells),
                 "current_penalty_cell_count": len(current_penalty_cells),

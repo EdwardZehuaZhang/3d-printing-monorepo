@@ -1320,128 +1320,6 @@ def _waypoint_chain_spread(
     )
 
 
-def _segment_progress_ratio(
-    point: GridIndex,
-    start: GridIndex,
-    goal: GridIndex,
-) -> float:
-    sx, sy, sz = (float(value) for value in start)
-    gx, gy, gz = (float(value) for value in goal)
-    px, py, pz = (float(value) for value in point)
-
-    vx = gx - sx
-    vy = gy - sy
-    vz = gz - sz
-    wx = px - sx
-    wy = py - sy
-    wz = pz - sz
-    length_sq = (vx * vx) + (vy * vy) + (vz * vz)
-    if length_sq <= 1e-9:
-        return 0.5
-    projection = ((wx * vx) + (wy * vy) + (wz * vz)) / length_sq
-    return max(0.0, min(1.0, projection))
-
-
-def _segment_side_sign(
-    point: GridIndex,
-    start: GridIndex,
-    goal: GridIndex,
-) -> int:
-    vx = goal[0] - start[0]
-    vy = goal[1] - start[1]
-    wx = point[0] - start[0]
-    wy = point[1] - start[1]
-    cross_z = (vx * wy) - (vy * wx)
-    if cross_z > 0:
-        return 1
-    if cross_z < 0:
-        return -1
-    return 0
-
-
-def _preferred_over_sequences(
-    start: GridIndex,
-    goal: GridIndex,
-    candidate_waypoints: Sequence[GridIndex],
-    max_sequences: int = 10,
-) -> List[Tuple[GridIndex, ...]]:
-    if not candidate_waypoints:
-        return []
-
-    top_z = max(start[2], goal[2])
-    elevated = [waypoint for waypoint in candidate_waypoints if waypoint[2] > top_z]
-    if not elevated:
-        return []
-
-    mid_x = (start[0] + goal[0]) * 0.5
-    mid_y = (start[1] + goal[1]) * 0.5
-
-    def _single_sort_key(waypoint: GridIndex) -> Tuple[float, float, float, float]:
-        z_gain = waypoint[2] - top_z
-        line_distance = _point_to_segment_distance(waypoint, start, goal)
-        mid_distance = math.hypot(waypoint[0] - mid_x, waypoint[1] - mid_y)
-        progress = _segment_progress_ratio(waypoint, start, goal)
-        return (
-            -float(z_gain),
-            line_distance,
-            abs(progress - 0.5),
-            mid_distance,
-        )
-
-    elevated_sorted = sorted(elevated, key=_single_sort_key)
-    sequences: List[Tuple[GridIndex, ...]] = []
-    seen: Set[Tuple[GridIndex, ...]] = set()
-
-    for waypoint in elevated_sorted[: min(6, len(elevated_sorted))]:
-        sequence = (waypoint,)
-        if sequence in seen:
-            continue
-        seen.add(sequence)
-        sequences.append(sequence)
-        if len(sequences) >= max_sequences:
-            return sequences
-
-    side_groups: Dict[int, List[GridIndex]] = {-1: [], 1: []}
-    for waypoint in elevated_sorted:
-        side = _segment_side_sign(waypoint, start, goal)
-        if side in side_groups:
-            side_groups[side].append(waypoint)
-
-    for side in (-1, 1):
-        side_candidates = side_groups[side]
-        if len(side_candidates) < 2:
-            continue
-
-        near_start = [
-            waypoint
-            for waypoint in side_candidates
-            if _segment_progress_ratio(waypoint, start, goal) <= 0.6
-        ]
-        near_goal = [
-            waypoint
-            for waypoint in side_candidates
-            if _segment_progress_ratio(waypoint, start, goal) >= 0.4
-        ]
-        if not near_start or not near_goal:
-            continue
-
-        for first in near_start[: min(3, len(near_start))]:
-            for second in near_goal[: min(3, len(near_goal))]:
-                if first == second:
-                    continue
-                if _segment_progress_ratio(second, start, goal) <= _segment_progress_ratio(first, start, goal):
-                    continue
-                sequence = (first, second)
-                if sequence in seen:
-                    continue
-                seen.add(sequence)
-                sequences.append(sequence)
-                if len(sequences) >= max_sequences:
-                    return sequences
-
-    return sequences
-
-
 def _segment_candidate_paths(
     valid_cells: Set[GridIndex],
     start: GridIndex,
@@ -1467,7 +1345,6 @@ def _segment_candidate_paths(
     strict_layercake_mode: bool = False,
     strict_completion_ratio: float = STRICT_INTERNAL_TARGET_RATIO,
     preferred_pipe_path: Optional[Sequence[GridIndex]] = None,
-    strict_layercake_return_early: bool = True,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1615,9 +1492,7 @@ def _segment_candidate_paths(
                     valid_cells=valid_cells,
                     bottleneck_threshold=bottleneck_threshold,
                 )[:max_candidates]
-                if strict_layercake_return_early:
-                    return strict_sorted
-                candidates = strict_sorted
+                return strict_sorted
             fill_headroom = 0
             headroom_threshold = max(
                 AGGRESSIVE_HEADROOM_MIN_CELLS,
@@ -1658,33 +1533,6 @@ def _segment_candidate_paths(
         roominess_map=roominess_map,
         bottleneck_threshold=bottleneck_threshold,
     )
-
-    if not allow_diagonals and candidate_waypoints:
-        preferred_sequences = _preferred_over_sequences(
-            start,
-            goal,
-            candidate_waypoints,
-            max_sequences=min(12, max_candidates * 2),
-        )
-        for waypoint_sequence in preferred_sequences:
-            if deadline is not None and time.monotonic() > deadline:
-                break
-            try:
-                candidates.append(
-                    _route_through_waypoints(
-                        valid_cells=candidate_valid_cells,
-                        waypoint_sequence=(start,) + waypoint_sequence + (goal,),
-                        penalty_cells=penalty_cells,
-                        penalty_weight=penalty_weight,
-                        allow_diagonals=allow_diagonals,
-                        self_avoid_radius=self_avoid_radius,
-                        vertical_move_penalty=target_first_vertical_penalty,
-                        boundary_penalty_cells=boundary_penalty_cells,
-                        boundary_penalty_weight=boundary_penalty_weight,
-                    )
-                )
-            except RoutingError:
-                continue
 
     beam: List[Tuple[GridIndex, ...]] = [tuple()]
     for _ in range(beam_max_waypoints):
@@ -2412,21 +2260,8 @@ def route_node_sequence(
                 dilate_cells({node}, node_keepout_radius)
             )
 
-    # Adaptive beam search: reduce beam width and waypoint depth for
-    # high node counts to keep per-segment candidate generation fast.
-    if num_segments > 10:
-        seg_beam_width = 3
-        seg_beam_max_waypoints = 1
-    elif num_segments > 8:
-        seg_beam_width = 4
-        seg_beam_max_waypoints = 2
-    else:
-        seg_beam_width = 8
-        seg_beam_max_waypoints = 3
-    if segment_target_lengths is not None:
-        seg_beam_width = min(12, seg_beam_width + AGGRESSIVE_BEAM_WIDTH_BONUS)
-        seg_beam_max_waypoints = min(4, seg_beam_max_waypoints + AGGRESSIVE_BEAM_WAYPOINT_BONUS)
-
+    seg_beam_width = 8
+    seg_beam_max_waypoints = 3
     seg_max_candidates = 8
     if strict_internal_best_effort:
         seg_beam_width = max(seg_beam_width, 18)
@@ -2689,6 +2524,8 @@ def route_node_sequence(
             and segment_target_length is not None
             and segment_target_length > 0.0
         )
+        target_length_value = float(segment_target_length or 0.0)
+        direct_distance = _distance(start, goal)
         strict_target_threshold = (
             float(segment_target_length) * STRICT_INTERNAL_TARGET_RATIO
             if strict_internal_target
@@ -2765,7 +2602,6 @@ def route_node_sequence(
                     strict_layercake_mode=strict_internal_target,
                     strict_completion_ratio=STRICT_INTERNAL_TARGET_RATIO,
                     preferred_pipe_path=segment_bridge_path,
-                    strict_layercake_return_early=not strict_internal_best_effort,
                 )
             except RoutingError:
                 candidate_paths = []
@@ -2834,24 +2670,16 @@ def route_node_sequence(
             # physically arrive/depart at the shared node while still
             # catching near-node overlaps that violate the 1 mm gap.
             if blocked_radius > 0 and current_segments:
-                skip_adjacent_overlap_gate = (
-                    strict_internal_target
-                    and (
-                        routed_length + 1e-9 >= strict_target_threshold
-                        or strict_internal_best_effort
-                    )
-                )
-                if not skip_adjacent_overlap_gate:
-                    prev_seg = current_segments[-1]
-                    shared = start
-                    cross_segment_radius = blocked_radius
-                    cross_segment_node_adjacency = max(2, blocked_radius + 1)
-                    if _cross_segment_near_approach(
-                        prev_seg, routed_segment, cross_segment_radius, shared,
-                        node_adjacency=cross_segment_node_adjacency,
-                    ):
-                        rejection_counts["cross_segment_overlap"] += 1
-                        continue
+                prev_seg = current_segments[-1]
+                shared = start
+                cross_segment_radius = blocked_radius
+                cross_segment_node_adjacency = max(2, blocked_radius + 1)
+                if _cross_segment_near_approach(
+                    prev_seg, routed_segment, cross_segment_radius, shared,
+                    node_adjacency=cross_segment_node_adjacency,
+                ):
+                    rejection_counts["cross_segment_overlap"] += 1
+                    continue
 
             # Non-adjacent segment overlap check: reject candidates that
             # wander through the exemption zone into territory blocked by
@@ -2901,9 +2729,11 @@ def route_node_sequence(
                     rejection_counts["non_endpoint_node_keepout"] += 1
                     continue
 
+            routed_length = _path_length(routed_segment)
+
             accepted_candidate_length = max(
                 accepted_candidate_length,
-                _path_length(routed_segment),
+                routed_length,
             )
 
             next_penalty_cells = set(current_penalty_cells)
@@ -2977,7 +2807,6 @@ def route_node_sequence(
             raise last_error
 
         if strict_internal_target:
-            target_length_value = float(segment_target_length or 0.0)
             failure_diagnostics: Dict[str, object] = {
                 "type": "strict_internal_target_failure",
                 "segment_index": segment_index,
@@ -2988,7 +2817,7 @@ def route_node_sequence(
                 "shortfall_cells": max(0.0, target_length_value - best_internal_length),
                 "required_ratio": STRICT_INTERNAL_TARGET_RATIO,
                 "required_length_cells": strict_target_threshold,
-                "direct_distance_cells": _distance(start, goal),
+                "direct_distance_cells": direct_distance,
                 "segment_valid_cell_count": len(segment_valid_cells),
                 "current_blocked_cell_count": len(current_blocked_cells),
                 "current_penalty_cell_count": len(current_penalty_cells),

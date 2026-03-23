@@ -1345,7 +1345,6 @@ def _segment_candidate_paths(
     strict_layercake_mode: bool = False,
     strict_completion_ratio: float = STRICT_INTERNAL_TARGET_RATIO,
     preferred_pipe_path: Optional[Sequence[GridIndex]] = None,
-    strict_layercake_return_early: bool = True,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1493,9 +1492,7 @@ def _segment_candidate_paths(
                     valid_cells=valid_cells,
                     bottleneck_threshold=bottleneck_threshold,
                 )[:max_candidates]
-                if strict_layercake_return_early:
-                    return strict_sorted
-                candidates = strict_sorted
+                return strict_sorted
             fill_headroom = 0
             headroom_threshold = max(
                 AGGRESSIVE_HEADROOM_MIN_CELLS,
@@ -2263,20 +2260,15 @@ def route_node_sequence(
                 dilate_cells({node}, node_keepout_radius)
             )
 
-    # Adaptive beam search: reduce beam width and waypoint depth for
-    # high node counts to keep per-segment candidate generation fast.
-    if num_segments > 10:
-        seg_beam_width = 3
-        seg_beam_max_waypoints = 1
-    elif num_segments > 8:
-        seg_beam_width = 4
-        seg_beam_max_waypoints = 2
-    else:
-        seg_beam_width = 8
-        seg_beam_max_waypoints = 3
-    if segment_target_lengths is not None:
-        seg_beam_width = min(12, seg_beam_width + AGGRESSIVE_BEAM_WIDTH_BONUS)
-        seg_beam_max_waypoints = min(4, seg_beam_max_waypoints + AGGRESSIVE_BEAM_WAYPOINT_BONUS)
+    seg_beam_width = 8
+    seg_beam_max_waypoints = 3
+    seg_max_candidates = 8
+    if strict_internal_best_effort:
+        seg_beam_width = max(seg_beam_width, 18)
+        seg_beam_max_waypoints = max(seg_beam_max_waypoints, 5)
+        seg_max_candidates = 28
+    elif segment_target_lengths is not None:
+        seg_max_candidates = 12
 
     # Maximum number of segments to backtrack when a downstream segment
     # fails.  Deep backtracking is exponentially expensive and rarely
@@ -2532,6 +2524,8 @@ def route_node_sequence(
             and segment_target_length is not None
             and segment_target_length > 0.0
         )
+        target_length_value = float(segment_target_length or 0.0)
+        direct_distance = _distance(start, goal)
         strict_target_threshold = (
             float(segment_target_length) * STRICT_INTERNAL_TARGET_RATIO
             if strict_internal_target
@@ -2600,6 +2594,7 @@ def route_node_sequence(
                     boundary_penalty_weight=0.2,
                     beam_width=seg_beam_width,
                     beam_max_waypoints=seg_beam_max_waypoints,
+                    max_candidates=seg_max_candidates,
                     deadline=deadline,
                     min_self_spacing=min_self_spacing,
                     fill_hard_excluded_cells=fill_hard_excluded,
@@ -2607,7 +2602,6 @@ def route_node_sequence(
                     strict_layercake_mode=strict_internal_target,
                     strict_completion_ratio=STRICT_INTERNAL_TARGET_RATIO,
                     preferred_pipe_path=segment_bridge_path,
-                    strict_layercake_return_early=not strict_internal_best_effort,
                 )
             except RoutingError:
                 candidate_paths = []
@@ -2676,24 +2670,16 @@ def route_node_sequence(
             # physically arrive/depart at the shared node while still
             # catching near-node overlaps that violate the 1 mm gap.
             if blocked_radius > 0 and current_segments:
-                skip_adjacent_overlap_gate = (
-                    strict_internal_target
-                    and (
-                        routed_length + 1e-9 >= strict_target_threshold
-                        or strict_internal_best_effort
-                    )
-                )
-                if not skip_adjacent_overlap_gate:
-                    prev_seg = current_segments[-1]
-                    shared = start
-                    cross_segment_radius = blocked_radius
-                    cross_segment_node_adjacency = max(2, blocked_radius + 1)
-                    if _cross_segment_near_approach(
-                        prev_seg, routed_segment, cross_segment_radius, shared,
-                        node_adjacency=cross_segment_node_adjacency,
-                    ):
-                        rejection_counts["cross_segment_overlap"] += 1
-                        continue
+                prev_seg = current_segments[-1]
+                shared = start
+                cross_segment_radius = blocked_radius
+                cross_segment_node_adjacency = max(2, blocked_radius + 1)
+                if _cross_segment_near_approach(
+                    prev_seg, routed_segment, cross_segment_radius, shared,
+                    node_adjacency=cross_segment_node_adjacency,
+                ):
+                    rejection_counts["cross_segment_overlap"] += 1
+                    continue
 
             # Non-adjacent segment overlap check: reject candidates that
             # wander through the exemption zone into territory blocked by
@@ -2743,9 +2729,11 @@ def route_node_sequence(
                     rejection_counts["non_endpoint_node_keepout"] += 1
                     continue
 
+            routed_length = _path_length(routed_segment)
+
             accepted_candidate_length = max(
                 accepted_candidate_length,
-                _path_length(routed_segment),
+                routed_length,
             )
 
             next_penalty_cells = set(current_penalty_cells)
@@ -2819,7 +2807,6 @@ def route_node_sequence(
             raise last_error
 
         if strict_internal_target:
-            target_length_value = float(segment_target_length or 0.0)
             failure_diagnostics: Dict[str, object] = {
                 "type": "strict_internal_target_failure",
                 "segment_index": segment_index,
@@ -2830,7 +2817,7 @@ def route_node_sequence(
                 "shortfall_cells": max(0.0, target_length_value - best_internal_length),
                 "required_ratio": STRICT_INTERNAL_TARGET_RATIO,
                 "required_length_cells": strict_target_threshold,
-                "direct_distance_cells": _distance(start, goal),
+                "direct_distance_cells": direct_distance,
                 "segment_valid_cell_count": len(segment_valid_cells),
                 "current_blocked_cell_count": len(current_blocked_cells),
                 "current_penalty_cell_count": len(current_penalty_cells),
