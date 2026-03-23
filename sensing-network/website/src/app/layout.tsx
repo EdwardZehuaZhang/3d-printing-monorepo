@@ -14,6 +14,13 @@ export const metadata: Metadata = {
   title: "SenseKit — Turn Any 3D Print Into a Touch Sensor",
   description:
     "The complete kit for making interactive, touch-sensitive 3D prints. Conductive filament, Rhino plugin, and SenseBoard included.",
+  icons: {
+    icon: "/SenseKit_icon.png",
+    apple: "/SenseKit_icon.png",
+  },
+  openGraph: {
+    images: ["/SenseKit_icon.png"],
+  },
 };
 
 export default function RootLayout({

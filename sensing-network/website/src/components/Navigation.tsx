@@ -1,14 +1,15 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 
 const navLinks = [
   { href: "/", label: "Home" },
   { href: "/product", label: "How It Works" },
-  { href: "/pricing", label: "Pricing" },
   { href: "/docs", label: "Docs" },
+  { href: "/pricing", label: "Pricing" },
   { href: "/calibrate", label: "Calibrate" },
 ];
 
@@ -20,8 +21,9 @@ export default function Navigation() {
     <nav className="sticky top-0 z-50 border-b-2 border-border bg-surface/95 backdrop-blur-sm">
       <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
         <Link href="/" className="flex items-center gap-2 no-underline">
+          <Image src="/SenseKit_logo.svg" alt="SenseKit logo" width={32} height={32} />
           <span className="text-2xl font-bold tracking-tight text-text-primary">
-            <span className="text-primary">//</span> SenseKit
+            SenseKit
           </span>
         </Link>
 
@@ -31,9 +33,9 @@ export default function Navigation() {
             <Link
               key={link.href}
               href={link.href}
-              className={`rounded-lg px-3 py-2 text-xs font-semibold uppercase tracking-widest no-underline transition-all ${
+              className={`rounded-lg border-2 border-transparent px-3 py-2 text-xs font-semibold uppercase tracking-widest no-underline transition-all ${
                 pathname === link.href
-                  ? "bg-primary text-white"
+                  ? "bg-surface-inset text-primary"
                   : "text-text-secondary hover:bg-surface-inset hover:text-text-primary"
               }`}
             >
@@ -42,7 +44,7 @@ export default function Navigation() {
           ))}
           <Link
             href="/pricing"
-            className="ml-3 rounded-lg border-2 border-primary bg-primary px-4 py-2 text-xs font-semibold uppercase tracking-widest text-white no-underline transition-all hover:-translate-y-0.5 hover:bg-primary-dark hover:shadow-lg"
+            className="ml-3 rounded-lg border-2 border-primary bg-primary px-3 py-2 text-xs font-semibold uppercase tracking-widest text-white no-underline transition-all hover:-translate-y-0.5 hover:bg-primary-dark hover:shadow-lg"
           >
             Get Kit
           </Link>
