@@ -2037,7 +2037,6 @@ def route_node_sequence(
     vertical_move_penalty: float = 0.0,
     deadline: Optional[float] = None,
     min_self_spacing: int = 0,
-    min_target_attainment_ratio: float = 0.85,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
@@ -2047,8 +2046,6 @@ def route_node_sequence(
 
     if node_labels is not None and len(node_labels) != len(node_sequence):
         raise RoutingError("Node labels must match the routed node sequence length.")
-
-    min_target_attainment_ratio = max(0.0, min(1.0, float(min_target_attainment_ratio)))
 
     segments: List[List[GridIndex]] = []
     reserved = reserved_cells or set()
@@ -2248,7 +2245,7 @@ def route_node_sequence(
         for routed_segment in candidate_paths:
             if segment_target_length is not None:
                 routed_length = _path_length(routed_segment)
-                if routed_length + 1e-9 < segment_target_length * min_target_attainment_ratio:
+                if routed_length + 1e-9 < segment_target_length * 0.85:
                     continue
 
             # Cross-segment overlap check: verify the new segment does

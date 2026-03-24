@@ -51,7 +51,7 @@ PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
 ROUTER_BUILD_VERSION = "v27-core rollback with fixed-diameter solids"
 ROUTER_BUILD_DATE = "2026-03-24"
-ROUTER_ROUTING_PROFILE = "deterministic-zbottom-proximity-order-v4"
+ROUTER_ROUTING_PROFILE = "deterministic-bottomup-packed-fill-v3"
 ROUTER_BUILD_SOURCE = "main-source"
 ROUTER_BUILD_TAG = "{} | {} | {} | {}".format(
     ROUTER_BUILD_VERSION,
@@ -312,56 +312,50 @@ def _greedy_target_order(
 
 
 def _preferred_bottom_up_order(
-    start: TerminalPlacement,
     touch_nodes: Sequence[TouchNodePlacement],
 ) -> Tuple[int, ...]:
     if not touch_nodes:
         return ()
 
-    indices = list(range(len(touch_nodes)))
-    z_values = [touch_nodes[index].anchor_point.Z for index in indices]
-    z_min = min(z_values)
-    z_max = max(z_values)
-    z_range = z_max - z_min
+    xs = [node.anchor_point.X for node in touch_nodes]
+    ys = [node.anchor_point.Y for node in touch_nodes]
+    min_x = min(xs)
+    max_x = max(xs)
+    min_y = min(ys)
+    max_y = max(ys)
 
-    # "Similar Z height" groups for routing order: keep the grouping
-    # tolerant enough for mesh-surface noise while still honoring a
-    # bottom-up progression when levels differ meaningfully.
-    z_band_tolerance = max(1e-6, z_range * 0.05)
+    def _edge_distance(index: int) -> float:
+        point = touch_nodes[index].anchor_point
+        return min(
+            abs(point.X - min_x),
+            abs(max_x - point.X),
+            abs(point.Y - min_y),
+            abs(max_y - point.Y),
+        )
 
-    sorted_by_z = sorted(indices, key=lambda index: touch_nodes[index].anchor_point.Z)
-    z_bands: List[List[int]] = []
-    for index in sorted_by_z:
-        if not z_bands:
-            z_bands.append([index])
-            continue
-        previous = z_bands[-1][-1]
-        current_z = touch_nodes[index].anchor_point.Z
-        previous_z = touch_nodes[previous].anchor_point.Z
-        if abs(current_z - previous_z) <= z_band_tolerance:
-            z_bands[-1].append(index)
-        else:
-            z_bands.append([index])
+    z_values = [node.anchor_point.Z for node in touch_nodes]
+    all_same_z = (max(z_values) - min(z_values)) <= 1e-9
 
-    ordered: List[int] = []
-    current_point = start.anchor_point
-    for band in z_bands:
-        remaining = list(band)
-        while remaining:
-            next_index = min(
-                remaining,
-                key=lambda index: (
-                    _distance_between(current_point, touch_nodes[index].anchor_point),
-                    touch_nodes[index].anchor_point.X,
-                    touch_nodes[index].anchor_point.Y,
-                    touch_nodes[index].anchor_point.Z,
-                ),
+    ordered_indices = list(range(len(touch_nodes)))
+    if all_same_z:
+        ordered_indices.sort(
+            key=lambda index: (
+                _edge_distance(index),
+                touch_nodes[index].anchor_point.X,
+                touch_nodes[index].anchor_point.Y,
             )
-            ordered.append(next_index)
-            current_point = touch_nodes[next_index].anchor_point
-            remaining.remove(next_index)
+        )
+        return tuple(ordered_indices)
 
-    return tuple(ordered)
+    ordered_indices.sort(
+        key=lambda index: (
+            touch_nodes[index].anchor_point.Z,
+            _edge_distance(index),
+            touch_nodes[index].anchor_point.X,
+            touch_nodes[index].anchor_point.Y,
+        )
+    )
+    return tuple(ordered_indices)
 
 
 def _target_order_candidates(
@@ -390,46 +384,20 @@ def _target_order_candidates(
 
     start_distances, end_distances, pair_distances = _touch_node_distance_tables(start, touch_nodes, end)
 
-    preferred_bottom_up = _preferred_bottom_up_order(start, touch_nodes)
+    preferred_bottom_up = _preferred_bottom_up_order(touch_nodes)
     if not preferred_bottom_up:
         return []
 
-    # Hard fixed node order: bottom-Z to top-Z, and for similar Z use
-    # proximity chaining from the current routing head.
-    order_indices: List[Tuple[int, ...]] = [preferred_bottom_up]
-
-    unique_orders: List[Tuple[int, ...]] = []
-    seen_orders: Set[Tuple[int, ...]] = set()
-    for order in order_indices:
-        if order in seen_orders:
-            continue
-        seen_orders.add(order)
-        unique_orders.append(order)
-
-    candidates: List[TouchNodeOrderCandidate] = []
-    for order in unique_orders:
-        metrics = evaluate_node_order(order, start_distances, end_distances, pair_distances)
-        max_length_error, total_length_error, _ = _target_length_score(metrics, target_leg_length)
-        candidates.append(
-            TouchNodeOrderCandidate(
-                ordered_nodes=_nodes_from_order_indices(touch_nodes, order),
-                metrics=metrics,
-                max_length_error=max_length_error,
-                total_length_error=total_length_error,
-            )
+    metrics = evaluate_node_order(preferred_bottom_up, start_distances, end_distances, pair_distances)
+    max_length_error, total_length_error, _ = _target_length_score(metrics, target_leg_length)
+    return [
+        TouchNodeOrderCandidate(
+            ordered_nodes=_nodes_from_order_indices(touch_nodes, preferred_bottom_up),
+            metrics=metrics,
+            max_length_error=max_length_error,
+            total_length_error=total_length_error,
         )
-
-    preferred_order_labels = tuple(node.label for node in _nodes_from_order_indices(touch_nodes, preferred_bottom_up))
-    candidates.sort(
-        key=lambda candidate: (
-            0 if tuple(node.label for node in candidate.ordered_nodes) == preferred_order_labels else 1,
-            candidate.max_length_error,
-            candidate.total_length_error,
-            candidate.metrics.total_path_length,
-        )
-    )
-
-    return candidates[:1]
+    ]
 
 
 def _create_touch_node(
@@ -1671,7 +1639,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
-    Rhino.RhinoApp.WriteLine("Selecting deterministic z-bottom then proximity touch-node order...")
+    Rhino.RhinoApp.WriteLine("Selecting deterministic low-to-high touch-node order...")
     order_candidates = _target_order_candidates(
         start_terminal,
         touch_nodes,
@@ -1683,10 +1651,9 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     # cell, so the next path starts at distance R+1.  We need
     # (R+1)*step >= wire_diameter + PATH_SEPARATION for the required
     # edge-to-edge gap, i.e.  R >= (wire_d + sep) / step - 1.
-    base_spacing_radius = max(1, int(math.ceil(
+    spacing_radius = max(1, int(math.ceil(
         (wire_diameter_for_clearance_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step - 1.0
     )))
-    spacing_radius = base_spacing_radius
     # Guard band to avoid edge-touching in very dense serpentine turns.
     spacing_radius += 1
     # The node exemption covers the physical node radius so paths can
@@ -1701,17 +1668,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         (wire_diameter_for_clearance_mm + MIN_INTRA_PATH_GAP_MM) * _mm_to_model(doc, 1.0) / step
     )))
 
-    # Vertical segments print at larger diameter (1.2mm vs 0.8mm XY).
-    # Add a dedicated keepout boost around Z-risers to prevent the
-    # remaining edge-to-edge contacts seen in dense routes.
-    vertical_spacing_boost = 0
-    if wire_diameter_z_mm > wire_diameter_xy_mm + 1e-9:
-        radial_delta_mm = 0.5 * (wire_diameter_z_mm - wire_diameter_xy_mm)
-        vertical_spacing_boost = max(
-            1,
-            int(math.ceil(radial_delta_mm * _mm_to_model(doc, 1.0) / step)),
-        )
-
     selected_candidate: Optional[TouchNodeOrderCandidate] = None
     selected_touch_nodes: List[TouchNodePlacement] = []
     selected_route_points: List[rg.Point3d] = []
@@ -1721,120 +1677,79 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     first_failure_order: Optional[List[str]] = None
     first_failure_diagnostics: Optional[Dict[str, object]] = None
     attempted_orders = 0
-    total_order_budget = 2400.0
-    routing_profiles: List[Tuple[int, int, int, float]] = [
-        (spacing_radius, node_exemption_radius, min_self_spacing, 0.90),
-        (
-            max(1, base_spacing_radius),
-            max(1, node_exemption_radius - 1),
-            max(1, min_self_spacing - 1),
-            0.70,
-        ),
-        (
-            max(1, base_spacing_radius - 1),
-            max(1, node_exemption_radius - 2),
-            max(1, min_self_spacing - 2),
-            0.0,
-        ),
-    ]
 
-    # Deduplicate small-grid cases where relaxed profiles collapse to the same values.
-    deduped_profiles: List[Tuple[int, int, int, float]] = []
-    seen_profiles: Set[Tuple[int, int, int, float]] = set()
-    for profile in routing_profiles:
-        if profile in seen_profiles:
+    for candidate in order_candidates:
+        ordered_touch_nodes = list(candidate.ordered_nodes)
+        route_points = [start_terminal.anchor_point] + [node.anchor_point for node in ordered_touch_nodes] + [end_terminal.anchor_point]
+        route_labels = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
+        # Convert target_leg_length from model units (mm) to grid-cell
+        # units so that _path_length() comparisons inside core.py are
+        # consistent — _path_length() returns Euclidean distance
+        # in grid-index space where each step equals 1.0.
+        target_leg_length_cells = target_leg_length / step
+        segment_target_lengths = _segment_target_lengths(route_points, target_leg_length_cells)
+
+        node_cells: List[GridIndex] = []
+        mapping_failed = False
+        for point in route_points:
+            cell = _find_nearest_valid_cell(point, valid_cells, grid)
+            if cell is None:
+                mapping_failed = True
+                break
+            node_cells.append(cell)
+        if mapping_failed:
+            Rhino.RhinoApp.WriteLine(
+                "A selected terminal or touch node could not be placed into the usable internal volume. Choose a location with more internal space."
+            )
+            return Rhino.Commands.Result.Failure
+
+        anchor_radii = [terminal_radius] + [node_radius for _ in ordered_touch_nodes] + [terminal_radius]
+        reserved_cells, reserved_exemption_radius = _protected_anchor_cells(
+            anchor_cells=node_cells,
+            anchor_radii=anchor_radii,
+            step=step,
+        )
+
+        attempted_orders += 1
+        per_order_budget = max(420.0, 2400.0 / max(1, len(order_candidates)))
+        deadline = time.monotonic() + per_order_budget
+        try:
+            segments = route_node_sequence(
+                valid_cells=valid_cells,
+                node_sequence=node_cells,
+                segment_target_lengths=segment_target_lengths,
+                penalty_radius=0,
+                penalty_weight=step,
+                blocked_radius=spacing_radius,
+                blocked_exemption_radius=node_exemption_radius,
+                reserved_cells=reserved_cells,
+                reserved_exemption_radius=reserved_exemption_radius,
+                node_labels=route_labels,
+                allow_diagonals=False,
+                vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
+                deadline=deadline,
+                min_self_spacing=min_self_spacing,
+            )
+        except RoutingError as error:
+            attempted_sequence = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
+            Rhino.RhinoApp.WriteLine(
+                "Order attempt failed: {} | reason: {}".format(
+                    " -> ".join(attempted_sequence),
+                    str(error),
+                )
+            )
+            if first_failure_reason is None:
+                first_failure_reason = str(error)
+                first_failure_order = [node.label for node in ordered_touch_nodes]
+                first_failure_diagnostics = error.diagnostics if hasattr(error, "diagnostics") else None
             continue
-        seen_profiles.add(profile)
-        deduped_profiles.append(profile)
-    routing_profiles = deduped_profiles
 
-    for profile_index, (profile_blocked_radius, profile_node_exemption_radius, profile_min_self_spacing, profile_min_target_ratio) in enumerate(routing_profiles):
-        if profile_index == 1:
-            Rhino.RhinoApp.WriteLine(
-                "Retrying with mildly relaxed constraints for feasibility (still preserving clearance)."
-            )
-        elif profile_index == 2:
-            Rhino.RhinoApp.WriteLine(
-                "Retrying with feasibility-priority constraints for dense node layouts (target-length best effort)."
-            )
-
-        for candidate in order_candidates:
-            ordered_touch_nodes = list(candidate.ordered_nodes)
-            route_points = [start_terminal.anchor_point] + [node.anchor_point for node in ordered_touch_nodes] + [end_terminal.anchor_point]
-            route_labels = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
-            # Convert target_leg_length from model units (mm) to grid-cell
-            # units so that _path_length() comparisons inside core.py are
-            # consistent — _path_length() returns Euclidean distance
-            # in grid-index space where each step equals 1.0.
-            target_leg_length_cells = target_leg_length / step
-            segment_target_lengths = _segment_target_lengths(route_points, target_leg_length_cells)
-
-            node_cells: List[GridIndex] = []
-            mapping_failed = False
-            for point in route_points:
-                cell = _find_nearest_valid_cell(point, valid_cells, grid)
-                if cell is None:
-                    mapping_failed = True
-                    break
-                node_cells.append(cell)
-            if mapping_failed:
-                Rhino.RhinoApp.WriteLine(
-                    "A selected terminal or touch node could not be placed into the usable internal volume. Choose a location with more internal space."
-                )
-                return Rhino.Commands.Result.Failure
-
-            anchor_radii = [terminal_radius] + [node_radius for _ in ordered_touch_nodes] + [terminal_radius]
-            reserved_cells, reserved_exemption_radius = _protected_anchor_cells(
-                anchor_cells=node_cells,
-                anchor_radii=anchor_radii,
-                step=step,
-            )
-
-            attempted_orders += 1
-            per_order_budget = max(90.0, total_order_budget / max(1, len(order_candidates)))
-            deadline = time.monotonic() + per_order_budget
-            try:
-                segments = route_node_sequence(
-                    valid_cells=valid_cells,
-                    node_sequence=node_cells,
-                    segment_target_lengths=segment_target_lengths,
-                    penalty_radius=0,
-                    penalty_weight=step,
-                    blocked_radius=profile_blocked_radius,
-                    vertical_blocked_extra_radius=vertical_spacing_boost,
-                    blocked_exemption_radius=profile_node_exemption_radius,
-                    reserved_cells=reserved_cells,
-                    reserved_exemption_radius=reserved_exemption_radius,
-                    node_labels=route_labels,
-                    allow_diagonals=False,
-                    vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
-                    deadline=deadline,
-                    min_self_spacing=profile_min_self_spacing,
-                    min_target_attainment_ratio=profile_min_target_ratio,
-                )
-            except RoutingError as error:
-                attempted_sequence = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
-                Rhino.RhinoApp.WriteLine(
-                    "Order attempt failed: {} | reason: {}".format(
-                        " -> ".join(attempted_sequence),
-                        str(error),
-                    )
-                )
-                if first_failure_reason is None:
-                    first_failure_reason = str(error)
-                    first_failure_order = [node.label for node in ordered_touch_nodes]
-                    first_failure_diagnostics = error.diagnostics if hasattr(error, "diagnostics") else None
-                continue
-
-            selected_candidate = candidate
-            selected_touch_nodes = ordered_touch_nodes
-            selected_route_points = route_points
-            selected_route_labels = route_labels
-            selected_segments = segments
-            break
-
-        if selected_candidate is not None:
-            break
+        selected_candidate = candidate
+        selected_touch_nodes = ordered_touch_nodes
+        selected_route_points = route_points
+        selected_route_labels = route_labels
+        selected_segments = segments
+        break
 
     if selected_candidate is None:
         if first_failure_reason is not None and first_failure_order is not None:

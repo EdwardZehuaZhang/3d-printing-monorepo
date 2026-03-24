@@ -193,48 +193,32 @@ def _build_fill_corridor(
     roominess_map: Optional[RoominessMap] = None,
     bottleneck_threshold: int = 0,
     min_self_spacing: int = 0,
-    use_full_domain: bool = False,
 ) -> Set[GridIndex]:
     """Build a corridor around the pipe wide enough for a serpentine fill."""
     # Use the same spacing as _generate_serpentine_fill so the radius
     # estimate is consistent with the actual row/layer layout.
-    row_spacing = max(2, min_self_spacing)
+    row_spacing = max(2, self_avoid_radius + 2, min_self_spacing)
     pipe_length = max(1.0, _path_length(pipe_path))
     needed_r_sq = target_length * row_spacing * row_spacing / (4.0 * pipe_length)
     # Use a generous multiplier (3.0) so the serpentine can exploit
     # available space even when multiple segments compete for room.
     radius = max(4, int(math.ceil(math.sqrt(max(1.0, needed_r_sq)) * 3.0)))
 
-    if use_full_domain:
-        corridor = set(valid_cells)
-    else:
-        pipe_xs = [p[0] for p in pipe_path]
-        pipe_ys = [p[1] for p in pipe_path]
-        pipe_zs = [p[2] for p in pipe_path]
-        min_x = min(pipe_xs) - radius
-        max_x = max(pipe_xs) + radius
-        min_y = min(pipe_ys) - radius
-        max_y = max(pipe_ys) + radius
-        min_z = min(pipe_zs) - radius
-        max_z = max(pipe_zs) + radius
-
-        # Encourage bottom-up utilization: allow corridor to extend to the
-        # lowest available Z in the currently valid routing domain.
-        if valid_cells:
-            min_valid_z = min(cell[2] for cell in valid_cells)
-            min_z = min(min_z, min_valid_z)
-
-        corridor = {
-            cell for cell in valid_cells
-            if min_x <= cell[0] <= max_x
-            and min_y <= cell[1] <= max_y
-            and min_z <= cell[2] <= max_z
-        }
-
-    if start is not None and start in valid_cells:
-        corridor.add(start)
-    if goal is not None and goal in valid_cells:
-        corridor.add(goal)
+    pipe_xs = [p[0] for p in pipe_path]
+    pipe_ys = [p[1] for p in pipe_path]
+    pipe_zs = [p[2] for p in pipe_path]
+    min_x = min(pipe_xs) - radius
+    max_x = max(pipe_xs) + radius
+    min_y = min(pipe_ys) - radius
+    max_y = max(pipe_ys) + radius
+    min_z = min(pipe_zs) - radius
+    max_z = max(pipe_zs) + radius
+    corridor = {
+        cell for cell in valid_cells
+        if min_x <= cell[0] <= max_x
+        and min_y <= cell[1] <= max_y
+        and min_z <= cell[2] <= max_z
+    }
 
     # Prefer roomy regions (higher local free-space) while preserving
     # a guaranteed neighborhood around the pipe backbone.
@@ -290,23 +274,22 @@ def _generate_serpentine_fill(
     if len(corridor) < 4:
         return None
 
-    # Use explicit intra-path spacing (derived from wire diameter +
-    # minimum intra-path gap) so lanes are packed but still valid.
-    row_spacing = max(2, min_self_spacing)
-    layer_spacing = max(1, min_self_spacing)
+    # +2 gives one full cell of clearance beyond the blocked radius,
+    # which prevents pipe geometry at bends from overlapping adjacent rows.
+    row_spacing = max(2, self_avoid_radius + 2, min_self_spacing)
+    layer_spacing = max(2, self_avoid_radius + 2, min_self_spacing)
 
-    # Choose sweep axes with deterministic world-Z layering so fill
-    # generally grows bottom-up in printer coordinates.
+    # Choose sweep axes: sweep along the longest corridor dimension,
+    # layer through the shortest, rows in the middle.
     coords = list(zip(*corridor))  # ([x …], [y …], [z …])
-    x_range = max(coords[0]) - min(coords[0])
-    y_range = max(coords[1]) - min(coords[1])
-    layer_axis = 2
-    if x_range >= y_range:
-        sweep_axis = 0
-        row_axis = 1
-    else:
-        sweep_axis = 1
-        row_axis = 0
+    axis_ranges = []
+    for axis in range(3):
+        vals = coords[axis]
+        axis_ranges.append((max(vals) - min(vals), axis))
+    axis_ranges.sort(key=lambda r: r[0])
+    layer_axis = axis_ranges[0][1]  # thinnest
+    row_axis = axis_ranges[1][1]
+    sweep_axis = axis_ranges[2][1]  # longest
 
     # Group corridor cells by (layer, row) → list of sweep values.
     layer_rows: Dict[int, Dict[int, List[int]]] = {}
@@ -316,8 +299,10 @@ def _generate_serpentine_fill(
         sv = cell[sweep_axis]
         layer_rows.setdefault(lv, {}).setdefault(rv, []).append(sv)
 
-    # Select layers with spacing; always prefer low Z first.
+    # Select layers with spacing, ordered from start toward goal.
     all_layers = sorted(layer_rows.keys())
+    if start[layer_axis] > goal[layer_axis]:
+        all_layers = list(reversed(all_layers))
     selected_layers: List[int] = []
     for lv in all_layers:
         if not selected_layers or abs(lv - selected_layers[-1]) >= layer_spacing:
@@ -418,8 +403,8 @@ def _generate_serpentine_fill(
     def _suffix_valid() -> Set[GridIndex]:
         """Valid cells for the suffix A*: exclude the prefix zone."""
         if not prefix_blocked:
-            return corridor
-        tv = corridor - prefix_blocked
+            return valid_cells
+        tv = valid_cells - prefix_blocked
         tv.add(start)
         tv.add(goal)
         return tv
@@ -440,7 +425,7 @@ def _generate_serpentine_fill(
         path.append(start)
     else:
         try:
-            prefix = astar_path(corridor, start, ordered[0])
+            prefix = astar_path(valid_cells, start, ordered[0])
             _extend_and_track(prefix)
             if self_avoid_radius > 0:
                 prefix_blocked = dilate_cells(set(prefix), self_avoid_radius)
@@ -461,18 +446,12 @@ def _generate_serpentine_fill(
             running_length += 1.0
             path.append(cell)
         else:
-            walk = _axis_walk(last, cell, corridor)
+            walk = _axis_walk(last, cell, valid_cells)
             if walk is not None:
                 _extend_and_track(walk)
             else:
                 try:
-                    micro = astar_path(
-                        corridor,
-                        last,
-                        cell,
-                        penalty_cells=set(path),
-                        penalty_weight=2.0,
-                    )
+                    micro = astar_path(valid_cells, last, cell)
                     _extend_and_track(micro[1:])
                 except RoutingError:
                     # Rollback any partial approach toward the unreachable
@@ -491,7 +470,7 @@ def _generate_serpentine_fill(
         # Avoid the serpentine body so the suffix doesn't create
         # reversals that _remove_path_reversals would collapse.
         body = set(path)
-        suffix_cells = corridor - body
+        suffix_cells = valid_cells - body
         suffix_cells -= prefix_blocked
         suffix_cells.add(path[-1])
         suffix_cells.add(goal)
@@ -513,7 +492,7 @@ def _generate_serpentine_fill(
             deduped.append(cell)
 
     deduped = _remove_path_reversals(deduped)
-    deduped = _repair_path_continuity(deduped, corridor)
+    deduped = _repair_path_continuity(deduped, valid_cells)
     deduped = _remove_path_reversals(deduped)
 
     # Serpentine spacing correctness is guaranteed by row_spacing and
@@ -611,40 +590,6 @@ def _path_xy_footprint(path: Sequence[GridIndex]) -> int:
     x_values = [point[0] for point in path]
     y_values = [point[1] for point in path]
     return (max(x_values) - min(x_values) + 1) * (max(y_values) - min(y_values) + 1)
-
-
-def _expand_index_path(path: Sequence[GridIndex]) -> List[GridIndex]:
-    if len(path) < 2:
-        return list(path)
-
-    expanded: List[GridIndex] = [path[0]]
-    for target in path[1:]:
-        cx, cy, cz = expanded[-1]
-        tx, ty, tz = target
-        for axis, (current_value, target_value) in enumerate(((cx, tx), (cy, ty), (cz, tz))):
-            if current_value == target_value:
-                continue
-            step = 1 if target_value > current_value else -1
-            while current_value != target_value:
-                current_value += step
-                if axis == 0:
-                    cx = current_value
-                elif axis == 1:
-                    cy = current_value
-                else:
-                    cz = current_value
-                expanded.append((cx, cy, cz))
-    return expanded
-
-
-def _vertical_path_cells(path: Sequence[GridIndex]) -> Set[GridIndex]:
-    expanded = _expand_index_path(path)
-    vertical: Set[GridIndex] = set()
-    for start, end in zip(expanded[:-1], expanded[1:]):
-        if start[2] != end[2]:
-            vertical.add(start)
-            vertical.add(end)
-    return vertical
 
 
 def _offset_index(index: GridIndex, offset: GridIndex, scale: int = 1) -> GridIndex:
@@ -1334,7 +1279,7 @@ def _segment_candidate_paths(
 
     # ---- Serpentine fill (primary strategy for large targets) ----
     # Inspired by trace_filling from 3dp-singlewire-sensing.
-    if not allow_diagonals and target_length > direct_length * 1.2:
+    if not allow_diagonals and target_length > direct_length * 1.5:
         fill_corridor = _build_fill_corridor(
             pipe_path,
             valid_cells,
@@ -1358,7 +1303,7 @@ def _segment_candidate_paths(
         if serpentine is not None:
             candidates.append(serpentine)
             serpentine_length = _path_length(serpentine)
-            if serpentine_length >= target_length * 0.97:
+            if serpentine_length >= target_length * 0.85:
                 # Serpentine reached the target — skip the expensive beam search.
                 unique = _dedupe_paths(candidates)
                 return _sort_candidate_paths(
@@ -1472,65 +1417,6 @@ def _segment_candidate_paths(
         ]
         grown_cleaned = [_remove_path_reversals(path) for path in grown_candidates]
         unique_candidates = _dedupe_paths(unique_candidates + grown_cleaned)
-
-        # If still far from target, attempt a full-domain bottom-up
-        # serpentine so the path can continue on higher layers after
-        # reaching local corridor boundaries.
-        best_current_length = 0.0
-        if unique_candidates:
-            best_current_length = max(_path_length(path) for path in unique_candidates)
-        if best_current_length < target_length * 0.9:
-            full_corridor = _build_fill_corridor(
-                pipe_path,
-                valid_cells,
-                target_length,
-                self_avoid_radius,
-                start=start,
-                goal=goal,
-                roominess_map=roominess_map,
-                bottleneck_threshold=bottleneck_threshold,
-                min_self_spacing=min_self_spacing,
-                use_full_domain=True,
-            )
-            extra_candidates: List[List[GridIndex]] = []
-            full_serpentine = _generate_serpentine_fill(
-                full_corridor,
-                valid_cells,
-                start,
-                goal,
-                target_length,
-                self_avoid_radius,
-                min_self_spacing=min_self_spacing,
-            )
-            if full_serpentine is not None:
-                extra_candidates.append(full_serpentine)
-            reverse_serpentine = _generate_serpentine_fill(
-                full_corridor,
-                valid_cells,
-                goal,
-                start,
-                target_length,
-                self_avoid_radius,
-                min_self_spacing=min_self_spacing,
-            )
-            if reverse_serpentine is not None:
-                extra_candidates.append(list(reversed(reverse_serpentine)))
-
-            if extra_candidates:
-                extra_grown = [
-                    _grow_path_toward_target(
-                        path,
-                        valid_cells,
-                        target_length,
-                        max(0, self_avoid_radius),
-                        roominess_map,
-                        bottleneck_threshold,
-                        growth_valid_cells=valid_cells,
-                    )
-                    for path in extra_candidates
-                ]
-                extra_cleaned = [_remove_path_reversals(path) for path in (extra_candidates + extra_grown)]
-                unique_candidates = _dedupe_paths(unique_candidates + extra_cleaned)
     return _sort_candidate_paths(
         unique_candidates,
         target_length,
@@ -1960,67 +1846,6 @@ def _reconstruct_order(
     return tuple(order_indices)
 
 
-def _allocate_proportional_layer_counts(
-    total_layers: int,
-    weights: Sequence[float],
-) -> List[int]:
-    if total_layers <= 0 or not weights:
-        return [0 for _ in weights]
-
-    segment_count = len(weights)
-    normalized = [max(0.0, float(weight)) for weight in weights]
-    total_weight = sum(normalized)
-    if total_weight <= 0.0:
-        normalized = [1.0 for _ in weights]
-        total_weight = float(segment_count)
-
-    if total_layers >= segment_count:
-        counts = [1 for _ in weights]
-        remaining = total_layers - segment_count
-        ideal_extra = [((weight / total_weight) * total_layers) - 1.0 for weight in normalized]
-    else:
-        counts = [1 if index < total_layers else 0 for index in range(segment_count)]
-        remaining = 0
-        ideal_extra = [0.0 for _ in normalized]
-
-    while remaining > 0:
-        best_index = max(
-            range(segment_count),
-            key=lambda index: (ideal_extra[index], normalized[index], -index),
-        )
-        counts[best_index] += 1
-        ideal_extra[best_index] -= 1.0
-        remaining -= 1
-
-    return counts
-
-
-def _internal_layer_band_allocation(
-    z_levels: Sequence[int],
-    internal_segment_indices: Sequence[int],
-    segment_demands: Dict[int, float],
-) -> Dict[int, Set[int]]:
-    allocation: Dict[int, Set[int]] = {}
-    if not z_levels or not internal_segment_indices:
-        return allocation
-
-    weights = [max(1.0, float(segment_demands.get(index, 1.0))) for index in internal_segment_indices]
-    layer_counts = _allocate_proportional_layer_counts(len(z_levels), weights)
-
-    cursor = 0
-    for internal_order, segment_index in enumerate(internal_segment_indices):
-        layer_count = layer_counts[internal_order]
-        next_cursor = min(len(z_levels), cursor + max(0, layer_count))
-        if next_cursor > cursor:
-            assigned = set(z_levels[cursor:next_cursor])
-        else:
-            assigned = {z_levels[-1]}
-        allocation[segment_index] = assigned
-        cursor = next_cursor
-
-    return allocation
-
-
 def route_node_sequence(
     valid_cells: Set[GridIndex],
     node_sequence: Sequence[GridIndex],
@@ -2028,7 +1853,6 @@ def route_node_sequence(
     penalty_radius: int = 1,
     penalty_weight: float = 10.0,
     blocked_radius: int = 0,
-    vertical_blocked_extra_radius: int = 0,
     blocked_exemption_radius: int = 0,
     reserved_cells: Optional[Set[GridIndex]] = None,
     reserved_exemption_radius: int = 0,
@@ -2037,7 +1861,6 @@ def route_node_sequence(
     vertical_move_penalty: float = 0.0,
     deadline: Optional[float] = None,
     min_self_spacing: int = 0,
-    min_target_attainment_ratio: float = 0.85,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
@@ -2048,22 +1871,21 @@ def route_node_sequence(
     if node_labels is not None and len(node_labels) != len(node_sequence):
         raise RoutingError("Node labels must match the routed node sequence length.")
 
-    min_target_attainment_ratio = max(0.0, min(1.0, float(min_target_attainment_ratio)))
-
     segments: List[List[GridIndex]] = []
     reserved = reserved_cells or set()
-    global_roominess_map = _build_roominess_map(valid_cells)
-    global_bottleneck_threshold = _bottleneck_threshold(global_roominess_map)
+    roominess_map = _build_roominess_map(valid_cells)
+    bottleneck_threshold = _bottleneck_threshold(roominess_map)
 
-    # Precompute non-endpoint node influence zones. These are treated as
-    # soft penalties (not hard exclusions) so dense multi-node layouts can
-    # remain routable while still preferring clearance from future nodes.
-    node_penalty_radius = reserved_exemption_radius + max(1, blocked_radius // 2) if blocked_radius > 0 else 0
-    per_node_penalty_zone: Dict[GridIndex, FrozenSet[GridIndex]] = {}
-    if node_penalty_radius > 0 and len(node_sequence) > 2:
+    # Precompute node keepout zones: for each node, the set of cells
+    # that paths NOT connecting to that node must avoid.  The radius
+    # covers the physical node volume (reserved_exemption_radius) plus
+    # the wire-to-node edge-to-edge clearance (blocked_radius).
+    node_keepout_radius = reserved_exemption_radius + blocked_radius if blocked_radius > 0 else 0
+    per_node_keepout: Dict[GridIndex, FrozenSet[GridIndex]] = {}
+    if node_keepout_radius > 0 and len(node_sequence) > 2:
         for node in set(node_sequence):
-            per_node_penalty_zone[node] = frozenset(
-                dilate_cells({node}, node_penalty_radius)
+            per_node_keepout[node] = frozenset(
+                dilate_cells({node}, node_keepout_radius)
             )
 
     # Adaptive beam search: reduce beam width and waypoint depth for
@@ -2089,11 +1911,11 @@ def route_node_sequence(
     # (low roominess) get a soft A* cost penalty so paths prefer the
     # interior.  This leaves more room for serpentine fills and reduces
     # the chance of cross-segment overlaps near tight boundary regions.
-    global_boundary_penalty_cells: Optional[Set[GridIndex]] = None
-    if global_bottleneck_threshold > 0:
-        global_boundary_penalty_cells = frozenset(
-            cell for cell, roominess in global_roominess_map.items()
-            if roominess < global_bottleneck_threshold
+    boundary_penalty_cells: Optional[Set[GridIndex]] = None
+    if bottleneck_threshold > 0:
+        boundary_penalty_cells = frozenset(
+            cell for cell, roominess in roominess_map.items()
+            if roominess < bottleneck_threshold
         )
 
     # Track the furthest segment reached so far (shared mutable state)
@@ -2144,34 +1966,29 @@ def route_node_sequence(
             local_blocked.discard(goal)
             segment_valid_cells.difference_update(local_blocked)
 
-        local_penalties = set(current_penalty_cells)
-        local_penalties.discard(start)
-        local_penalties.discard(goal)
-
-        # Apply soft penalties around non-endpoint nodes instead of hard
-        # exclusions. Hard node volume protection is already provided by
-        # reserved_cells above.
-        if per_node_penalty_zone and segment_index > 0:
-            endpoint_safe = dilate_cells({start, goal}, blocked_exemption_radius)
+        # Enforce wire-to-node edge-to-edge clearance for nodes that
+        # are NOT the current segment's endpoints.  reserved_cells
+        # blocks only the physical node volume; this extends that by
+        # blocked_radius so the conductive wire maintains at least
+        # PATH_SEPARATION_MM gap from every non-connected node.
+        if per_node_keepout:
+            endpoint_safe = dilate_cells(
+                {start, goal}, blocked_exemption_radius
+            )
             for node in node_sequence:
                 if node == start or node == goal:
                     continue
-                penalty_zone = per_node_penalty_zone.get(node)
-                if penalty_zone is not None:
-                    local_penalties.update(penalty_zone - endpoint_safe)
+                if node in per_node_keepout:
+                    segment_valid_cells.difference_update(
+                        per_node_keepout[node] - endpoint_safe
+                    )
+            # Ensure start/goal always remain routable.
+            segment_valid_cells.add(start)
+            segment_valid_cells.add(goal)
 
-        # Relearn free-space structure per node-pair segment after all
-        # current hard constraints are applied.
-        segment_roominess_map = _build_roominess_map(segment_valid_cells)
-        segment_bottleneck_threshold = _bottleneck_threshold(segment_roominess_map)
-        segment_boundary_penalty_cells: Optional[Set[GridIndex]] = None
-        if segment_bottleneck_threshold > 0:
-            segment_boundary_penalty_cells = frozenset(
-                cell for cell, roominess in segment_roominess_map.items()
-                if roominess < segment_bottleneck_threshold
-            )
-        elif global_boundary_penalty_cells is not None:
-            segment_boundary_penalty_cells = global_boundary_penalty_cells
+        local_penalties = set(current_penalty_cells)
+        local_penalties.discard(start)
+        local_penalties.discard(goal)
 
         # Soft approach-direction penalty: discourage departing from
         # *start* in the same direction a previous segment arrived.
@@ -2203,9 +2020,9 @@ def route_node_sequence(
                 target_length=segment_target_length,
                 self_avoid_radius=max(0, blocked_radius),
                 vertical_move_penalty=vertical_move_penalty,
-                roominess_map=segment_roominess_map,
-                bottleneck_threshold=segment_bottleneck_threshold,
-                boundary_penalty_cells=segment_boundary_penalty_cells,
+                roominess_map=roominess_map,
+                bottleneck_threshold=bottleneck_threshold,
+                boundary_penalty_cells=boundary_penalty_cells,
                 boundary_penalty_weight=0.2,
                 beam_width=seg_beam_width,
                 beam_max_waypoints=seg_beam_max_waypoints,
@@ -2224,20 +2041,12 @@ def route_node_sequence(
         non_adjacent_blocked: Optional[Set[GridIndex]] = None
         if blocked_radius > 0 and len(current_segments) >= 2:
             non_adj_cells: Set[GridIndex] = set()
-            non_adj_vertical_cells: Set[GridIndex] = set()
             for prev_idx in range(len(current_segments) - 1):
-                prev_segment_cells = _expand_index_path(current_segments[prev_idx])
-                non_adj_cells.update(prev_segment_cells)
-                if vertical_blocked_extra_radius > 0:
-                    non_adj_vertical_cells.update(_vertical_path_cells(prev_segment_cells))
+                non_adj_cells.update(current_segments[prev_idx])
             non_adj_cells.discard(start)
             non_adj_cells.discard(goal)
             if non_adj_cells:
                 non_adjacent_blocked = dilate_cells(non_adj_cells, blocked_radius)
-                if vertical_blocked_extra_radius > 0 and non_adj_vertical_cells:
-                    non_adjacent_blocked.update(
-                        dilate_cells(non_adj_vertical_cells, blocked_radius + vertical_blocked_extra_radius)
-                    )
                 # Exempt cells near start/goal so the path can still
                 # reach its endpoints.  Using only 1 cell was too tight
                 # and prevented valid routes in dense layouts.
@@ -2246,25 +2055,16 @@ def route_node_sequence(
 
         last_error: Optional[RoutingError] = None
         for routed_segment in candidate_paths:
-            if segment_target_length is not None:
-                routed_length = _path_length(routed_segment)
-                if routed_length + 1e-9 < segment_target_length * min_target_attainment_ratio:
-                    continue
-
             # Cross-segment overlap check: verify the new segment does
             # not run parallel to the previous segment near the shared
             # node.  The blocked_exemption_radius is deliberately NOT
             # used here — only a tiny 1-cell zone around the shared node
             # is exempt so that near-node overlaps are caught.
             if blocked_radius > 0 and current_segments:
-                prev_seg = _expand_index_path(current_segments[-1])
+                prev_seg = current_segments[-1]
                 shared = start
-                cross_segment_radius = blocked_radius
-                if vertical_blocked_extra_radius > 0:
-                    if _vertical_path_cells(prev_seg) or _vertical_path_cells(routed_segment):
-                        cross_segment_radius += vertical_blocked_extra_radius
                 if _cross_segment_near_approach(
-                    prev_seg, routed_segment, cross_segment_radius, shared,
+                    prev_seg, routed_segment, blocked_radius, shared,
                     node_adjacency=max(2, blocked_exemption_radius),
                 ):
                     continue
@@ -2284,12 +2084,6 @@ def route_node_sequence(
             next_blocked_cells = set(current_blocked_cells)
             if blocked_radius > 0:
                 next_blocked_cells.update(dilate_cells(routed_segment, blocked_radius))
-                if vertical_blocked_extra_radius > 0:
-                    vertical_cells = _vertical_path_cells(routed_segment)
-                    if vertical_cells:
-                        next_blocked_cells.update(
-                            dilate_cells(vertical_cells, blocked_radius + vertical_blocked_extra_radius)
-                        )
 
             # Record how this segment arrives at *goal* so the next
             # segment can prefer a different departure direction.

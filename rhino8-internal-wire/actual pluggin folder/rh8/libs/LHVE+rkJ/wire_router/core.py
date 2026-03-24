@@ -2037,7 +2037,6 @@ def route_node_sequence(
     vertical_move_penalty: float = 0.0,
     deadline: Optional[float] = None,
     min_self_spacing: int = 0,
-    min_target_attainment_ratio: float = 0.85,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
@@ -2048,22 +2047,21 @@ def route_node_sequence(
     if node_labels is not None and len(node_labels) != len(node_sequence):
         raise RoutingError("Node labels must match the routed node sequence length.")
 
-    min_target_attainment_ratio = max(0.0, min(1.0, float(min_target_attainment_ratio)))
-
     segments: List[List[GridIndex]] = []
     reserved = reserved_cells or set()
     global_roominess_map = _build_roominess_map(valid_cells)
     global_bottleneck_threshold = _bottleneck_threshold(global_roominess_map)
 
-    # Precompute non-endpoint node influence zones. These are treated as
-    # soft penalties (not hard exclusions) so dense multi-node layouts can
-    # remain routable while still preferring clearance from future nodes.
-    node_penalty_radius = reserved_exemption_radius + max(1, blocked_radius // 2) if blocked_radius > 0 else 0
-    per_node_penalty_zone: Dict[GridIndex, FrozenSet[GridIndex]] = {}
-    if node_penalty_radius > 0 and len(node_sequence) > 2:
+    # Precompute node keepout zones: for each node, the set of cells
+    # that paths NOT connecting to that node must avoid.  The radius
+    # covers the physical node volume (reserved_exemption_radius) plus
+    # the wire-to-node edge-to-edge clearance (blocked_radius).
+    node_keepout_radius = reserved_exemption_radius + blocked_radius if blocked_radius > 0 else 0
+    per_node_keepout: Dict[GridIndex, FrozenSet[GridIndex]] = {}
+    if node_keepout_radius > 0 and len(node_sequence) > 2:
         for node in set(node_sequence):
-            per_node_penalty_zone[node] = frozenset(
-                dilate_cells({node}, node_penalty_radius)
+            per_node_keepout[node] = frozenset(
+                dilate_cells({node}, node_keepout_radius)
             )
 
     # Adaptive beam search: reduce beam width and waypoint depth for
@@ -2144,21 +2142,29 @@ def route_node_sequence(
             local_blocked.discard(goal)
             segment_valid_cells.difference_update(local_blocked)
 
-        local_penalties = set(current_penalty_cells)
-        local_penalties.discard(start)
-        local_penalties.discard(goal)
-
-        # Apply soft penalties around non-endpoint nodes instead of hard
-        # exclusions. Hard node volume protection is already provided by
-        # reserved_cells above.
-        if per_node_penalty_zone and segment_index > 0:
-            endpoint_safe = dilate_cells({start, goal}, blocked_exemption_radius)
+        # Enforce wire-to-node edge-to-edge clearance for nodes that
+        # are NOT the current segment's endpoints.  reserved_cells
+        # blocks only the physical node volume; this extends that by
+        # blocked_radius so the conductive wire maintains at least
+        # PATH_SEPARATION_MM gap from every non-connected node.
+        if per_node_keepout:
+            endpoint_safe = dilate_cells(
+                {start, goal}, blocked_exemption_radius
+            )
             for node in node_sequence:
                 if node == start or node == goal:
                     continue
-                penalty_zone = per_node_penalty_zone.get(node)
-                if penalty_zone is not None:
-                    local_penalties.update(penalty_zone - endpoint_safe)
+                if node in per_node_keepout:
+                    segment_valid_cells.difference_update(
+                        per_node_keepout[node] - endpoint_safe
+                    )
+            # Ensure start/goal always remain routable.
+            segment_valid_cells.add(start)
+            segment_valid_cells.add(goal)
+
+        local_penalties = set(current_penalty_cells)
+        local_penalties.discard(start)
+        local_penalties.discard(goal)
 
         # Relearn free-space structure per node-pair segment after all
         # current hard constraints are applied.
@@ -2248,7 +2254,7 @@ def route_node_sequence(
         for routed_segment in candidate_paths:
             if segment_target_length is not None:
                 routed_length = _path_length(routed_segment)
-                if routed_length + 1e-9 < segment_target_length * min_target_attainment_ratio:
+                if routed_length + 1e-9 < segment_target_length * 0.85:
                     continue
 
             # Cross-segment overlap check: verify the new segment does

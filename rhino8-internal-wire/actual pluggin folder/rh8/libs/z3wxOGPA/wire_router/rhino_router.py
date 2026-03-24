@@ -1671,7 +1671,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
-    Rhino.RhinoApp.WriteLine("Selecting deterministic z-bottom then proximity touch-node order...")
+    Rhino.RhinoApp.WriteLine("Selecting deterministic low-to-high touch-node order candidates...")
     order_candidates = _target_order_candidates(
         start_terminal,
         touch_nodes,
@@ -1722,25 +1722,23 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     first_failure_diagnostics: Optional[Dict[str, object]] = None
     attempted_orders = 0
     total_order_budget = 2400.0
-    routing_profiles: List[Tuple[int, int, int, float]] = [
-        (spacing_radius, node_exemption_radius, min_self_spacing, 0.90),
+    routing_profiles: List[Tuple[int, int, int]] = [
+        (spacing_radius, node_exemption_radius, min_self_spacing),
         (
             max(1, base_spacing_radius),
             max(1, node_exemption_radius - 1),
             max(1, min_self_spacing - 1),
-            0.70,
         ),
         (
             max(1, base_spacing_radius - 1),
             max(1, node_exemption_radius - 2),
             max(1, min_self_spacing - 2),
-            0.0,
         ),
     ]
 
     # Deduplicate small-grid cases where relaxed profiles collapse to the same values.
-    deduped_profiles: List[Tuple[int, int, int, float]] = []
-    seen_profiles: Set[Tuple[int, int, int, float]] = set()
+    deduped_profiles: List[Tuple[int, int, int]] = []
+    seen_profiles: Set[Tuple[int, int, int]] = set()
     for profile in routing_profiles:
         if profile in seen_profiles:
             continue
@@ -1748,14 +1746,14 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         deduped_profiles.append(profile)
     routing_profiles = deduped_profiles
 
-    for profile_index, (profile_blocked_radius, profile_node_exemption_radius, profile_min_self_spacing, profile_min_target_ratio) in enumerate(routing_profiles):
+    for profile_index, (profile_blocked_radius, profile_node_exemption_radius, profile_min_self_spacing) in enumerate(routing_profiles):
         if profile_index == 1:
             Rhino.RhinoApp.WriteLine(
                 "Retrying with mildly relaxed constraints for feasibility (still preserving clearance)."
             )
         elif profile_index == 2:
             Rhino.RhinoApp.WriteLine(
-                "Retrying with feasibility-priority constraints for dense node layouts (target-length best effort)."
+                "Retrying with feasibility-priority constraints for dense node layouts."
             )
 
         for candidate in order_candidates:
@@ -1810,7 +1808,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                     vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
                     deadline=deadline,
                     min_self_spacing=profile_min_self_spacing,
-                    min_target_attainment_ratio=profile_min_target_ratio,
                 )
             except RoutingError as error:
                 attempted_sequence = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]

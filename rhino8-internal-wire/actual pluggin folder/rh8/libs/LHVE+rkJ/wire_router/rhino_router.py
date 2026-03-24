@@ -51,7 +51,7 @@ PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
 ROUTER_BUILD_VERSION = "v27-core rollback with fixed-diameter solids"
 ROUTER_BUILD_DATE = "2026-03-24"
-ROUTER_ROUTING_PROFILE = "deterministic-zbottom-proximity-order-v4"
+ROUTER_ROUTING_PROFILE = "deterministic-bottomup-packed-fill-v3"
 ROUTER_BUILD_SOURCE = "main-source"
 ROUTER_BUILD_TAG = "{} | {} | {} | {}".format(
     ROUTER_BUILD_VERSION,
@@ -312,56 +312,50 @@ def _greedy_target_order(
 
 
 def _preferred_bottom_up_order(
-    start: TerminalPlacement,
     touch_nodes: Sequence[TouchNodePlacement],
 ) -> Tuple[int, ...]:
     if not touch_nodes:
         return ()
 
-    indices = list(range(len(touch_nodes)))
-    z_values = [touch_nodes[index].anchor_point.Z for index in indices]
-    z_min = min(z_values)
-    z_max = max(z_values)
-    z_range = z_max - z_min
+    xs = [node.anchor_point.X for node in touch_nodes]
+    ys = [node.anchor_point.Y for node in touch_nodes]
+    min_x = min(xs)
+    max_x = max(xs)
+    min_y = min(ys)
+    max_y = max(ys)
 
-    # "Similar Z height" groups for routing order: keep the grouping
-    # tolerant enough for mesh-surface noise while still honoring a
-    # bottom-up progression when levels differ meaningfully.
-    z_band_tolerance = max(1e-6, z_range * 0.05)
+    def _edge_distance(index: int) -> float:
+        point = touch_nodes[index].anchor_point
+        return min(
+            abs(point.X - min_x),
+            abs(max_x - point.X),
+            abs(point.Y - min_y),
+            abs(max_y - point.Y),
+        )
 
-    sorted_by_z = sorted(indices, key=lambda index: touch_nodes[index].anchor_point.Z)
-    z_bands: List[List[int]] = []
-    for index in sorted_by_z:
-        if not z_bands:
-            z_bands.append([index])
-            continue
-        previous = z_bands[-1][-1]
-        current_z = touch_nodes[index].anchor_point.Z
-        previous_z = touch_nodes[previous].anchor_point.Z
-        if abs(current_z - previous_z) <= z_band_tolerance:
-            z_bands[-1].append(index)
-        else:
-            z_bands.append([index])
+    z_values = [node.anchor_point.Z for node in touch_nodes]
+    all_same_z = (max(z_values) - min(z_values)) <= 1e-9
 
-    ordered: List[int] = []
-    current_point = start.anchor_point
-    for band in z_bands:
-        remaining = list(band)
-        while remaining:
-            next_index = min(
-                remaining,
-                key=lambda index: (
-                    _distance_between(current_point, touch_nodes[index].anchor_point),
-                    touch_nodes[index].anchor_point.X,
-                    touch_nodes[index].anchor_point.Y,
-                    touch_nodes[index].anchor_point.Z,
-                ),
+    ordered_indices = list(range(len(touch_nodes)))
+    if all_same_z:
+        ordered_indices.sort(
+            key=lambda index: (
+                _edge_distance(index),
+                touch_nodes[index].anchor_point.X,
+                touch_nodes[index].anchor_point.Y,
             )
-            ordered.append(next_index)
-            current_point = touch_nodes[next_index].anchor_point
-            remaining.remove(next_index)
+        )
+        return tuple(ordered_indices)
 
-    return tuple(ordered)
+    ordered_indices.sort(
+        key=lambda index: (
+            touch_nodes[index].anchor_point.Z,
+            _edge_distance(index),
+            touch_nodes[index].anchor_point.X,
+            touch_nodes[index].anchor_point.Y,
+        )
+    )
+    return tuple(ordered_indices)
 
 
 def _target_order_candidates(
@@ -390,13 +384,34 @@ def _target_order_candidates(
 
     start_distances, end_distances, pair_distances = _touch_node_distance_tables(start, touch_nodes, end)
 
-    preferred_bottom_up = _preferred_bottom_up_order(start, touch_nodes)
+    preferred_bottom_up = _preferred_bottom_up_order(touch_nodes)
     if not preferred_bottom_up:
         return []
 
-    # Hard fixed node order: bottom-Z to top-Z, and for similar Z use
-    # proximity chaining from the current routing head.
+    node_count = len(touch_nodes)
     order_indices: List[Tuple[int, ...]] = [preferred_bottom_up]
+
+    if node_count <= max_exact_nodes:
+        order_indices.extend(tuple(order) for order in itertools.permutations(range(node_count)))
+    else:
+        optimized = optimize_node_order_for_target_leg_length(
+            start_distances,
+            end_distances,
+            pair_distances,
+            target_leg_length,
+            max_exact_nodes=MAX_DP_NODES,
+        )
+        order_indices.append(optimized)
+        for start_index in range(node_count):
+            order_indices.append(
+                _greedy_target_order(
+                    start_distances,
+                    end_distances,
+                    pair_distances,
+                    target_leg_length,
+                    start_index,
+                )
+            )
 
     unique_orders: List[Tuple[int, ...]] = []
     seen_orders: Set[Tuple[int, ...]] = set()
@@ -429,7 +444,10 @@ def _target_order_candidates(
         )
     )
 
-    return candidates[:1]
+    if node_count <= 4:
+        return candidates
+    candidate_limit = max(MAX_ORDER_CANDIDATES, 12)
+    return candidates[:candidate_limit]
 
 
 def _create_touch_node(
@@ -1671,7 +1689,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
-    Rhino.RhinoApp.WriteLine("Selecting deterministic z-bottom then proximity touch-node order...")
+    Rhino.RhinoApp.WriteLine("Selecting deterministic low-to-high touch-node order candidates...")
     order_candidates = _target_order_candidates(
         start_terminal,
         touch_nodes,
@@ -1683,10 +1701,9 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     # cell, so the next path starts at distance R+1.  We need
     # (R+1)*step >= wire_diameter + PATH_SEPARATION for the required
     # edge-to-edge gap, i.e.  R >= (wire_d + sep) / step - 1.
-    base_spacing_radius = max(1, int(math.ceil(
+    spacing_radius = max(1, int(math.ceil(
         (wire_diameter_for_clearance_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step - 1.0
     )))
-    spacing_radius = base_spacing_radius
     # Guard band to avoid edge-touching in very dense serpentine turns.
     spacing_radius += 1
     # The node exemption covers the physical node radius so paths can
@@ -1722,40 +1739,19 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     first_failure_diagnostics: Optional[Dict[str, object]] = None
     attempted_orders = 0
     total_order_budget = 2400.0
-    routing_profiles: List[Tuple[int, int, int, float]] = [
-        (spacing_radius, node_exemption_radius, min_self_spacing, 0.90),
+    routing_profiles = [
+        (spacing_radius, node_exemption_radius, min_self_spacing),
         (
-            max(1, base_spacing_radius),
+            max(1, spacing_radius - 1),
             max(1, node_exemption_radius - 1),
             max(1, min_self_spacing - 1),
-            0.70,
-        ),
-        (
-            max(1, base_spacing_radius - 1),
-            max(1, node_exemption_radius - 2),
-            max(1, min_self_spacing - 2),
-            0.0,
         ),
     ]
 
-    # Deduplicate small-grid cases where relaxed profiles collapse to the same values.
-    deduped_profiles: List[Tuple[int, int, int, float]] = []
-    seen_profiles: Set[Tuple[int, int, int, float]] = set()
-    for profile in routing_profiles:
-        if profile in seen_profiles:
-            continue
-        seen_profiles.add(profile)
-        deduped_profiles.append(profile)
-    routing_profiles = deduped_profiles
-
-    for profile_index, (profile_blocked_radius, profile_node_exemption_radius, profile_min_self_spacing, profile_min_target_ratio) in enumerate(routing_profiles):
+    for profile_index, (profile_blocked_radius, profile_node_exemption_radius, profile_min_self_spacing) in enumerate(routing_profiles):
         if profile_index == 1:
             Rhino.RhinoApp.WriteLine(
                 "Retrying with mildly relaxed constraints for feasibility (still preserving clearance)."
-            )
-        elif profile_index == 2:
-            Rhino.RhinoApp.WriteLine(
-                "Retrying with feasibility-priority constraints for dense node layouts (target-length best effort)."
             )
 
         for candidate in order_candidates:
@@ -1810,7 +1806,6 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                     vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
                     deadline=deadline,
                     min_self_spacing=profile_min_self_spacing,
-                    min_target_attainment_ratio=profile_min_target_ratio,
                 )
             except RoutingError as error:
                 attempted_sequence = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
