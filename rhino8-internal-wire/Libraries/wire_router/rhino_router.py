@@ -47,8 +47,16 @@ MAX_ORDER_CANDIDATES = 5
 DEFAULT_TOUCH_READING_DELTA_KOHM = 10.0
 MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
-PROTO_PASTA_BASE_DIAMETER_MM = 1.5
-PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (4.8, 5.0)
+# Calibrated March 2026 for 0.8 mm XY and 1.2 mm Z conductive paths
+# Based on empirical measurements provided by the user:
+#   - XY slope ≈ 44.5 Ω/mm (0.0445 kohm/mm)
+#   - Z  slope ≈ 42.857 Ω/mm (0.042857 kohm/mm)
+# These values are used to convert between desired resistance deltas and
+# target routed lengths, and to report estimated segment/total resistance.
+CAL_XY_OHM_PER_MM = 44.5
+CAL_Z_OHM_PER_MM = 42.857
+# Effective average used for quick length targeting before a path exists
+CAL_EFFECTIVE_OHM_PER_MM = (CAL_XY_OHM_PER_MM + CAL_Z_OHM_PER_MM) * 0.5  # ≈ 43.6785 Ω/mm
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
 TARGET_WINDOW_RATIO = 0.10
@@ -1124,11 +1132,21 @@ def _cumulative_anchor_lengths(
 def _resistance_range_kohm(
     doc: Rhino.RhinoDoc, length_in_model_units: float, wire_diameter_mm: float
 ) -> Tuple[float, float]:
+    """
+    Estimate resistance range in kohm for a routed path length.
+
+    Uses calibrated per-mm ohmic slopes for XY and Z to provide a small range
+    that reflects anisotropy. Since we do not decompose the path into XY/Z
+    at this stage, we report [Z-slope * L, XY-slope * L] as [low, high].
+    The wire_diameter_mm parameter is ignored because the calibration already
+    accounts for the fixed diameters in this command (0.8 mm XY, 1.2 mm Z).
+    """
     length_mm = _model_to_mm(doc, length_in_model_units)
-    diameter_ratio_sq = (PROTO_PASTA_BASE_DIAMETER_MM / wire_diameter_mm) ** 2
-    low = PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] * diameter_ratio_sq * (length_mm / 100.0)
-    high = PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1] * diameter_ratio_sq * (length_mm / 100.0)
-    return low, high
+    low_kohm = (CAL_Z_OHM_PER_MM * length_mm) / 1000.0
+    high_kohm = (CAL_XY_OHM_PER_MM * length_mm) / 1000.0
+    if low_kohm > high_kohm:
+        low_kohm, high_kohm = high_kohm, low_kohm
+    return low_kohm, high_kohm
 
 
 def _nominal_resistance_kohm(
@@ -1139,13 +1157,17 @@ def _nominal_resistance_kohm(
 
 
 def _reading_delta_length(doc: Rhino.RhinoDoc, delta_kohm: float, wire_diameter_mm: float) -> float:
-    mean_kohm_per_100mm = (
-        (PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] + PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1])
-        * 0.5
-        * (PROTO_PASTA_BASE_DIAMETER_MM / wire_diameter_mm) ** 2
-    )
-    mean_kohm_per_mm = mean_kohm_per_100mm / 100.0
-    required_mm = delta_kohm / mean_kohm_per_mm
+    """
+    Convert a desired touch-to-touch resistance delta (in kohm) into an
+    approximate target routed length (in model units) for that leg.
+
+    We use the calibrated effective ohmic slope (Ω/mm), averaged across XY/Z,
+    because the actual XY/Z mix is not yet known at this stage. This produces
+    a more accurate target than the previous diameter-scaled ProtoPasta model
+    when using fixed 0.8 mm (XY) and 1.2 mm (Z) traces.
+    """
+    effective_ohm_per_mm = CAL_EFFECTIVE_OHM_PER_MM  # Ω/mm
+    required_mm = (delta_kohm * 1000.0) / effective_ohm_per_mm
     return _mm_to_model(doc, required_mm)
 
 
