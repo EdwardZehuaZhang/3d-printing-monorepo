@@ -973,11 +973,35 @@ def _segments_to_polyline_points(
     grid: GridSpec,
     tolerance: float,
 ) -> List[rg.Point3d]:
+    def _axis_connect(a: rg.Point3d, b: rg.Point3d) -> List[rg.Point3d]:
+        """Return axis-aligned connectors from a to b (no diagonals).
+
+        Uses X -> Y -> Z stepping order. Skips zero-length legs.
+        """
+        pts: List[rg.Point3d] = []
+        current = rg.Point3d(a.X, a.Y, a.Z)
+        if abs(b.X - current.X) > tolerance:
+            current = rg.Point3d(b.X, current.Y, current.Z)
+            pts.append(current)
+        if abs(b.Y - current.Y) > tolerance:
+            current = rg.Point3d(current.X, b.Y, current.Z)
+            pts.append(current)
+        if abs(b.Z - current.Z) > tolerance:
+            current = rg.Point3d(current.X, current.Y, b.Z)
+            pts.append(current)
+        return pts
+
     combined: List[rg.Point3d] = [anchor_points[0]]
 
     for index, segment in enumerate(segments):
         segment_points = [_grid_point(cell, grid) for cell in segment]
-        stitched = [anchor_points[index]] + segment_points + [anchor_points[index + 1]]
+        # Stitch with axis-aligned joins to avoid any diagonal pipes near anchors
+        stitched: List[rg.Point3d] = [anchor_points[index]]
+        for pt in segment_points:
+            stitched.extend(_axis_connect(stitched[-1], pt))
+            stitched.append(pt)
+        stitched.extend(_axis_connect(stitched[-1], anchor_points[index + 1]))
+        stitched.append(anchor_points[index + 1])
         if index > 0:
             stitched = stitched[1:]
 
@@ -1618,7 +1642,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                 )
                 segment_target_lengths[seg_index] = clamped_cells
 
-    deadline = time.monotonic() + 300.0
+    # Disable hard routing timeout to allow completion on large models
+    deadline = None
     segment_debug_lines: List[str] = []
     try:
         segments = route_node_sequence(

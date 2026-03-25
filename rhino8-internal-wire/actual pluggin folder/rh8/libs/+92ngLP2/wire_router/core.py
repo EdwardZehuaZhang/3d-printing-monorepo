@@ -2690,6 +2690,8 @@ def _route_continuous_coiling_sequence(
                         max_candidates=12,
                         vertical_move_penalty=vertical_move_penalty,
                         deadline=deadline,
+                        beam_width=4,
+                        beam_max_waypoints=2,
                     )
                     if candidate_coils:
                         coil_path = max(candidate_coils, key=_path_length)
@@ -2749,6 +2751,8 @@ def _route_continuous_coiling_sequence(
                     self_avoid_radius=max(0, xy_xy_blocked_radius),
                     vertical_move_penalty=vertical_move_penalty,
                     deadline=deadline,
+                    beam_width=4,
+                    beam_max_waypoints=2,
                 )
                 if fallback_candidates and window_ratio is not None:
                     min_length = target_length * target_length_min_ratio
@@ -2831,6 +2835,8 @@ def _route_continuous_coiling_sequence(
                     self_avoid_radius=max(0, xy_xy_blocked_radius),
                     vertical_move_penalty=vertical_move_penalty,
                     deadline=deadline,
+                    beam_width=4,
+                    beam_max_waypoints=2,
                 )
                 for candidate in retry_candidates:
                     if not _path_has_typed_spacing_violation(
