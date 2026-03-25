@@ -2034,6 +2034,97 @@ def _dynamic_corridor(
     return corridor
 
 
+def estimate_segment_max_length(
+    valid_cells: Set[GridIndex],
+    node_sequence: Sequence[GridIndex],
+    segment_index: int,
+    reserved_cells: Set[GridIndex],
+    reserved_exemption_radius: int,
+    blocked_exemption_radius: int,
+    vertical_move_penalty: float,
+    corridor_radius_cells: int,
+    xy_xy_blocked_radius: int,
+    xy_z_blocked_radius: int,
+    z_z_blocked_radius: int,
+    efficiency: float = 0.35,
+) -> float:
+    """
+    Quick, optimistic upper-bound estimate of achievable routed length (in cells)
+    for a single segment under continuous corridor-coil constraints.
+
+    Strategy:
+      1) Build a corridor spanning the internal touch-node chain.
+      2) Remove reserved anchor keepouts from valid cells for this segment.
+      3) Attempt a corridor path between segment endpoints.
+      4) Estimate coiling capacity as a fraction of free (non-corridor) cells.
+
+    Returns:
+      Estimated maximum segment length in grid cells.
+    """
+    if segment_index < 0 or segment_index >= len(node_sequence) - 1:
+        return 0.0
+
+    # Corridor across all internal segments (same span used by routing).
+    try:
+        corridor_cells = _dynamic_corridor(
+            valid_cells,
+            node_sequence,
+            span_start=1,
+            span_end=max(1, len(node_sequence) - 2),
+            vertical_move_penalty=vertical_move_penalty,
+            corridor_radius_cells=corridor_radius_cells,
+        )
+    except RoutingError:
+        corridor_cells = set()
+
+    # Segment-local valid cells: remove reserved zones except endpoints.
+    segment_valid = set(valid_cells)
+    start = node_sequence[segment_index]
+    goal = node_sequence[segment_index + 1]
+    if reserved_cells:
+        local_reserved = set(reserved_cells)
+        endpoint_reserved_exempt = dilate_cells(
+            {start, goal}, max(1, reserved_exemption_radius) if reserved_exemption_radius > 0 else 0
+        )
+        local_reserved.difference_update(endpoint_reserved_exempt)
+        local_reserved.discard(start)
+        local_reserved.discard(goal)
+        segment_valid.difference_update(local_reserved)
+
+    # Build a corridor-only path if possible for a baseline length.
+    corridor_zone = {cell for cell in corridor_cells if cell in segment_valid}
+    corridor_zone.update({start, goal})
+    try:
+        corridor_path = astar_path(
+            valid_cells=corridor_zone,
+            start=start,
+            goal=goal,
+            allow_diagonals=False,
+            vertical_move_penalty=vertical_move_penalty,
+        )
+    except RoutingError:
+        try:
+            corridor_path = astar_path(
+                valid_cells=segment_valid,
+                start=start,
+                goal=goal,
+                allow_diagonals=False,
+                vertical_move_penalty=vertical_move_penalty,
+            )
+        except RoutingError:
+            corridor_path = [start, goal]
+
+    # Coiling space: optimistic — free cells not part of the corridor set.
+    coiling_space = set(segment_valid)
+    coiling_space.difference_update(corridor_cells)
+
+    # Apply a packing/spacing efficiency factor to reflect actual serpentine fill
+    # losses due to row/layer spacing and typed-spacing constraints.
+    efficiency = max(0.0, min(1.0, efficiency))
+    max_cells = float(len(corridor_path)) + (efficiency * float(len(coiling_space)))
+    return max_cells
+
+
 def _contiguous_x_segments(row_cells: Sequence[GridIndex]) -> List[List[GridIndex]]:
     if not row_cells:
         return []

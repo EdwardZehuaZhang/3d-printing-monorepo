@@ -25,6 +25,7 @@ from .core import (
     index_to_point,
     optimize_node_order_for_target_leg_length,
     route_node_sequence,
+    estimate_segment_max_length,
 )
 
 
@@ -1450,6 +1451,16 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm, wire_diameter_xy_mm)
     target_leg_length_mm = _model_to_mm(doc, target_leg_length)
 
+    # Preflight feasibility hint: print required mm per leg and per-kohm ratio
+    mm_per_kohm = 1000.0 / CAL_EFFECTIVE_OHM_PER_MM
+    Rhino.RhinoApp.WriteLine(
+        "Preflight: {:.1f} kohm per leg requires ~{} of conductive trace (≈ {:.1f} mm/kohm)".format(
+            float(target_touch_reading_delta_kohm),
+            _format_length_mm(float(target_touch_reading_delta_kohm) * mm_per_kohm),
+            mm_per_kohm,
+        )
+    )
+
     terminals = _collect_terminals(
         mesh,
         host_brep,
@@ -1565,6 +1576,47 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         anchor_radii=anchor_radii,
         step=step,
     )
+
+    # Auto-clamp to feasible per-segment targets using a quick, optimistic estimate.
+    # This prevents hard failures when the requested kohm implies more length
+    # than the interior can reasonably provide.
+    if segment_target_lengths is not None and coiling_segment_indices:
+        Rhino.RhinoApp.WriteLine("Preflight: estimating per-leg feasible lengths and applying auto-clamps if necessary...")
+        for seg_index in sorted(coiling_segment_indices):
+            if seg_index < 0 or seg_index >= len(segment_target_lengths):
+                continue
+            target_cells = segment_target_lengths[seg_index]
+            if target_cells is None or target_cells <= 0:
+                continue
+            est_max_cells = estimate_segment_max_length(
+                valid_cells=valid_cells,
+                node_sequence=node_cells,
+                segment_index=seg_index,
+                reserved_cells=reserved_cells,
+                reserved_exemption_radius=reserved_exemption_radius,
+                blocked_exemption_radius=node_exemption_radius,
+                vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
+                corridor_radius_cells=corridor_radius_cells,
+                xy_xy_blocked_radius=spacing_xy_xy_radius,
+                xy_z_blocked_radius=spacing_xy_z_radius,
+                z_z_blocked_radius=spacing_z_z_radius,
+                efficiency=0.35,
+            )
+            if est_max_cells + 1e-9 < target_cells:
+                clamped_cells = max(0.0, est_max_cells * 0.90)
+                req_mm = target_cells * step
+                max_mm = est_max_cells * step
+                clamp_mm = clamped_cells * step
+                Rhino.RhinoApp.WriteLine(
+                    "Auto-clamp: requested {}→{} target {} exceeds quick estimate {}. Clamping to {} (~90% of estimate).".format(
+                        route_labels[seg_index],
+                        route_labels[seg_index + 1],
+                        _format_length_mm(req_mm),
+                        _format_length_mm(max_mm),
+                        _format_length_mm(clamp_mm),
+                    )
+                )
+                segment_target_lengths[seg_index] = clamped_cells
 
     deadline = time.monotonic() + 300.0
     segment_debug_lines: List[str] = []
