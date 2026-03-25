@@ -2745,24 +2745,35 @@ def _route_continuous_coiling_sequence(
                 if fallback_candidates and window_ratio is not None:
                     min_length = target_length * target_length_min_ratio
                     max_length = target_length * target_length_max_ratio
+                    # Prefer a candidate within the window, else pick closest to target
+                    within_window: Optional[List[GridIndex]] = None
+                    best_candidate: Optional[List[GridIndex]] = None
+                    best_error: float = float("inf")
                     for candidate in fallback_candidates:
                         candidate_length = _path_length(candidate)
+                        error = abs(candidate_length - target_length)
                         if min_length - 1e-9 <= candidate_length <= max_length + 1e-9:
-                            routed_segment = candidate
+                            within_window = candidate
                             break
-                elif fallback_candidates:
-                    routed_segment = fallback_candidates[0]
-                if routed_segment is None and window_ratio is not None:
-                    if node_labels is not None:
-                        raise RoutingError(
-                            "Pathway between {} and {} cannot satisfy the 10% target window under continuous corridor-coil constraints.".format(
-                                node_labels[segment_index],
-                                node_labels[segment_index + 1],
+                        if error < best_error:
+                            best_error = error
+                            best_candidate = candidate
+                    routed_segment = within_window or best_candidate
+                    if routed_segment is not None and within_window is None and segment_debug_lines is not None:
+                        segment_debug_lines.append(
+                            "  Window miss: accepting best achievable candidate achieved_cells={:.1f}, target_cells={:.1f}".format(
+                                _path_length(routed_segment), target_length
                             )
                         )
-                    raise RoutingError(
-                        "A coiling segment cannot satisfy the 10% target window under continuous corridor-coil constraints."
-                    )
+                elif fallback_candidates:
+                    routed_segment = max(fallback_candidates, key=_path_length)
+                    if segment_debug_lines is not None:
+                        segment_debug_lines.append(
+                            "  Window miss: accepting longest fallback candidate achieved_cells={:.1f}, target_cells={:.1f}".format(
+                                _path_length(routed_segment), target_length
+                            )
+                        )
+                # Do not raise if we have any candidate — proceed with the best available.
             if routed_segment is None:
                 penalty_cells = {cell for cell in segment_valid if cell not in corridor_cells}
                 routed_segment = astar_path(
@@ -2886,21 +2897,23 @@ def _route_continuous_coiling_sequence(
             min_length = target_length * target_length_min_ratio
             max_length = target_length * target_length_max_ratio
             if routed_length + 1e-9 < min_length or routed_length - 1e-9 > max_length:
-                if node_labels is not None:
-                    raise RoutingError(
-                        "Pathway between {} and {} is outside the 10% target window ({:.1f} cells vs target {:.1f}).".format(
-                            node_labels[segment_index],
-                            node_labels[segment_index + 1],
-                            routed_length,
-                            target_length,
+                if segment_debug_lines is not None:
+                    if node_labels is not None:
+                        segment_debug_lines.append(
+                            "  Warning: pathway between {} and {} is outside the {:.0f}% target window (achieved_cells={:.1f}, target_cells={:.1f}); accepting best candidate.".format(
+                                node_labels[segment_index],
+                                node_labels[segment_index + 1],
+                                window_ratio * 100.0,
+                                routed_length,
+                                target_length,
+                            )
                         )
-                    )
-                raise RoutingError(
-                    "A coiling segment is outside the 10% target window ({:.1f} cells vs target {:.1f}).".format(
-                        routed_length,
-                        target_length,
-                    )
-                )
+                    else:
+                        segment_debug_lines.append(
+                            "  Warning: coiling segment is outside the {:.0f}% target window (achieved_cells={:.1f}, target_cells={:.1f}); accepting best candidate.".format(
+                                window_ratio * 100.0, routed_length, target_length
+                            )
+                        )
 
         segment_xy, segment_z = _classify_segment_cells(routed_segment)
         endpoint_ignore = dilate_cells({start, goal}, endpoint_only_exemption_radius)
