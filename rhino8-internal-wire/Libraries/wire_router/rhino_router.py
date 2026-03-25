@@ -1618,7 +1618,8 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
                 )
                 segment_target_lengths[seg_index] = clamped_cells
 
-    deadline = time.monotonic() + 300.0
+    # Disable hard routing timeout to allow completion on large models
+    deadline = None
     segment_debug_lines: List[str] = []
     try:
         segments = route_node_sequence(

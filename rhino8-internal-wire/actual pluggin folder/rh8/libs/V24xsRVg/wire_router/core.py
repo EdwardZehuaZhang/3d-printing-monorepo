@@ -2595,6 +2595,13 @@ def _route_continuous_coiling_sequence(
                 coiling_space.difference_update(dilate_cells(occupied_xy, xy_xy_blocked_radius))
             if occupied_z and xy_z_blocked_radius > 0:
                 coiling_space.difference_update(dilate_cells(occupied_z, xy_z_blocked_radius))
+            # Ensure coils do not overlap with any node volume, including endpoints.
+            extra_keepout_radius = max(0, reserved_exemption_radius + node_edge_clearance_radius)
+            if extra_keepout_radius > 0:
+                node_keepout: Set[GridIndex] = set()
+                for n in node_sequence:
+                    node_keepout.update(dilate_cells({n}, extra_keepout_radius))
+                coiling_space.difference_update(node_keepout)
             coiling_space_cell_count = len(coiling_space)
             coiling_stats = {}
 
@@ -2663,7 +2670,8 @@ def _route_continuous_coiling_sequence(
                     start=coil_start,
                     goal=coil_end,
                     target_length=coil_target,
-                    xy_xy_spacing_radius=max(0, xy_xy_blocked_radius),
+                    # Enforce larger endpoint buffer around nodes to avoid overlap
+                    xy_xy_spacing_radius=max(0, xy_xy_blocked_radius, extra_keepout_radius),
                     xy_z_spacing_radius=max(0, xy_z_blocked_radius),
                     z_z_spacing_radius=max(0, z_z_blocked_radius),
                     vertical_move_penalty=vertical_move_penalty,
