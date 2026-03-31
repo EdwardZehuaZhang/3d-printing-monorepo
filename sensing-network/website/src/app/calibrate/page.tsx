@@ -727,12 +727,123 @@ export default function CalibratePage() {
             </motion.div>
           )}
 
-          {/* Info note */}
+          {/* Wiring Guide */}
           <motion.div
             initial="hidden"
             animate="visible"
             variants={fadeUp}
             custom={3}
+            className="mt-6 rounded-xl border-2 border-dashed border-primary/30 bg-primary/5 p-6"
+          >
+            <p className="mb-3 text-sm font-semibold text-primary">
+              How to wire the sensor block to your Arduino
+            </p>
+
+            {/* SVG wiring diagram */}
+            <div className="mb-5 overflow-x-auto rounded-lg bg-[#1a1a2e] p-5">
+              <svg viewBox="0 0 700 190" className="w-full max-w-[700px] mx-auto" style={{ minWidth: 420 }}>
+                {/* ── Row 1: Pin 5 —[ 10kΩ ]— Pin 2 ——— wire ——→ TRACE START ── */}
+
+                {/* Pin 5 label */}
+                <text x="10" y="44" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 5</text>
+                {/* wire to resistor */}
+                <line x1="68" y1="40" x2="110" y2="40" stroke="#60a5fa" strokeWidth="2" />
+                {/* resistor body */}
+                <rect x="110" y="28" width="80" height="24" rx="5" fill="#334155" stroke="#facc15" strokeWidth="2" />
+                <text x="150" y="45" textAnchor="middle" fill="#facc15" fontSize="11" fontWeight="bold" fontFamily="monospace">10kΩ</text>
+                {/* wire from resistor to Pin 2 */}
+                <line x1="190" y1="40" x2="250" y2="40" stroke="#60a5fa" strokeWidth="2" />
+                {/* Pin 2 label */}
+                <text x="253" y="44" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 2</text>
+                {/* long wire to block */}
+                <line x1="310" y1="40" x2="430" y2="40" stroke="#60a5fa" strokeWidth="2" strokeDasharray="8 4" />
+                {/* arrow */}
+                <polygon points="430,34 442,40 430,46" fill="#60a5fa" />
+                {/* wire label */}
+                <text x="370" y="30" textAnchor="middle" fill="#475569" fontSize="10" fontFamily="monospace">wire 1</text>
+
+                {/* Block trace start */}
+                <rect x="445" y="22" width="245" height="38" rx="6" fill="#1e293b" stroke="#3b82f6" strokeWidth="2" />
+                <text x="567" y="46" textAnchor="middle" fill="#60a5fa" fontSize="12" fontWeight="bold" fontFamily="monospace">TRACE START</text>
+
+                {/* Trace inside block: series chain */}
+                {/* Connector line down from trace start box */}
+                <line x1="567" y1="60" x2="567" y2="80" stroke="#3b82f6" strokeWidth="1.5" />
+
+                {/* Series node chain */}
+                <line x1="445" y1="100" x2="467" y2="100" stroke="#475569" strokeWidth="1.5" />
+                {/* N1 */}
+                <circle cx="480" cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
+                <text x="480" y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N1</text>
+                <line x1="493" y1="100" x2="527" y2="100" stroke="#475569" strokeWidth="1.5" />
+                {/* N2 */}
+                <circle cx="540" cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
+                <text x="540" y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N2</text>
+                <line x1="553" y1="100" x2="587" y2="100" stroke="#475569" strokeWidth="1.5" />
+                {/* N3 */}
+                <circle cx="600" cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
+                <text x="600" y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N3</text>
+                <line x1="613" y1="100" x2="647" y2="100" stroke="#475569" strokeWidth="1.5" />
+                {/* N4 */}
+                <circle cx="660" cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
+                <text x="660" y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N4</text>
+                <line x1="673" y1="100" x2="690" y2="100" stroke="#475569" strokeWidth="1.5" />
+
+                {/* "inside block" bracket */}
+                <rect x="440" y="82" width="255" height="36" rx="6" fill="none" stroke="#3b82f6" strokeWidth="1" strokeDasharray="4 3" opacity="0.4" />
+                <text x="567" y="133" textAnchor="middle" fill="#475569" fontSize="9" fontFamily="monospace">conductive trace inside block (nodes in series)</text>
+
+                {/* ── Row 2: Pin 3 ——— wire ——→ TRACE END ── */}
+
+                {/* Pin 3 label */}
+                <text x="10" y="162" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 3</text>
+                {/* long wire to block */}
+                <line x1="68" y1="158" x2="430" y2="158" stroke="#60a5fa" strokeWidth="2" strokeDasharray="8 4" />
+                {/* arrow */}
+                <polygon points="430,152 442,158 430,164" fill="#60a5fa" />
+                {/* wire label */}
+                <text x="250" y="148" textAnchor="middle" fill="#475569" fontSize="10" fontFamily="monospace">wire 2</text>
+
+                {/* Block trace end */}
+                <rect x="445" y="140" width="245" height="38" rx="6" fill="#1e293b" stroke="#3b82f6" strokeWidth="2" />
+                <text x="567" y="164" textAnchor="middle" fill="#60a5fa" fontSize="12" fontWeight="bold" fontFamily="monospace">TRACE END</text>
+              </svg>
+            </div>
+
+            {/* Simple step-by-step */}
+            <div className="space-y-3">
+              <p className="text-xs font-semibold uppercase tracking-wider text-primary/70">
+                3 connections — that&apos;s it
+              </p>
+              <ol className="space-y-2 text-sm text-text-secondary">
+                <li className="flex items-start gap-3">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary text-[11px] font-bold text-white">1</span>
+                  <span>Plug a <strong className="text-text-primary">10k&Omega; resistor</strong> between <strong className="text-text-primary">Pin 5</strong> and <strong className="text-text-primary">Pin 2</strong> on the Arduino.</span>
+                </li>
+                <li className="flex items-start gap-3">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary text-[11px] font-bold text-white">2</span>
+                  <span>Run a wire from <strong className="text-text-primary">Pin 2</strong> to the <strong className="text-text-primary">trace start</strong> on your 3D-printed block (the wire entering the first node).</span>
+                </li>
+                <li className="flex items-start gap-3">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary text-[11px] font-bold text-white">3</span>
+                  <span>Run a wire from <strong className="text-text-primary">Pin 3</strong> to the <strong className="text-text-primary">trace end</strong> on your block (the wire exiting the last node).</span>
+                </li>
+              </ol>
+            </div>
+
+            <div className="mt-4 h-px bg-primary/20" />
+            <p className="mt-3 text-xs leading-relaxed text-text-tertiary">
+              <strong className="text-text-secondary">Resistor sizing:</strong>{" "}
+              Use 10k&Omega; for low path resistance (&lt;50k&Omega;), 100k&ndash;1M&Omega; for high path resistance (&gt;100k&Omega;). Rule of thumb: external resistor should be 0.3&times;&ndash;1&times; the total trace resistance.
+            </p>
+          </motion.div>
+
+          {/* Info note */}
+          <motion.div
+            initial="hidden"
+            animate="visible"
+            variants={fadeUp}
+            custom={4}
             className="mt-6 rounded-xl border-2 border-dashed border-secondary/30 bg-secondary/5 p-6"
           >
             <p className="mb-1 text-sm font-semibold text-secondary">
