@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<RhinoUI guid="17b2b8e4-030d-4607-ace4-9004a6203486" plug_in_guid="17b2b8e4-030d-4607-ace4-9004a6203486" major_ver="5" minor_ver="0" localize="False" default_language_id="1033">
+<RhinoUI guid="17b2b8e4-030d-4607-ace4-9004a6203486" plug_in_guid="17b2b8e4-030d-4607-ace4-9004a6203486" major_ver="8" minor_ver="0" localize="False" default_language_id="1033">
   <extend_rhino_menus />
   <menus />
   <tool_bar_groups>

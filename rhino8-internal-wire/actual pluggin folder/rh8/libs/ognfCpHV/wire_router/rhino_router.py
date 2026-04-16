@@ -25,19 +25,16 @@ from .core import (
     index_to_point,
     optimize_node_order_for_target_leg_length,
     route_node_sequence,
-    estimate_segment_max_length,
 )
 
 
 MAX_ESTIMATED_CELLS = 180000
-FIXED_WIRE_DIAMETER_XY_MM = 0.8
-FIXED_WIRE_DIAMETER_Z_MM = 1.2
+DEFAULT_WIRE_DIAMETER_MM = 1.5
+MIN_WIRE_DIAMETER_MM = 0.5
 CASING_THICKNESS_MM = 0.5
 BOUNDARY_CLEARANCE_MM = 0.5
-CENTER_SPACING_XY_TO_XY_MM = 1.8
-CENTER_SPACING_XY_TO_Z_MM = 2.0
-CENTER_SPACING_Z_TO_Z_MM = 2.2
-NODE_EDGE_CLEARANCE_MM = 1.0
+PATH_SEPARATION_MM = 1.0
+MIN_INTRA_PATH_GAP_MM = 1.0
 DEFAULT_TOUCH_NODE_FLUSH_DIAMETER_MM = 10.0
 MIN_TOUCH_NODE_FLUSH_DIAMETER_MM = 0.5
 TERMINAL_DIAMETER_MM = 3.0
@@ -48,21 +45,11 @@ MAX_ORDER_CANDIDATES = 5
 DEFAULT_TOUCH_READING_DELTA_KOHM = 10.0
 MIN_ALLOWED_TOUCH_READING_DELTA_KOHM = 1.0
 SUGGESTED_SERIES_RESISTOR_RANGE_OHM = (470000.0, 2200000.0)
-# Calibrated March 2026 for 0.8 mm XY and 1.2 mm Z conductive paths
-# Based on empirical measurements provided by the user:
-#   - XY slope ≈ 44.5 Ω/mm (0.0445 kohm/mm)
-#   - Z  slope ≈ 42.857 Ω/mm (0.042857 kohm/mm)
-# These values are used to convert between desired resistance deltas and
-# target routed lengths, and to report estimated segment/total resistance.
-CAL_XY_OHM_PER_MM = 44.5
-CAL_Z_OHM_PER_MM = 42.857
-# Effective average used for quick length targeting before a path exists
-CAL_EFFECTIVE_OHM_PER_MM = (CAL_XY_OHM_PER_MM + CAL_Z_OHM_PER_MM) * 0.5  # ≈ 43.6785 Ω/mm
+PROTO_PASTA_BASE_DIAMETER_MM = 1.5
+PROTO_PASTA_RESISTANCE_KOHM_PER_100MM = (4.8, 5.0)
 PRINT_LAYER_HEIGHT_MM = 0.2
 LAYER_COMPACTION_VERTICAL_MOVE_PENALTY = 2.0
-TARGET_WINDOW_RATIO = 0.10
-CORRIDOR_TWO_Z_PATH_TOTAL_WIDTH_MM = 3.4
-ROUTER_BUILD_TAG = "2026-03-25 continuous-corridor-coil-z-order-windowed-thin-corridor"
+ROUTER_BUILD_TAG = "2026-03-11 node-clearance-and-fill"
 
 
 @dataclass(frozen=True)
@@ -669,7 +656,7 @@ class _TerminalGetter(ric.GetPoint):
         terminal_radius: float,
         minimum_clearance: float,
         tolerance: float,
-        default_protrudes: bool = False,
+        initial_protrude: bool = False,
     ) -> None:
         super(_TerminalGetter, self).__init__()
         self._mesh = mesh
@@ -678,7 +665,7 @@ class _TerminalGetter(ric.GetPoint):
         self._terminal_radius = terminal_radius
         self._minimum_clearance = minimum_clearance
         self._tolerance = tolerance
-        self.protrude_toggle = ric.OptionToggle(default_protrudes, "Flush", "Protrude")
+        self.protrude_toggle = ric.OptionToggle(initial_protrude, "Flush", "Protrude")
 
     def OnDynamicDraw(self, e: ri.GetPointDrawEventArgs) -> None:
         super(_TerminalGetter, self).OnDynamicDraw(e)
@@ -717,17 +704,12 @@ def _collect_terminals(
     tolerance: float,
 ) -> Optional[Tuple[TerminalPlacement, TerminalPlacement]]:
     terminals: List[TerminalPlacement] = []
-    start_default_protrudes = False
+    start_protrudes: Optional[bool] = None
 
     for label in ("Start", "End"):
         gp = _TerminalGetter(
-            mesh,
-            label,
-            terminals,
-            terminal_radius,
-            minimum_clearance,
-            tolerance,
-            default_protrudes=start_default_protrudes if label == "End" else False,
+            mesh, label, terminals, terminal_radius, minimum_clearance, tolerance,
+            initial_protrude=start_protrudes if (label == "End" and start_protrudes is not None) else False,
         )
         gp.SetCommandPrompt("Pick the {} terminal on the outer surface".format(label.lower()))
         gp.Constrain(mesh, False)
@@ -743,6 +725,8 @@ def _collect_terminals(
                 return None
 
             protrudes = bool(gp.protrude_toggle.CurrentValue)
+            if label == "Start":
+                start_protrudes = protrudes
             anchor_depth = terminal_radius if protrudes else terminal_length
             terminal = _create_terminal(
                 mesh,
@@ -766,8 +750,6 @@ def _collect_terminals(
                 continue
 
             terminals.append(terminal)
-            if label == "Start":
-                start_default_protrudes = protrudes
             break
 
     return terminals[0], terminals[1]
@@ -973,35 +955,11 @@ def _segments_to_polyline_points(
     grid: GridSpec,
     tolerance: float,
 ) -> List[rg.Point3d]:
-    def _axis_connect(a: rg.Point3d, b: rg.Point3d) -> List[rg.Point3d]:
-        """Return axis-aligned connectors from a to b (no diagonals).
-
-        Uses X -> Y -> Z stepping order. Skips zero-length legs.
-        """
-        pts: List[rg.Point3d] = []
-        current = rg.Point3d(a.X, a.Y, a.Z)
-        if abs(b.X - current.X) > tolerance:
-            current = rg.Point3d(b.X, current.Y, current.Z)
-            pts.append(current)
-        if abs(b.Y - current.Y) > tolerance:
-            current = rg.Point3d(current.X, b.Y, current.Z)
-            pts.append(current)
-        if abs(b.Z - current.Z) > tolerance:
-            current = rg.Point3d(current.X, current.Y, b.Z)
-            pts.append(current)
-        return pts
-
     combined: List[rg.Point3d] = [anchor_points[0]]
 
     for index, segment in enumerate(segments):
         segment_points = [_grid_point(cell, grid) for cell in segment]
-        # Stitch with axis-aligned joins to avoid any diagonal pipes near anchors
-        stitched: List[rg.Point3d] = [anchor_points[index]]
-        for pt in segment_points:
-            stitched.extend(_axis_connect(stitched[-1], pt))
-            stitched.append(pt)
-        stitched.extend(_axis_connect(stitched[-1], anchor_points[index + 1]))
-        stitched.append(anchor_points[index + 1])
+        stitched = [anchor_points[index]] + segment_points + [anchor_points[index + 1]]
         if index > 0:
             stitched = stitched[1:]
 
@@ -1045,16 +1003,12 @@ def _nodes_from_order_indices(
 def _segment_solids(
     doc: Rhino.RhinoDoc,
     points: Sequence[rg.Point3d],
-    radius_xy: float,
-    radius_z: float,
+    radius: float,
 ) -> List[rg.Brep]:
     solids: List[rg.Brep] = []
     for start, end in zip(points[:-1], points[1:]):
         if start.DistanceTo(end) <= doc.ModelAbsoluteTolerance:
             continue
-        direction = end - start
-        xy_length = math.sqrt((direction.X * direction.X) + (direction.Y * direction.Y))
-        radius = radius_z if abs(direction.Z) > xy_length else radius_xy
         line_curve = rg.LineCurve(start, end)
         pipes = rg.Brep.CreatePipe(
             line_curve,
@@ -1069,7 +1023,7 @@ def _segment_solids(
             solids.extend(pipe for pipe in pipes if pipe is not None and pipe.IsValid)
 
     for point in points:
-        sphere = rg.Sphere(point, radius_xy).ToBrep()
+        sphere = rg.Sphere(point, radius).ToBrep()
         if sphere is not None and sphere.IsValid:
             solids.append(sphere)
     return solids
@@ -1157,21 +1111,11 @@ def _cumulative_anchor_lengths(
 def _resistance_range_kohm(
     doc: Rhino.RhinoDoc, length_in_model_units: float, wire_diameter_mm: float
 ) -> Tuple[float, float]:
-    """
-    Estimate resistance range in kohm for a routed path length.
-
-    Uses calibrated per-mm ohmic slopes for XY and Z to provide a small range
-    that reflects anisotropy. Since we do not decompose the path into XY/Z
-    at this stage, we report [Z-slope * L, XY-slope * L] as [low, high].
-    The wire_diameter_mm parameter is ignored because the calibration already
-    accounts for the fixed diameters in this command (0.8 mm XY, 1.2 mm Z).
-    """
     length_mm = _model_to_mm(doc, length_in_model_units)
-    low_kohm = (CAL_Z_OHM_PER_MM * length_mm) / 1000.0
-    high_kohm = (CAL_XY_OHM_PER_MM * length_mm) / 1000.0
-    if low_kohm > high_kohm:
-        low_kohm, high_kohm = high_kohm, low_kohm
-    return low_kohm, high_kohm
+    diameter_ratio_sq = (PROTO_PASTA_BASE_DIAMETER_MM / wire_diameter_mm) ** 2
+    low = PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] * diameter_ratio_sq * (length_mm / 100.0)
+    high = PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1] * diameter_ratio_sq * (length_mm / 100.0)
+    return low, high
 
 
 def _nominal_resistance_kohm(
@@ -1182,17 +1126,13 @@ def _nominal_resistance_kohm(
 
 
 def _reading_delta_length(doc: Rhino.RhinoDoc, delta_kohm: float, wire_diameter_mm: float) -> float:
-    """
-    Convert a desired touch-to-touch resistance delta (in kohm) into an
-    approximate target routed length (in model units) for that leg.
-
-    We use the calibrated effective ohmic slope (Ω/mm), averaged across XY/Z,
-    because the actual XY/Z mix is not yet known at this stage. This produces
-    a more accurate target than the previous diameter-scaled ProtoPasta model
-    when using fixed 0.8 mm (XY) and 1.2 mm (Z) traces.
-    """
-    effective_ohm_per_mm = CAL_EFFECTIVE_OHM_PER_MM  # Ω/mm
-    required_mm = (delta_kohm * 1000.0) / effective_ohm_per_mm
+    mean_kohm_per_100mm = (
+        (PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[0] + PROTO_PASTA_RESISTANCE_KOHM_PER_100MM[1])
+        * 0.5
+        * (PROTO_PASTA_BASE_DIAMETER_MM / wire_diameter_mm) ** 2
+    )
+    mean_kohm_per_mm = mean_kohm_per_100mm / 100.0
+    required_mm = delta_kohm / mean_kohm_per_mm
     return _mm_to_model(doc, required_mm)
 
 
@@ -1362,29 +1302,13 @@ def _protected_anchor_cells(
 def _segment_target_lengths(
     route_points: Sequence[rg.Point3d],
     target_touch_leg_length: float,
-    coiling_segment_indices: Optional[Set[int]] = None,
 ) -> List[Optional[float]]:
     targets: List[Optional[float]] = [None for _ in range(max(0, len(route_points) - 1))]
-    if coiling_segment_indices is None:
-        for segment_index in range(1, max(1, len(route_points) - 2)):
-            if segment_index >= len(targets) - 1:
-                break
-            targets[segment_index] = target_touch_leg_length
-        return targets
-
-    for segment_index in coiling_segment_indices:
-        if 0 <= segment_index < len(targets):
-            targets[segment_index] = target_touch_leg_length
+    for segment_index in range(1, max(1, len(route_points) - 2)):
+        if segment_index >= len(targets) - 1:
+            break
+        targets[segment_index] = target_touch_leg_length
     return targets
-
-
-def _forced_touch_chain_order(
-    touch_nodes: Sequence[TouchNodePlacement],
-) -> List[TouchNodePlacement]:
-    return sorted(
-        touch_nodes,
-        key=lambda node: (node.anchor_point.Z, node.anchor_point.X, node.anchor_point.Y),
-    )
 
 
 def _add_output_geometry(
@@ -1393,8 +1317,7 @@ def _add_output_geometry(
     polyline_points: Sequence[rg.Point3d],
     touch_nodes: Sequence[TouchNodePlacement],
     terminals: Sequence[TerminalPlacement],
-    wire_radius_xy: float,
-    wire_radius_z: float,
+    wire_radius: float,
     node_radius: float,
     terminal_radius: float,
     terminal_length: float,
@@ -1405,7 +1328,7 @@ def _add_output_geometry(
     if not _add_named_curve(doc, polyline_points, "GenerateInternalWire_Centerline"):
         return False
 
-    path_breps = _segment_solids(doc, polyline_points, wire_radius_xy, wire_radius_z)
+    path_breps = _segment_solids(doc, polyline_points, wire_radius)
     touch_node_breps = _touch_node_conductive_breps(
         touch_nodes,
         host_brep,
@@ -1442,6 +1365,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
 
     casing_thickness = _mm_to_model(doc, CASING_THICKNESS_MM)
     boundary_clearance = _mm_to_model(doc, BOUNDARY_CLEARANCE_MM)
+    path_separation = _mm_to_model(doc, PATH_SEPARATION_MM)
     terminal_radius = _mm_to_model(doc, TERMINAL_DIAMETER_MM * 0.5)
     terminal_length = _mm_to_model(doc, TERMINAL_LENGTH_MM)
 
@@ -1461,29 +1385,20 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
     if flush_node_diameter_mm is None:
         return Rhino.Commands.Result.Cancel
 
-    wire_diameter_xy_mm = FIXED_WIRE_DIAMETER_XY_MM
-    wire_diameter_z_mm = FIXED_WIRE_DIAMETER_Z_MM
-    wire_radius_xy = _mm_to_model(doc, wire_diameter_xy_mm * 0.5)
-    wire_radius_z = _mm_to_model(doc, wire_diameter_z_mm * 0.5)
-    route_clearance = max(wire_radius_xy, wire_radius_z) + casing_thickness + boundary_clearance
+    wire_diameter_mm = _get_conductive_path_diameter_mm(flush_node_diameter_mm)
+    if wire_diameter_mm is None:
+        return Rhino.Commands.Result.Cancel
 
-    target_touch_reading_delta_kohm = _get_target_touch_reading_delta_kohm(wire_diameter_xy_mm)
+    wire_radius = _mm_to_model(doc, wire_diameter_mm * 0.5)
+    route_clearance = wire_radius + casing_thickness + boundary_clearance
+
+    target_touch_reading_delta_kohm = _get_target_touch_reading_delta_kohm(wire_diameter_mm)
     if target_touch_reading_delta_kohm is None:
         return Rhino.Commands.Result.Cancel
 
     node_radius = _mm_to_model(doc, flush_node_diameter_mm * 0.5)
-    target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm, wire_diameter_xy_mm)
+    target_leg_length = _reading_delta_length(doc, target_touch_reading_delta_kohm, wire_diameter_mm)
     target_leg_length_mm = _model_to_mm(doc, target_leg_length)
-
-    # Preflight feasibility hint: print required mm per leg and per-kohm ratio
-    mm_per_kohm = 1000.0 / CAL_EFFECTIVE_OHM_PER_MM
-    Rhino.RhinoApp.WriteLine(
-        "Preflight: {:.1f} kohm per leg requires ~{} of conductive trace (≈ {:.1f} mm/kohm)".format(
-            float(target_touch_reading_delta_kohm),
-            _format_length_mm(float(target_touch_reading_delta_kohm) * mm_per_kohm),
-            mm_per_kohm,
-        )
-    )
 
     terminals = _collect_terminals(
         mesh,
@@ -1502,197 +1417,155 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         terminals,
         node_radius,
         terminal_radius,
-        _mm_to_model(doc, NODE_EDGE_CLEARANCE_MM),
+        path_separation,
         tolerance,
     )
     if touch_nodes is None:
         return Rhino.Commands.Result.Cancel
-    if len(touch_nodes) < 2:
-        Rhino.RhinoApp.WriteLine("At least two touch nodes are required for continuous chain routing.")
-        return Rhino.Commands.Result.Failure
-    Rhino.RhinoApp.WriteLine(
-        "Collected {} touch nodes: {}".format(
-            len(touch_nodes),
-            ", ".join(node.label for node in touch_nodes),
-        )
-    )
 
-    step = _auto_step(mesh, doc, wire_diameter_z_mm, node_count=len(touch_nodes))
+    step = _auto_step(mesh, doc, wire_diameter_mm, node_count=len(touch_nodes))
 
     Rhino.RhinoApp.WriteLine("Routing...")
     valid_cells, grid = _build_valid_grid(mesh, step, route_clearance, tolerance)
     if not valid_cells:
         Rhino.RhinoApp.WriteLine(
             "No valid routing space was found. The part is too small for a {:.2f} mm conductive trace while also keeping {:.1f} mm clearance from the outer wall and {:.1f} mm spacing around the trace."
-            .format(wire_diameter_z_mm, BOUNDARY_CLEARANCE_MM, NODE_EDGE_CLEARANCE_MM)
+            .format(wire_diameter_mm, BOUNDARY_CLEARANCE_MM, PATH_SEPARATION_MM)
         )
         return Rhino.Commands.Result.Failure
 
-    ordered_touch_nodes = _forced_touch_chain_order(touch_nodes)
+    Rhino.RhinoApp.WriteLine("Ranking touch-node orders...")
+    order_candidates = _target_order_candidates(
+        start_terminal,
+        touch_nodes,
+        end_terminal,
+        target_leg_length,
+    )
 
     # dilate_cells blocks cells within Chebyshev radius R of each path
     # cell, so the next path starts at distance R+1.  We need
     # (R+1)*step >= wire_diameter + PATH_SEPARATION for the required
     # edge-to-edge gap, i.e.  R >= (wire_d + sep) / step - 1.
-    spacing_xy_xy_radius = max(1, int(math.ceil(
-        (CENTER_SPACING_XY_TO_XY_MM * _mm_to_model(doc, 1.0)) / step - 1.0
+    spacing_radius = max(1, int(math.ceil(
+        (wire_diameter_mm + PATH_SEPARATION_MM) * _mm_to_model(doc, 1.0) / step - 1.0
     )))
-    spacing_xy_z_radius = max(1, int(math.ceil(
-        (CENTER_SPACING_XY_TO_Z_MM * _mm_to_model(doc, 1.0)) / step - 1.0
-    )))
-    spacing_z_z_radius = max(1, int(math.ceil(
-        (CENTER_SPACING_Z_TO_Z_MM * _mm_to_model(doc, 1.0)) / step - 1.0
-    )))
-    corridor_radius_cells = max(
-        1,
-        int(math.ceil((_mm_to_model(doc, CORRIDOR_TWO_Z_PATH_TOTAL_WIDTH_MM * 0.5)) / step)),
-    )
-    node_exemption_radius = 1
+    # The node exemption covers the physical node radius so paths can
+    # reach the node through blocked zones, but no larger — oversized
+    # exemption zones allow parallel paths with no inter-segment gap.
+    node_exemption_radius = spacing_radius
 
-    route_points = [start_terminal.anchor_point] + [node.anchor_point for node in ordered_touch_nodes] + [end_terminal.anchor_point]
-    route_labels = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
-    if len(ordered_touch_nodes) != len(touch_nodes):
-        Rhino.RhinoApp.WriteLine(
-            "Routing order construction failed integrity check: selected {} nodes, ordered {} nodes.".format(
-                len(touch_nodes),
-                len(ordered_touch_nodes),
+    # Minimum intra-path spacing for U-turns and serpentine fills.
+    # ceil((wire_d + gap) / step) gives the minimum center-to-center
+    # distance in grid cells so that edge-to-edge gap >= MIN_INTRA_PATH_GAP_MM.
+    min_self_spacing = max(1, int(math.ceil(
+        (wire_diameter_mm + MIN_INTRA_PATH_GAP_MM) * _mm_to_model(doc, 1.0) / step
+    )))
+
+    selected_candidate: Optional[TouchNodeOrderCandidate] = None
+    selected_touch_nodes: List[TouchNodePlacement] = []
+    selected_route_points: List[rg.Point3d] = []
+    selected_route_labels: List[str] = []
+    selected_segments: List[List[GridIndex]] = []
+    first_failure_reason: Optional[str] = None
+    first_failure_order: Optional[List[str]] = None
+    attempted_orders = 0
+
+    for candidate in order_candidates:
+        ordered_touch_nodes = list(candidate.ordered_nodes)
+        route_points = [start_terminal.anchor_point] + [node.anchor_point for node in ordered_touch_nodes] + [end_terminal.anchor_point]
+        route_labels = [start_terminal.label] + [node.label for node in ordered_touch_nodes] + [end_terminal.label]
+        # Convert target_leg_length from model units (mm) to grid-cell
+        # units so that _path_length() comparisons inside core.py are
+        # consistent — _path_length() returns Euclidean distance
+        # in grid-index space where each step equals 1.0.
+        target_leg_length_cells = target_leg_length / step
+        segment_target_lengths = _segment_target_lengths(route_points, target_leg_length_cells)
+
+        node_cells: List[GridIndex] = []
+        mapping_failed = False
+        for point in route_points:
+            cell = _find_nearest_valid_cell(point, valid_cells, grid)
+            if cell is None:
+                mapping_failed = True
+                break
+            node_cells.append(cell)
+        if mapping_failed:
+            Rhino.RhinoApp.WriteLine(
+                "A selected terminal or touch node could not be placed into the usable internal volume. Choose a location with more internal space."
             )
-        )
-        return Rhino.Commands.Result.Failure
-    selected_labels = sorted(node.label for node in touch_nodes)
-    ordered_labels_check = sorted(node.label for node in ordered_touch_nodes)
-    if selected_labels != ordered_labels_check:
-        Rhino.RhinoApp.WriteLine(
-            "Routing order integrity mismatch: selected nodes and ordered nodes differ."
-        )
-        return Rhino.Commands.Result.Failure
+            return Rhino.Commands.Result.Failure
 
-    target_leg_length_cells = target_leg_length / step
-    coiling_segment_indices = set(range(1, max(1, len(route_points) - 2)))
-    segment_target_lengths = _segment_target_lengths(
-        route_points,
-        target_leg_length_cells,
-        coiling_segment_indices=coiling_segment_indices,
-    )
-
-    node_cells: List[GridIndex] = []
-    mapping_failed = False
-    for point in route_points:
-        cell = _find_nearest_valid_cell(point, valid_cells, grid)
-        if cell is None:
-            mapping_failed = True
-            break
-        node_cells.append(cell)
-    if mapping_failed:
-        Rhino.RhinoApp.WriteLine(
-            "A selected terminal or touch node could not be placed into the usable internal volume. Choose a location with more internal space."
+        anchor_radii = [terminal_radius] + [node_radius for _ in ordered_touch_nodes] + [terminal_radius]
+        reserved_cells, reserved_exemption_radius = _protected_anchor_cells(
+            anchor_cells=node_cells,
+            anchor_radii=anchor_radii,
+            step=step,
         )
-        return Rhino.Commands.Result.Failure
-    if len(set(node_cells)) != len(node_cells):
-        Rhino.RhinoApp.WriteLine(
-            "Two or more selected nodes collapsed to the same routing cell. Reposition nodes farther apart or increase geometry scale."
-        )
-        return Rhino.Commands.Result.Failure
 
-    anchor_radii = [terminal_radius] + [node_radius for _ in ordered_touch_nodes] + [terminal_radius]
-    reserved_cells, reserved_exemption_radius = _protected_anchor_cells(
-        anchor_cells=node_cells,
-        anchor_radii=anchor_radii,
-        step=step,
-    )
-
-    # Auto-clamp to feasible per-segment targets using a quick, optimistic estimate.
-    # This prevents hard failures when the requested kohm implies more length
-    # than the interior can reasonably provide.
-    if segment_target_lengths is not None and coiling_segment_indices:
-        Rhino.RhinoApp.WriteLine("Preflight: estimating per-leg feasible lengths and applying auto-clamps if necessary...")
-        for seg_index in sorted(coiling_segment_indices):
-            if seg_index < 0 or seg_index >= len(segment_target_lengths):
-                continue
-            target_cells = segment_target_lengths[seg_index]
-            if target_cells is None or target_cells <= 0:
-                continue
-            est_max_cells = estimate_segment_max_length(
+        attempted_orders += 1
+        per_order_budget = max(60.0, 300.0 / max(1, len(order_candidates)))
+        deadline = time.monotonic() + per_order_budget
+        try:
+            segments = route_node_sequence(
                 valid_cells=valid_cells,
                 node_sequence=node_cells,
-                segment_index=seg_index,
+                segment_target_lengths=segment_target_lengths,
+                penalty_radius=0,
+                penalty_weight=step,
+                blocked_radius=spacing_radius,
+                blocked_exemption_radius=node_exemption_radius,
                 reserved_cells=reserved_cells,
                 reserved_exemption_radius=reserved_exemption_radius,
-                blocked_exemption_radius=node_exemption_radius,
+                node_labels=route_labels,
+                allow_diagonals=False,
                 vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
-                corridor_radius_cells=corridor_radius_cells,
-                xy_xy_blocked_radius=spacing_xy_xy_radius,
-                xy_z_blocked_radius=spacing_xy_z_radius,
-                z_z_blocked_radius=spacing_z_z_radius,
-                efficiency=0.35,
+                deadline=deadline,
+                min_self_spacing=min_self_spacing,
             )
-            if est_max_cells + 1e-9 < target_cells:
-                clamped_cells = max(0.0, est_max_cells * 0.90)
-                req_mm = target_cells * step
-                max_mm = est_max_cells * step
-                clamp_mm = clamped_cells * step
-                Rhino.RhinoApp.WriteLine(
-                    "Auto-clamp: requested {}→{} target {} exceeds quick estimate {}. Clamping to {} (~90% of estimate).".format(
-                        route_labels[seg_index],
-                        route_labels[seg_index + 1],
-                        _format_length_mm(req_mm),
-                        _format_length_mm(max_mm),
-                        _format_length_mm(clamp_mm),
-                    )
-                )
-                segment_target_lengths[seg_index] = clamped_cells
+        except RoutingError as error:
+            if first_failure_reason is None:
+                first_failure_reason = str(error)
+                first_failure_order = [node.label for node in ordered_touch_nodes]
+            continue
 
-    # Disable hard routing timeout to allow completion on large models
-    deadline = None
-    segment_debug_lines: List[str] = []
-    try:
-        segments = route_node_sequence(
-            valid_cells=valid_cells,
-            node_sequence=node_cells,
-            segment_target_lengths=segment_target_lengths,
-            penalty_radius=0,
-            penalty_weight=step,
-            blocked_radius=spacing_xy_xy_radius,
-            blocked_exemption_radius=node_exemption_radius,
-            reserved_cells=reserved_cells,
-            reserved_exemption_radius=reserved_exemption_radius,
-            node_labels=route_labels,
-            allow_diagonals=False,
-            vertical_move_penalty=LAYER_COMPACTION_VERTICAL_MOVE_PENALTY,
-            deadline=deadline,
-            use_continuous_coiling=True,
-            coiling_segment_indices=coiling_segment_indices,
-            corridor_span=(1, len(node_cells) - 2),
-            xy_xy_blocked_radius=spacing_xy_xy_radius,
-            xy_z_blocked_radius=spacing_xy_z_radius,
-            z_z_blocked_radius=spacing_z_z_radius,
-            node_edge_clearance_radius=max(
-                1,
-                int(math.ceil((_mm_to_model(doc, NODE_EDGE_CLEARANCE_MM)) / step))
-            ),
-            target_window_ratio=TARGET_WINDOW_RATIO,
-            corridor_radius_cells=corridor_radius_cells,
-            segment_debug_lines=segment_debug_lines,
-        )
-    except RoutingError as error:
-        for debug_line in segment_debug_lines:
-            Rhino.RhinoApp.WriteLine(debug_line)
-        Rhino.RhinoApp.WriteLine(
-            "Routing failed under continuous corridor-coil constraints: {}".format(str(error).rstrip("."))
-        )
+        selected_candidate = candidate
+        selected_touch_nodes = ordered_touch_nodes
+        selected_route_points = route_points
+        selected_route_labels = route_labels
+        selected_segments = segments
+        break
+
+    if selected_candidate is None:
+        if first_failure_reason is not None and first_failure_order is not None:
+            Rhino.RhinoApp.WriteLine(
+                "No touch-node order could be routed after checking {} candidate order(s).".format(
+                    attempted_orders
+                )
+            )
+            Rhino.RhinoApp.WriteLine(
+                "The closest match to the target was {}. It failed because {}".format(
+                    " -> ".join(first_failure_order),
+                    first_failure_reason.rstrip("."),
+                )
+            )
+            Rhino.RhinoApp.WriteLine(
+                "This does not always mean the whole part is too small. It means at least one segment did not have enough local space once the trace diameter, node protection zones, wall clearance, and trace spacing were applied."
+            )
+        else:
+            Rhino.RhinoApp.WriteLine(
+                "No valid route could be found with the current geometry and spacing rules."
+            )
         return Rhino.Commands.Result.Failure
 
-    for debug_line in segment_debug_lines:
-        Rhino.RhinoApp.WriteLine(debug_line)
-
+    ordered_touch_nodes = selected_touch_nodes
     ordered_labels = [node.label for node in ordered_touch_nodes]
 
     # Print the routed node path sequence.
     path_sequence = [start_terminal.label] + ordered_labels + [end_terminal.label]
     Rhino.RhinoApp.WriteLine("Routed path: {}".format(" -> ".join(path_sequence)))
 
-    polyline_points = _segments_to_polyline_points(route_points, segments, grid, tolerance)
-    cumulative_lengths = _cumulative_anchor_lengths(polyline_points, route_points, tolerance)
+    polyline_points = _segments_to_polyline_points(selected_route_points, selected_segments, grid, tolerance)
+    cumulative_lengths = _cumulative_anchor_lengths(polyline_points, selected_route_points, tolerance)
     touch_segment_lengths = _touch_segment_lengths_from_cumulative_lengths(cumulative_lengths)
     vertical_span_mm = _polyline_vertical_span(doc, polyline_points)
     vertical_layer_span = _vertical_layer_height_span(polyline_points, doc)
@@ -1701,7 +1574,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
             doc,
             ordered_labels,
             touch_segment_lengths,
-            wire_diameter_xy_mm,
+            wire_diameter_mm,
             "Resistance between touch nodes:",
         )
 
@@ -1711,8 +1584,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         polyline_points,
         ordered_touch_nodes,
         terminals,
-        wire_radius_xy,
-        wire_radius_z,
+        wire_radius,
         node_radius,
         terminal_radius,
         terminal_length,
@@ -1722,7 +1594,7 @@ def run_generate_internal_wire() -> Rhino.Commands.Result:
         )
         return Rhino.Commands.Result.Failure
 
-    total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1], wire_diameter_xy_mm)
+    total_low, total_high = _resistance_range_kohm(doc, cumulative_lengths[-1], wire_diameter_mm)
     Rhino.RhinoApp.WriteLine(
         "Total resistance: {:.1f}-{:.1f} kohm.".format(total_low, total_high)
     )

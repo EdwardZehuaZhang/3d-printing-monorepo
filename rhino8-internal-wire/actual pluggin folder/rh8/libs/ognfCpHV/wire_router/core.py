@@ -101,61 +101,6 @@ def _bottleneck_threshold(roominess_map: RoominessMap) -> int:
     return values[percentile_index]
 
 
-def _allocate_proportional_layer_counts(total_layers: int, weights: Sequence[float]) -> List[int]:
-    if total_layers <= 0 or not weights:
-        return [0 for _ in weights]
-
-    count = len(weights)
-    minimum = [1 for _ in range(count)]
-    if total_layers <= count:
-        return [1 if idx < total_layers else 0 for idx in range(count)]
-
-    remaining = total_layers - count
-    safe_weights = [max(0.0, weight) for weight in weights]
-    total_weight = sum(safe_weights)
-    if total_weight <= 1e-9:
-        safe_weights = [1.0 for _ in weights]
-        total_weight = float(count)
-
-    raw = [remaining * (weight / total_weight) for weight in safe_weights]
-    floors = [int(math.floor(value)) for value in raw]
-    counts = [base + extra for base, extra in zip(minimum, floors)]
-    deficit = total_layers - sum(counts)
-    if deficit > 0:
-        order = sorted(
-            range(count),
-            key=lambda idx: (raw[idx] - floors[idx], safe_weights[idx], -idx),
-            reverse=True,
-        )
-        for idx in order[:deficit]:
-            counts[idx] += 1
-    return counts
-
-
-def _internal_layer_band_allocation(
-    z_levels: Sequence[int],
-    internal_segment_indices: Sequence[int],
-    segment_demands: Dict[int, float],
-) -> Dict[int, Set[int]]:
-    if not internal_segment_indices:
-        return {}
-
-    ordered_levels = sorted(z_levels)
-    weights = [segment_demands.get(index, 1.0) for index in internal_segment_indices]
-    counts = _allocate_proportional_layer_counts(len(ordered_levels), weights)
-
-    allocation: Dict[int, Set[int]] = {}
-    cursor = 0
-    for index, level_count in zip(internal_segment_indices, counts):
-        next_cursor = min(len(ordered_levels), cursor + max(0, level_count))
-        allocation[index] = set(ordered_levels[cursor:next_cursor])
-        cursor = next_cursor
-
-    if cursor < len(ordered_levels):
-        allocation[internal_segment_indices[-1]].update(ordered_levels[cursor:])
-    return allocation
-
-
 def _path_bottleneck_penalty(
     path: Sequence[GridIndex],
     roominess_map: RoominessMap,
@@ -222,11 +167,13 @@ def _build_fill_corridor(
     valid_cells: Set[GridIndex],
     target_length: float,
     self_avoid_radius: int,
+    min_self_spacing: int = 0,
+    fill_excluded_cells: Optional[Set[GridIndex]] = None,
 ) -> Set[GridIndex]:
     """Build a corridor around the pipe wide enough for a serpentine fill."""
     # Use the same spacing as _generate_serpentine_fill so the radius
     # estimate is consistent with the actual row/layer layout.
-    row_spacing = max(2, self_avoid_radius + 2)
+    row_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
     pipe_length = max(1.0, _path_length(pipe_path))
     needed_r_sq = target_length * row_spacing * row_spacing / (4.0 * pipe_length)
     # Use a generous multiplier (3.0) so the serpentine can exploit
@@ -242,19 +189,21 @@ def _build_fill_corridor(
     max_y = max(pipe_ys) + radius
     min_z = min(pipe_zs) - radius
     max_z = max(pipe_zs) + radius
+    excluded = fill_excluded_cells or set()
     corridor = {
         cell for cell in valid_cells
         if min_x <= cell[0] <= max_x
         and min_y <= cell[1] <= max_y
         and min_z <= cell[2] <= max_z
+        and cell not in excluded
     }
 
     # If the bounding-box corridor is too small relative to the
-    # target, fall back to all valid cells so the serpentine can
-    # fill whatever space remains in the grid.
+    # target, fall back to all valid cells (minus highway layers) so
+    # the serpentine can exploit all available fill space in the grid.
     min_cells_needed = int(target_length * 1.5)
     if len(corridor) < min_cells_needed:
-        corridor = set(valid_cells)
+        corridor = set(valid_cells) - excluded
 
     return corridor
 
@@ -266,6 +215,7 @@ def _generate_serpentine_fill(
     goal: GridIndex,
     target_length: float,
     self_avoid_radius: int,
+    min_self_spacing: int = 0,
 ) -> Optional[List[GridIndex]]:
     """Fill *corridor* with a dense serpentine path to reach *target_length*.
 
@@ -276,10 +226,10 @@ def _generate_serpentine_fill(
     if len(corridor) < 4:
         return None
 
-    # +2 gives one full cell of clearance beyond the blocked radius,
-    # which prevents pipe geometry at bends from overlapping adjacent rows.
-    row_spacing = max(2, self_avoid_radius + 2)
-    layer_spacing = max(2, self_avoid_radius + 2)
+    # +1 gives clearance beyond the blocked radius.
+    # min_self_spacing encodes the physics-based minimum separation.
+    row_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
+    layer_spacing = max(2, self_avoid_radius + 1, min_self_spacing)
 
     # Choose sweep axes: sweep along the longest corridor dimension,
     # layer through the shortest, rows in the middle.
@@ -448,19 +398,33 @@ def _generate_serpentine_fill(
             running_length += 1.0
             path.append(cell)
         else:
-            walk = _axis_walk(last, cell, valid_cells)
+            # Try body-avoiding micro-routing first so the serpentine
+            # doesn't loop back through previously visited cells.
+            # Fall back to full valid_cells if the restricted set has
+            # no viable route (common in tight grids).
+            body = set(path[:-1])
+            micro_valid = valid_cells - body
+            micro_valid.add(last)   # must be reachable
+            micro_valid.add(cell)   # must be reachable
+            walk = _axis_walk(last, cell, micro_valid)
+            if walk is None:
+                walk = _axis_walk(last, cell, valid_cells)
             if walk is not None:
                 _extend_and_track(walk)
             else:
                 try:
-                    micro = astar_path(valid_cells, last, cell)
+                    micro = astar_path(micro_valid, last, cell)
                     _extend_and_track(micro[1:])
                 except RoutingError:
-                    # Rollback any partial approach toward the unreachable
-                    # cell so the path is not stranded at a dead-end.
-                    del path[snapshot:]
-                    running_length = snapshot_length
-                    continue
+                    try:
+                        micro = astar_path(valid_cells, last, cell)
+                        _extend_and_track(micro[1:])
+                    except RoutingError:
+                        # Rollback any partial approach toward the unreachable
+                        # cell so the path is not stranded at a dead-end.
+                        del path[snapshot:]
+                        running_length = snapshot_length
+                        continue
 
         # Early stop once the serpentine has generated enough length.
         est_remaining = _distance(path[-1], goal)
@@ -730,6 +694,7 @@ def _candidate_edge_detours(
     goal: GridIndex,
     max_primary_depth: int,
     max_secondary_depth: int,
+    min_primary_depth: int = 1,
 ) -> List[List[GridIndex]]:
     step_offset = _segment_step_offset(start, goal)
     if step_offset is None:
@@ -738,7 +703,7 @@ def _candidate_edge_detours(
     candidates: List[List[GridIndex]] = []
     orthogonal = _orthogonal_offsets(step_offset)
     for primary_offset in orthogonal:
-        for primary_depth in range(1, max_primary_depth + 1):
+        for primary_depth in range(min_primary_depth, max_primary_depth + 1):
             simple: List[GridIndex] = [start]
             current = start
             for _ in range(primary_depth):
@@ -810,6 +775,7 @@ def _grow_path_toward_target(
     roominess_map: RoominessMap,
     bottleneck_threshold: int,
     growth_valid_cells: Optional[Set[GridIndex]] = None,
+    min_self_spacing: int = 0,
 ) -> List[GridIndex]:
     grown = list(path)
     if len(grown) < 2:
@@ -855,6 +821,7 @@ def _grow_path_toward_target(
                 goal,
                 max_primary_depth=4,
                 max_secondary_depth=3,
+                min_primary_depth=max(1, min_self_spacing),
             ):
                 if not _is_valid_detour_candidate(
                     candidate,
@@ -1243,6 +1210,8 @@ def _segment_candidate_paths(
     beam_width: int = 8,
     beam_max_waypoints: int = 3,
     deadline: Optional[float] = None,
+    min_self_spacing: int = 0,
+    fill_excluded_cells: Optional[Set[GridIndex]] = None,
 ) -> List[List[GridIndex]]:
     if roominess_map is None:
         roominess_map = _build_roominess_map(valid_cells)
@@ -1263,17 +1232,12 @@ def _segment_candidate_paths(
     )
     candidate_valid_cells = valid_cells
     if target_length is not None and not allow_diagonals:
-        corridor_cells = _build_pipe_corridor(
+        candidate_valid_cells = _build_pipe_corridor(
             pipe_path,
             valid_cells,
             roominess_map,
             bottleneck_threshold,
         )
-        # Keep full-domain search available for tough target-length
-        # segments where corridor-only candidates underfill by a small
-        # margin (e.g. 48 vs target 50 in constrained boxes).
-        candidate_valid_cells = set(valid_cells)
-        candidate_valid_cells.update(corridor_cells)
 
     direct_path = pipe_path
 
@@ -1285,16 +1249,31 @@ def _segment_candidate_paths(
 
     # ---- Serpentine fill (primary strategy for large targets) ----
     # Inspired by trace_filling from 3dp-singlewire-sensing.
-    if not allow_diagonals and target_length > direct_length * 1.5:
+    if not allow_diagonals and target_length > direct_length * 1.2:
         fill_corridor = _build_fill_corridor(
             pipe_path, valid_cells, target_length, self_avoid_radius,
+            min_self_spacing=min_self_spacing,
+            fill_excluded_cells=fill_excluded_cells,
         )
         serpentine = _generate_serpentine_fill(
             fill_corridor, valid_cells, start, goal, target_length, self_avoid_radius,
+            min_self_spacing=min_self_spacing,
         )
         if serpentine is not None:
             candidates.append(serpentine)
             serpentine_length = _path_length(serpentine)
+            # If the corridor-based fill fell short, try again with
+            # the full valid cell set (minus highway layers) so the
+            # serpentine can exploit all available fill space.
+            fill_full = set(valid_cells) - (fill_excluded_cells or set())
+            if serpentine_length < target_length * 0.85 and len(fill_corridor) < len(fill_full):
+                full_serpentine = _generate_serpentine_fill(
+                    fill_full, valid_cells, start, goal, target_length,
+                    self_avoid_radius, min_self_spacing=min_self_spacing,
+                )
+                if full_serpentine is not None:
+                    candidates.append(full_serpentine)
+                    serpentine_length = max(serpentine_length, _path_length(full_serpentine))
             if serpentine_length >= target_length * 0.85:
                 # Serpentine reached the target — skip the expensive beam search.
                 unique = _dedupe_paths(candidates)
@@ -1385,6 +1364,11 @@ def _segment_candidate_paths(
     cleaned_candidates = [_remove_path_reversals(path) for path in candidates]
     unique_candidates = _dedupe_paths(cleaned_candidates)
     if target_length is not None and not allow_diagonals:
+        short_candidates = [
+            path for path in unique_candidates
+            if _path_length(path) < target_length * 0.95
+        ]
+        # First pass: grow within the corridor.
         grown_candidates = [
             _grow_path_toward_target(
                 path,
@@ -1394,27 +1378,33 @@ def _segment_candidate_paths(
                 roominess_map,
                 bottleneck_threshold,
                 growth_valid_cells=candidate_valid_cells,
+                min_self_spacing=min_self_spacing,
             )
-            for path in unique_candidates
-            if _path_length(path) < target_length * 0.95
+            for path in short_candidates
         ]
-        grown_cleaned = [_remove_path_reversals(path) for path in grown_candidates]
-        unique_candidates = _dedupe_paths(unique_candidates + grown_cleaned)
-        if unique_candidates:
-            best_length = max(_path_length(path) for path in unique_candidates)
-            if best_length + 1e-9 < target_length:
-                longest = max(unique_candidates, key=_path_length)
-                aggressive = _grow_path_toward_target(
-                    longest,
+        # Second pass: if corridor growth fell short, grow using all
+        # valid cells so the wire can expand into unused space.
+        still_short = [
+            path for path in grown_candidates
+            if _path_length(path) < target_length * 0.95
+            and len(candidate_valid_cells) < len(valid_cells)
+        ]
+        if still_short:
+            grown_candidates.extend(
+                _grow_path_toward_target(
+                    path,
                     valid_cells,
                     target_length,
-                    max(0, self_avoid_radius - 1),
+                    max(0, self_avoid_radius),
                     roominess_map,
                     bottleneck_threshold,
                     growth_valid_cells=valid_cells,
+                    min_self_spacing=min_self_spacing,
                 )
-                aggressive = _remove_path_reversals(aggressive)
-                unique_candidates = _dedupe_paths(unique_candidates + [aggressive])
+                for path in still_short
+            )
+        grown_cleaned = [_remove_path_reversals(path) for path in grown_candidates]
+        unique_candidates = _dedupe_paths(unique_candidates + grown_cleaned)
     return _sort_candidate_paths(
         unique_candidates,
         target_length,
@@ -1844,1152 +1834,24 @@ def _reconstruct_order(
     return tuple(order_indices)
 
 
-def _nearest_cells(
-    origin: GridIndex,
-    candidates: Set[GridIndex],
-    limit: int = 24,
-) -> List[GridIndex]:
-    ranked = sorted(
-        candidates,
-        key=lambda cell: (
-            _distance(origin, cell),
-            cell[2],
-            cell[0],
-            cell[1],
-        ),
-    )
-    return ranked[:limit]
-
-
-def _route_to_zone(
-    valid_cells: Set[GridIndex],
-    start: GridIndex,
-    zone: Set[GridIndex],
-    penalty_cells: Optional[Set[GridIndex]] = None,
-    penalty_weight: float = 0.0,
-    vertical_move_penalty: float = 0.0,
-) -> List[GridIndex]:
-    if start in zone:
-        return [start]
-    if not zone:
-        raise RoutingError("Cannot route to an empty zone.")
-
-    best: Optional[List[GridIndex]] = None
-    for target in _nearest_cells(start, zone):
-        try:
-            candidate = astar_path(
-                valid_cells=valid_cells,
-                start=start,
-                goal=target,
-                penalty_cells=penalty_cells,
-                penalty_weight=penalty_weight,
-                allow_diagonals=False,
-                vertical_move_penalty=vertical_move_penalty,
-            )
-        except RoutingError:
-            continue
-        if best is None or _path_length(candidate) < _path_length(best):
-            best = candidate
-
-    if best is None:
-        raise RoutingError("No route could be found to corridor/coiling zone.")
-    return best
-
-
-def _classify_segment_cells(path: Sequence[GridIndex]) -> Tuple[Set[GridIndex], Set[GridIndex]]:
-    xy_cells: Set[GridIndex] = set()
-    z_cells: Set[GridIndex] = set()
-    if len(path) < 2:
-        return xy_cells, z_cells
-
-    for previous, current in zip(path[:-1], path[1:]):
-        if previous[2] != current[2]:
-            z_cells.add(previous)
-            z_cells.add(current)
-        else:
-            xy_cells.add(previous)
-            xy_cells.add(current)
-    return xy_cells, z_cells
-
-
-def _chebyshev_distance(a: GridIndex, b: GridIndex) -> int:
-    return max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
-
-
-def _violates_typed_spacing(
-    existing_xy: Set[GridIndex],
-    existing_z: Set[GridIndex],
-    new_xy: Set[GridIndex],
-    new_z: Set[GridIndex],
-    xy_xy_radius: int,
-    xy_z_radius: int,
-    z_z_radius: int,
-    ignore_cells: Optional[Set[GridIndex]] = None,
-) -> bool:
-    ignored = ignore_cells or set()
-
-    for cell in new_xy:
-        if cell in ignored:
-            continue
-        if xy_xy_radius > 0 and any(
-            _chebyshev_distance(cell, other) <= xy_xy_radius
-            for other in existing_xy
-            if other not in ignored
-        ):
-            return True
-        if xy_z_radius > 0 and any(
-            _chebyshev_distance(cell, other) <= xy_z_radius
-            for other in existing_z
-            if other not in ignored
-        ):
-            return True
-
-    for cell in new_z:
-        if cell in ignored:
-            continue
-        if z_z_radius > 0 and any(
-            _chebyshev_distance(cell, other) <= z_z_radius
-            for other in existing_z
-            if other not in ignored
-        ):
-            return True
-        if xy_z_radius > 0 and any(
-            _chebyshev_distance(cell, other) <= xy_z_radius
-            for other in existing_xy
-            if other not in ignored
-        ):
-            return True
-
-    return False
-
-
-def _path_has_typed_spacing_violation(
-    path: Sequence[GridIndex],
-    xy_xy_radius: int,
-    xy_z_radius: int,
-    z_z_radius: int,
-    local_window: int = 1,
-) -> bool:
-    if len(path) < 2:
-        return False
-
-    xy_cells, z_cells = _classify_segment_cells(path)
-
-    for current_index, current in enumerate(path):
-        current_is_z = current in z_cells
-        for previous_index in range(0, max(0, current_index - local_window)):
-            previous = path[previous_index]
-            previous_is_z = previous in z_cells
-            distance = _chebyshev_distance(current, previous)
-            if current_is_z and previous_is_z:
-                if current[0] == previous[0] and current[1] == previous[1]:
-                    continue
-                if z_z_radius > 0 and distance <= z_z_radius:
-                    return True
-            elif current_is_z or previous_is_z:
-                if xy_z_radius > 0 and distance <= xy_z_radius:
-                    return True
-            else:
-                if xy_xy_radius > 0 and distance <= xy_xy_radius:
-                    return True
-    return False
-
-
-def _dynamic_corridor(
-    valid_cells: Set[GridIndex],
-    node_sequence: Sequence[GridIndex],
-    span_start: int,
-    span_end: int,
-    vertical_move_penalty: float,
-    corridor_radius_cells: int,
-) -> Set[GridIndex]:
-    if span_end <= span_start:
-        return set()
-
-    touch_chain = list(node_sequence[span_start : span_end + 1])
-    if len(touch_chain) < 2:
-        return set(touch_chain)
-
-    corridor_backbone: List[GridIndex] = []
-    for start, goal in zip(touch_chain[:-1], touch_chain[1:]):
-        segment = astar_path(
-            valid_cells=valid_cells,
-            start=start,
-            goal=goal,
-            allow_diagonals=False,
-            vertical_move_penalty=vertical_move_penalty,
-        )
-        if corridor_backbone:
-            corridor_backbone.extend(segment[1:])
-        else:
-            corridor_backbone.extend(segment)
-
-    corridor: Set[GridIndex] = set()
-    touch_set = set(touch_chain)
-    fixed_radius = max(1, corridor_radius_cells)
-    for cell in corridor_backbone:
-        corridor.update(candidate for candidate in dilate_cells({cell}, fixed_radius) if candidate in valid_cells)
-
-    corridor.update(touch_set)
-    return corridor
-
-
-def estimate_segment_max_length(
-    valid_cells: Set[GridIndex],
-    node_sequence: Sequence[GridIndex],
+def _segment_excluded_fill(
+    segment_fill_zones: Optional[List[Set[GridIndex]]],
     segment_index: int,
-    reserved_cells: Set[GridIndex],
-    reserved_exemption_radius: int,
-    blocked_exemption_radius: int,
-    vertical_move_penalty: float,
-    corridor_radius_cells: int,
-    xy_xy_blocked_radius: int,
-    xy_z_blocked_radius: int,
-    z_z_blocked_radius: int,
-    efficiency: float = 0.35,
-) -> float:
-    """
-    Quick, optimistic upper-bound estimate of achievable routed length (in cells)
-    for a single segment under continuous corridor-coil constraints.
-
-    Strategy:
-      1) Build a corridor spanning the internal touch-node chain.
-      2) Remove reserved anchor keepouts from valid cells for this segment.
-      3) Attempt a corridor path between segment endpoints.
-      4) Estimate coiling capacity as a fraction of free (non-corridor) cells.
-
-    Returns:
-      Estimated maximum segment length in grid cells.
-    """
-    if segment_index < 0 or segment_index >= len(node_sequence) - 1:
-        return 0.0
-
-    # Corridor across all internal segments (same span used by routing).
-    try:
-        corridor_cells = _dynamic_corridor(
-            valid_cells,
-            node_sequence,
-            span_start=1,
-            span_end=max(1, len(node_sequence) - 2),
-            vertical_move_penalty=vertical_move_penalty,
-            corridor_radius_cells=corridor_radius_cells,
-        )
-    except RoutingError:
-        corridor_cells = set()
-
-    # Segment-local valid cells: remove reserved zones except endpoints.
-    segment_valid = set(valid_cells)
-    start = node_sequence[segment_index]
-    goal = node_sequence[segment_index + 1]
-    if reserved_cells:
-        local_reserved = set(reserved_cells)
-        endpoint_reserved_exempt = dilate_cells(
-            {start, goal}, max(1, reserved_exemption_radius) if reserved_exemption_radius > 0 else 0
-        )
-        local_reserved.difference_update(endpoint_reserved_exempt)
-        local_reserved.discard(start)
-        local_reserved.discard(goal)
-        segment_valid.difference_update(local_reserved)
-
-    # Build a corridor-only path if possible for a baseline length.
-    corridor_zone = {cell for cell in corridor_cells if cell in segment_valid}
-    corridor_zone.update({start, goal})
-    try:
-        corridor_path = astar_path(
-            valid_cells=corridor_zone,
-            start=start,
-            goal=goal,
-            allow_diagonals=False,
-            vertical_move_penalty=vertical_move_penalty,
-        )
-    except RoutingError:
-        try:
-            corridor_path = astar_path(
-                valid_cells=segment_valid,
-                start=start,
-                goal=goal,
-                allow_diagonals=False,
-                vertical_move_penalty=vertical_move_penalty,
-            )
-        except RoutingError:
-            corridor_path = [start, goal]
-
-    # Coiling space: optimistic — free cells not part of the corridor set.
-    coiling_space = set(segment_valid)
-    coiling_space.difference_update(corridor_cells)
-
-    # Apply a packing/spacing efficiency factor to reflect actual serpentine fill
-    # losses due to row/layer spacing and typed-spacing constraints.
-    efficiency = max(0.0, min(1.0, efficiency))
-    max_cells = float(len(corridor_path)) + (efficiency * float(len(coiling_space)))
-    return max_cells
-
-
-def _contiguous_x_segments(row_cells: Sequence[GridIndex]) -> List[List[GridIndex]]:
-    if not row_cells:
-        return []
-
-    ordered = sorted(row_cells, key=lambda cell: cell[0])
-    segments: List[List[GridIndex]] = []
-    current: List[GridIndex] = [ordered[0]]
-    for cell in ordered[1:]:
-        if cell[0] == current[-1][0] + 1:
-            current.append(cell)
-            continue
-        segments.append(current)
-        current = [cell]
-    segments.append(current)
-    return segments
-
-
-def _build_bottom_up_xy_lanes(
-    coiling_cells: Set[GridIndex],
-    row_spacing: int,
-) -> List[List[GridIndex]]:
-    if not coiling_cells:
-        return []
-
-    lanes: List[List[GridIndex]] = []
-    reverse_x = False
-    z_levels = sorted({cell[2] for cell in coiling_cells})
-    for z in z_levels:
-        layer = [cell for cell in coiling_cells if cell[2] == z]
-        rows_by_y: Dict[int, List[GridIndex]] = {}
-        for cell in layer:
-            rows_by_y.setdefault(cell[1], []).append(cell)
-
-        selected_rows: List[int] = []
-        for y in sorted(rows_by_y.keys()):
-            if not selected_rows or abs(y - selected_rows[-1]) >= row_spacing:
-                selected_rows.append(y)
-
-        for y in selected_rows:
-            row_segments = _contiguous_x_segments(rows_by_y[y])
-            if not row_segments:
-                continue
-
-            if reverse_x:
-                iter_segments = list(reversed(row_segments))
-            else:
-                iter_segments = row_segments
-
-            for segment in iter_segments:
-                if len(segment) < 2:
-                    continue
-                lane = list(reversed(segment)) if reverse_x else segment
-                lanes.append(lane)
-                reverse_x = not reverse_x
-
-    return lanes
-
-
-def _polyline_length(path: Sequence[GridIndex]) -> float:
-    if len(path) < 2:
-        return 0.0
-    return sum(_distance(path[i - 1], path[i]) for i in range(1, len(path)))
-
-
-def _generate_bottom_up_xy_coil(
-    coiling_cells: Set[GridIndex],
-    start: GridIndex,
-    goal: GridIndex,
-    target_length: float,
-    xy_xy_spacing_radius: int,
-    xy_z_spacing_radius: int,
-    z_z_spacing_radius: int,
-    vertical_move_penalty: float,
-    debug_stats: Optional[Dict[str, int]] = None,
-) -> Optional[List[GridIndex]]:
-    def _finalize_stats(values: Dict[str, int]) -> None:
-        if debug_stats is not None:
-            debug_stats.update(values)
-
-    def _fail(values: Dict[str, int]) -> Optional[List[GridIndex]]:
-        _finalize_stats(values)
-        return None
-
-    if len(coiling_cells) < 4:
-        return _fail({"fail_too_few_cells": 1})
-    if start not in coiling_cells or goal not in coiling_cells:
-        return _fail({"fail_endpoints_outside_coiling": 1})
-
-    row_spacing = max(2, xy_xy_spacing_radius + 1)
-    lanes = _build_bottom_up_xy_lanes(coiling_cells, row_spacing)
-    endpoint_buffer = dilate_cells({start, goal}, max(0, xy_xy_spacing_radius))
-    endpoint_buffer.discard(start)
-    endpoint_buffer.discard(goal)
-
-    filtered_lanes: List[List[GridIndex]] = []
-    for lane in lanes:
-        filtered = [cell for cell in lane if cell not in endpoint_buffer]
-        if len(filtered) >= 2:
-            filtered_lanes.append(filtered)
-
-    if not filtered_lanes:
-        return _fail({"fail_no_filtered_lanes": 1, "lanes_total": len(lanes), "lanes_filtered": 0})
-
-    path: List[GridIndex] = [start]
-    running_length = 0.0
-
-    stats: Dict[str, int] = {
-        "lanes_total": len(lanes),
-        "lanes_filtered": len(filtered_lanes),
-        "candidates_considered": 0,
-        "reject_connector": 0,
-        "reject_revisit": 0,
-        "reject_spacing": 0,
-        "accepted_candidates": 0,
-        "backtracks": 0,
-        "suffix_failures": 0,
-        "target_shortfalls": 0,
-    }
-
-    def _additions(base_path: Sequence[GridIndex], steps: Sequence[GridIndex]) -> List[GridIndex]:
-        if not steps:
-            return []
-        return [cell for cell in steps if cell != base_path[-1]]
-
-    def _append_check(base_path: Sequence[GridIndex], steps: Sequence[GridIndex]) -> Tuple[bool, Optional[str]]:
-        additions = _additions(base_path, steps)
-        if not additions:
-            return True, None
-
-        seen = set(base_path[:-1])
-        for cell in additions:
-            if cell in seen:
-                return False, "revisit"
-            seen.add(cell)
-
-        trial = list(base_path)
-        trial.extend(additions)
-        if _path_has_typed_spacing_violation(
-            trial,
-            xy_xy_radius=max(0, xy_xy_spacing_radius),
-            xy_z_radius=max(0, xy_z_spacing_radius),
-            z_z_radius=max(0, z_z_spacing_radius),
-            local_window=2,
-        ):
-            return False, "spacing"
-        return True, None
-
-    def _append_steps(steps: Sequence[GridIndex]) -> bool:
-        nonlocal running_length
-        additions = [cell for cell in steps if cell != path[-1]]
-        if not additions:
-            return True
-
-        can_append, _ = _append_check(path, steps)
-        if not can_append:
-            return False
-
-        for cell in steps:
-            if cell == path[-1]:
-                continue
-            running_length += _distance(path[-1], cell)
-            path.append(cell)
-        return True
-
-    def _record_rejection(reason: Optional[str]) -> None:
-        if reason == "revisit":
-            stats["reject_revisit"] += 1
-        elif reason == "spacing":
-            stats["reject_spacing"] += 1
-
-    def _build_candidates(current_path: Sequence[GridIndex], lane: List[GridIndex]) -> List[Tuple[float, List[GridIndex], List[GridIndex]]]:
-        candidates: List[Tuple[float, List[GridIndex], List[GridIndex]]] = []
-        for option in (lane, list(reversed(lane))):
-            stats["candidates_considered"] += 1
-            lane_start = option[0]
-            try:
-                connector = astar_path(
-                    coiling_cells,
-                    current_path[-1],
-                    lane_start,
-                    allow_diagonals=False,
-                    vertical_move_penalty=vertical_move_penalty,
-                )
-            except RoutingError:
-                stats["reject_connector"] += 1
-                continue
-
-            connector_steps = connector[1:]
-            connector_ok, connector_reason = _append_check(current_path, connector_steps)
-            if not connector_ok:
-                _record_rejection(connector_reason)
-                continue
-
-            staged_path = list(current_path)
-            staged_path.extend(_additions(staged_path, connector_steps))
-            option_ok, option_reason = _append_check(staged_path, option)
-            if not option_ok:
-                _record_rejection(option_reason)
-                continue
-
-            option_gain = _polyline_length(connector_steps) + _polyline_length(option)
-            score = option_gain - 0.5 * _distance(option[-1], goal)
-            candidates.append((score, connector_steps, option))
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates
-
-    def _try_apply_candidate(candidate: Tuple[float, List[GridIndex], List[GridIndex]]) -> bool:
-        _, connector_steps, option = candidate
-        if connector_steps and not _append_steps(connector_steps):
-            return False
-        if not _append_steps(option):
-            return False
-        stats["accepted_candidates"] += 1
-        return True
-
-    max_backtracks = 24
-    branch_stack: List[Tuple[List[GridIndex], float, int, List[Tuple[float, List[GridIndex], List[GridIndex]]], int]] = []
-    lane_index = 0
-
-    while True:
-        while lane_index < len(filtered_lanes):
-            if running_length + _distance(path[-1], goal) >= target_length:
-                break
-
-            lane = filtered_lanes[lane_index]
-            candidates = _build_candidates(path, lane)
-            if not candidates:
-                lane_index += 1
-                continue
-
-            pre_path = list(path)
-            pre_length = running_length
-            applied = False
-            next_choice = 0
-            while next_choice < len(candidates):
-                if _try_apply_candidate(candidates[next_choice]):
-                    applied = True
-                    next_choice += 1
-                    break
-                next_choice += 1
-
-            if applied:
-                branch_stack.append((pre_path, pre_length, lane_index, candidates, next_choice))
-            else:
-                path = pre_path
-                running_length = pre_length
-
-            lane_index += 1
-
-        suffix_ok = True
-        if path[-1] != goal:
-            try:
-                suffix = astar_path(
-                    coiling_cells,
-                    path[-1],
-                    goal,
-                    allow_diagonals=False,
-                    vertical_move_penalty=vertical_move_penalty,
-                )
-            except RoutingError:
-                suffix_ok = False
-                stats["suffix_failures"] += 1
-            else:
-                suffix_ok, suffix_reason = _append_check(path, suffix[1:])
-                if not suffix_ok:
-                    _record_rejection(suffix_reason)
-                    stats["suffix_failures"] += 1
-                elif not _append_steps(suffix[1:]):
-                    suffix_ok = False
-                    stats["suffix_failures"] += 1
-
-        if suffix_ok and (running_length + 1e-9 >= target_length or not branch_stack):
-            break
-
-        if suffix_ok and running_length + 1e-9 < target_length:
-            stats["target_shortfalls"] += 1
-
-        rewound = False
-        while branch_stack and stats["backtracks"] < max_backtracks:
-            snapshot_path, snapshot_length, snapshot_lane_index, candidates, next_choice = branch_stack.pop()
-            stats["backtracks"] += 1
-
-            path = list(snapshot_path)
-            running_length = snapshot_length
-
-            applied_alternative = False
-            while next_choice < len(candidates):
-                if _try_apply_candidate(candidates[next_choice]):
-                    branch_stack.append(
-                        (snapshot_path, snapshot_length, snapshot_lane_index, candidates, next_choice + 1)
-                    )
-                    lane_index = snapshot_lane_index + 1
-                    applied_alternative = True
-                    rewound = True
-                    break
-                next_choice += 1
-
-            if applied_alternative:
-                break
-
-        if rewound:
-            continue
-
-        if not suffix_ok:
-            _finalize_stats(stats)
-            return None
-        break
-
-    path = _remove_path_reversals(path)
-    path = _repair_path_continuity(path, coiling_cells)
-    path = _remove_path_reversals(path)
-    _finalize_stats(stats)
-    return path
-
-
-def _merge_paths(*paths: Sequence[GridIndex]) -> List[GridIndex]:
-    merged: List[GridIndex] = []
-    for path in paths:
-        if not path:
-            continue
-        if not merged:
-            merged.extend(path)
-            continue
-        merged.extend(path[1:] if path[0] == merged[-1] else path)
-    return merged
-
-
-def _route_continuous_coiling_sequence(
     valid_cells: Set[GridIndex],
-    node_sequence: Sequence[GridIndex],
-    segment_target_lengths: Optional[Sequence[Optional[float]]],
-    reserved_cells: Set[GridIndex],
-    reserved_exemption_radius: int,
-    blocked_exemption_radius: int,
-    penalty_weight: float,
-    vertical_move_penalty: float,
-    deadline: Optional[float],
-    node_labels: Optional[Sequence[str]],
-    coiling_segment_indices: Set[int],
-    corridor_span: Tuple[int, int],
-    xy_xy_blocked_radius: int,
-    xy_z_blocked_radius: int,
-    z_z_blocked_radius: int,
-    node_edge_clearance_radius: int,
-    target_window_ratio: Optional[float],
-    corridor_radius_cells: int,
-    segment_debug_lines: Optional[List[str]],
-) -> List[List[GridIndex]]:
-    if corridor_span[0] < 0 or corridor_span[1] >= len(node_sequence):
-        raise RoutingError("Corridor span is outside the node sequence.")
+    highway_cells: Set[GridIndex],
+) -> Optional[Set[GridIndex]]:
+    """Return the set of cells this segment's serpentine fill must avoid.
 
-    window_ratio = None
-    if target_window_ratio is not None:
-        window_ratio = max(0.0, target_window_ratio)
-    target_length_min_ratio = (1.0 - window_ratio) if window_ratio is not None else 0.0
-    target_length_max_ratio = (1.0 + window_ratio) if window_ratio is not None else float("inf")
-
-    corridor_cells = _dynamic_corridor(
-        valid_cells,
-        node_sequence,
-        corridor_span[0],
-        corridor_span[1],
-        vertical_move_penalty,
-        corridor_radius_cells,
-    )
-    if not corridor_cells:
-        raise RoutingError("Unable to construct corridor cells for touch-node chain.")
-
-    occupied_xy: Set[GridIndex] = set()
-    occupied_z: Set[GridIndex] = set()
-    segments: List[List[GridIndex]] = []
-    endpoint_only_exemption_radius = max(1, blocked_exemption_radius)
-    internal_spacing_local_window = 3
-
-    for segment_index, (start, goal) in enumerate(zip(node_sequence[:-1], node_sequence[1:])):
-        if deadline is not None and time.monotonic() > deadline:
-            raise RoutingError("Routing timed out for the continuous corridor-coil flow.")
-
-        segment_valid = set(valid_cells)
-        local_reserved = set(reserved_cells)
-        endpoint_reserved_exempt = dilate_cells(
-            {start, goal},
-            max(1, reserved_exemption_radius) if reserved_exemption_radius > 0 else 0,
-        )
-        local_reserved.difference_update(endpoint_reserved_exempt)
-        local_reserved.discard(start)
-        local_reserved.discard(goal)
-        segment_valid.difference_update(local_reserved)
-
-        max_xy_block = max(0, xy_xy_blocked_radius, xy_z_blocked_radius)
-        max_z_block = max(0, xy_z_blocked_radius, z_z_blocked_radius)
-        blocked_cells = set()
-        if occupied_xy and max_xy_block > 0:
-            blocked_cells.update(dilate_cells(occupied_xy, max_xy_block))
-        if occupied_z and max_z_block > 0:
-            blocked_cells.update(dilate_cells(occupied_z, max_z_block))
-        if blocked_cells:
-            exempt = dilate_cells({start, goal}, endpoint_only_exemption_radius)
-            blocked_cells.difference_update(exempt)
-            blocked_cells.discard(start)
-            blocked_cells.discard(goal)
-            segment_valid.difference_update(blocked_cells)
-
-        if node_edge_clearance_radius > 0:
-            endpoint_exempt = dilate_cells({start, goal}, endpoint_only_exemption_radius)
-            for node in node_sequence:
-                if node == start or node == goal:
-                    continue
-                keepout = dilate_cells({node}, reserved_exemption_radius + node_edge_clearance_radius)
-                segment_valid.difference_update(keepout - endpoint_exempt)
-            segment_valid.add(start)
-            segment_valid.add(goal)
-
-        if start not in segment_valid or goal not in segment_valid:
-            raise RoutingError("A segment endpoint is blocked by clearance constraints.")
-
-        target_length = None
-        if segment_target_lengths is not None:
-            target_length = segment_target_lengths[segment_index]
-
-        routed_segment: Optional[List[GridIndex]] = None
-        coiling_space_cell_count: Optional[int] = None
-        coiling_stats: Optional[Dict[str, int]] = None
-        if segment_index in coiling_segment_indices and target_length is not None:
-            corridor_zone = {cell for cell in corridor_cells if cell in segment_valid}
-            corridor_zone.update({start, goal})
-            start_to_corridor = _route_to_zone(
-                segment_valid,
-                start,
-                corridor_zone,
-                penalty_weight=penalty_weight,
-                vertical_move_penalty=vertical_move_penalty,
-            )
-            goal_to_corridor = _route_to_zone(
-                segment_valid,
-                goal,
-                corridor_zone,
-                penalty_weight=penalty_weight,
-                vertical_move_penalty=vertical_move_penalty,
-            )
-
-            corridor_start = start_to_corridor[-1]
-            corridor_end = goal_to_corridor[-1]
-            corridor_valid = set(corridor_zone)
-            corridor_valid.add(corridor_start)
-            corridor_valid.add(corridor_end)
-            try:
-                corridor_path = astar_path(
-                    corridor_valid,
-                    corridor_start,
-                    corridor_end,
-                    allow_diagonals=False,
-                    vertical_move_penalty=vertical_move_penalty,
-                )
-            except RoutingError:
-                corridor_path = astar_path(
-                    segment_valid,
-                    corridor_start,
-                    corridor_end,
-                    allow_diagonals=False,
-                    vertical_move_penalty=vertical_move_penalty,
-                )
-
-            coiling_space = set(segment_valid)
-            coiling_space.difference_update(corridor_cells)
-            if occupied_xy and xy_xy_blocked_radius > 0:
-                coiling_space.difference_update(dilate_cells(occupied_xy, xy_xy_blocked_radius))
-            if occupied_z and xy_z_blocked_radius > 0:
-                coiling_space.difference_update(dilate_cells(occupied_z, xy_z_blocked_radius))
-            # Ensure coils do not overlap with any node volume, including endpoints.
-            extra_keepout_radius = max(0, reserved_exemption_radius + node_edge_clearance_radius)
-            if extra_keepout_radius > 0:
-                node_keepout: Set[GridIndex] = set()
-                for n in node_sequence:
-                    node_keepout.update(dilate_cells({n}, extra_keepout_radius))
-                coiling_space.difference_update(node_keepout)
-            coiling_space_cell_count = len(coiling_space)
-            coiling_stats = {}
-
-            frontier_pairs: List[Tuple[GridIndex, GridIndex]] = []
-            for corridor_cell in corridor_path:
-                for neighbor in dilate_cells({corridor_cell}, 1):
-                    if neighbor in coiling_space:
-                        frontier_pairs.append((corridor_cell, neighbor))
-
-            if not frontier_pairs:
-                frontier_probe_radius = max(2, corridor_radius_cells + 1)
-                for corridor_cell in corridor_path:
-                    for neighbor in dilate_cells({corridor_cell}, frontier_probe_radius):
-                        if neighbor in coiling_space:
-                            frontier_pairs.append((corridor_cell, neighbor))
-
-            if coiling_stats is not None:
-                coiling_stats["frontier_pairs"] = len(frontier_pairs)
-
-            if frontier_pairs:
-                unique_frontier = list({pair for pair in frontier_pairs})
-                start_choices = sorted(
-                    unique_frontier,
-                    key=lambda pair: (_distance(start, pair[0]), _distance(start, pair[1])),
-                )[: min(24, len(unique_frontier))]
-                goal_choices = sorted(
-                    unique_frontier,
-                    key=lambda pair: (_distance(goal, pair[0]), _distance(goal, pair[1])),
-                )[: min(24, len(unique_frontier))]
-
-                best_pair: Optional[Tuple[Tuple[GridIndex, GridIndex], Tuple[GridIndex, GridIndex]]] = None
-                best_score = -float("inf")
-                for entry_pair in start_choices:
-                    for exit_pair in goal_choices:
-                        if exit_pair[1] == entry_pair[1]:
-                            continue
-                        coil_separation = _distance(entry_pair[1], exit_pair[1])
-                        score = (
-                            1.0 * coil_separation
-                            - 0.12 * _distance(start, entry_pair[0])
-                            - 0.12 * _distance(goal, exit_pair[0])
-                            + 0.08 * _distance(entry_pair[0], exit_pair[0])
-                        )
-                        if score > best_score:
-                            best_score = score
-                            best_pair = (entry_pair, exit_pair)
-
-                if best_pair is None:
-                    entry_anchor, coil_start = start_choices[0]
-                    exit_anchor, coil_end = goal_choices[0]
-                else:
-                    (entry_anchor, coil_start), (exit_anchor, coil_end) = best_pair
-
-                coil_target = max(
-                    _distance(coil_start, coil_end) + 2.0,
-                    target_length - _path_length(start_to_corridor) - _path_length(goal_to_corridor),
-                )
-                if coiling_stats is not None:
-                    coiling_stats["entry_exit_sep"] = int(round(_distance(coil_start, coil_end)))
-                    coiling_stats["coil_target"] = int(round(coil_target))
-                coil_zone = set(coiling_space)
-                coil_zone.add(coil_start)
-                coil_zone.add(coil_end)
-                coil_path = _generate_bottom_up_xy_coil(
-                    coiling_cells=coil_zone,
-                    start=coil_start,
-                    goal=coil_end,
-                    target_length=coil_target,
-                    # Enforce larger endpoint buffer around nodes to avoid overlap
-                    xy_xy_spacing_radius=max(0, xy_xy_blocked_radius, extra_keepout_radius),
-                    xy_z_spacing_radius=max(0, xy_z_blocked_radius),
-                    z_z_spacing_radius=max(0, z_z_blocked_radius),
-                    vertical_move_penalty=vertical_move_penalty,
-                    debug_stats=coiling_stats,
-                )
-                if coil_path is None:
-                    candidate_coils = _segment_candidate_paths(
-                        valid_cells=coil_zone,
-                        start=coil_start,
-                        goal=coil_end,
-                        penalty_cells=set(),
-                        penalty_weight=0.0,
-                        allow_diagonals=False,
-                        target_length=coil_target,
-                        self_avoid_radius=max(0, xy_xy_blocked_radius),
-                        max_candidates=12,
-                        vertical_move_penalty=vertical_move_penalty,
-                        deadline=deadline,
-                        beam_width=4,
-                        beam_max_waypoints=2,
-                    )
-                    if candidate_coils:
-                        coil_path = max(candidate_coils, key=_path_length)
-                        if coiling_stats is not None:
-                            coiling_stats["candidate_fallback_used"] = 1
-                            coiling_stats["candidate_fallback_length"] = int(round(_path_length(coil_path)))
-                if coil_path is not None:
-                    corridor_to_entry_anchor = astar_path(
-                        corridor_valid,
-                        corridor_start,
-                        entry_anchor,
-                        allow_diagonals=False,
-                        vertical_move_penalty=vertical_move_penalty,
-                    )
-                    corridor_exit_anchor_to_end = astar_path(
-                        corridor_valid,
-                        exit_anchor,
-                        corridor_end,
-                        allow_diagonals=False,
-                        vertical_move_penalty=vertical_move_penalty,
-                    )
-                    join_a = astar_path(
-                        segment_valid,
-                        entry_anchor,
-                        coil_start,
-                        allow_diagonals=False,
-                        vertical_move_penalty=vertical_move_penalty,
-                    )
-                    join_b = astar_path(
-                        segment_valid,
-                        coil_end,
-                        exit_anchor,
-                        allow_diagonals=False,
-                        vertical_move_penalty=vertical_move_penalty,
-                    )
-                    routed_segment = _merge_paths(
-                        start_to_corridor,
-                        corridor_to_entry_anchor,
-                        join_a,
-                        coil_path,
-                        join_b,
-                        corridor_exit_anchor_to_end,
-                        list(reversed(goal_to_corridor)),
-                    )
-
-        if routed_segment is None:
-            if target_length is not None and segment_index in coiling_segment_indices:
-                penalty_cells = {cell for cell in segment_valid if cell not in corridor_cells}
-                fallback_candidates = _segment_candidate_paths(
-                    valid_cells=segment_valid,
-                    start=start,
-                    goal=goal,
-                    penalty_cells=penalty_cells,
-                    penalty_weight=penalty_weight,
-                    allow_diagonals=False,
-                    target_length=target_length,
-                    self_avoid_radius=max(0, xy_xy_blocked_radius),
-                    vertical_move_penalty=vertical_move_penalty,
-                    deadline=deadline,
-                    beam_width=4,
-                    beam_max_waypoints=2,
-                )
-                if fallback_candidates and window_ratio is not None:
-                    min_length = target_length * target_length_min_ratio
-                    max_length = target_length * target_length_max_ratio
-                    # Prefer a candidate within the window, else pick closest to target
-                    within_window: Optional[List[GridIndex]] = None
-                    best_candidate: Optional[List[GridIndex]] = None
-                    best_error: float = float("inf")
-                    for candidate in fallback_candidates:
-                        candidate_length = _path_length(candidate)
-                        error = abs(candidate_length - target_length)
-                        if min_length - 1e-9 <= candidate_length <= max_length + 1e-9:
-                            within_window = candidate
-                            break
-                        if error < best_error:
-                            best_error = error
-                            best_candidate = candidate
-                    routed_segment = within_window or best_candidate
-                    if routed_segment is not None and within_window is None and segment_debug_lines is not None:
-                        segment_debug_lines.append(
-                            "  Window miss: accepting best achievable candidate achieved_cells={:.1f}, target_cells={:.1f}".format(
-                                _path_length(routed_segment), target_length
-                            )
-                        )
-                elif fallback_candidates:
-                    routed_segment = max(fallback_candidates, key=_path_length)
-                    if segment_debug_lines is not None:
-                        segment_debug_lines.append(
-                            "  Window miss: accepting longest fallback candidate achieved_cells={:.1f}, target_cells={:.1f}".format(
-                                _path_length(routed_segment), target_length
-                            )
-                        )
-                # Do not raise if we have any candidate — proceed with the best available.
-            if routed_segment is None:
-                penalty_cells = {cell for cell in segment_valid if cell not in corridor_cells}
-                routed_segment = astar_path(
-                    segment_valid,
-                    start,
-                    goal,
-                    penalty_cells=penalty_cells,
-                    penalty_weight=penalty_weight,
-                    allow_diagonals=False,
-                    vertical_move_penalty=vertical_move_penalty,
-                )
-
-        raw_routed_length = _path_length(routed_segment)
-        preserve_coil_loops = (
-            target_length is not None
-            and segment_index in coiling_segment_indices
-        )
-        if preserve_coil_loops:
-            routed_segment = _repair_path_continuity(routed_segment, segment_valid)
-        else:
-            routed_segment = _remove_path_reversals(routed_segment)
-            routed_segment = _repair_path_continuity(routed_segment, segment_valid)
-            routed_segment = _remove_path_reversals(routed_segment)
-        cleaned_routed_length = _path_length(routed_segment)
-        if coiling_stats is not None:
-            coiling_stats["segment_raw_len"] = int(round(raw_routed_length))
-            coiling_stats["segment_clean_len"] = int(round(cleaned_routed_length))
-
-        if _path_has_typed_spacing_violation(
-            routed_segment,
-            xy_xy_radius=0,
-            xy_z_radius=0,
-            z_z_radius=max(0, z_z_blocked_radius),
-            local_window=internal_spacing_local_window,
-        ):
-            recovered: Optional[List[GridIndex]] = None
-            if target_length is not None:
-                retry_penalties = {cell for cell in segment_valid if cell not in corridor_cells}
-                retry_candidates = _segment_candidate_paths(
-                    valid_cells=segment_valid,
-                    start=start,
-                    goal=goal,
-                    penalty_cells=retry_penalties,
-                    penalty_weight=penalty_weight,
-                    allow_diagonals=False,
-                    target_length=target_length,
-                    self_avoid_radius=max(0, xy_xy_blocked_radius),
-                    vertical_move_penalty=vertical_move_penalty,
-                    deadline=deadline,
-                    beam_width=4,
-                    beam_max_waypoints=2,
-                )
-                for candidate in retry_candidates:
-                    if not _path_has_typed_spacing_violation(
-                        candidate,
-                        xy_xy_radius=0,
-                        xy_z_radius=0,
-                        z_z_radius=max(0, z_z_blocked_radius),
-                        local_window=internal_spacing_local_window,
-                    ):
-                        recovered = candidate
-                        break
-            if recovered is not None:
-                routed_segment = recovered
-            else:
-                if target_length is None:
-                    raise RoutingError("Generated segment violates internal typed spacing constraints.")
-
-        if len(routed_segment) < 2:
-            if node_labels is not None:
-                raise RoutingError(
-                    "Pathway between {} and {} could not be routed.".format(
-                        node_labels[segment_index],
-                        node_labels[segment_index + 1],
-                    )
-                )
-            raise RoutingError("A routed segment collapsed to zero length.")
-
-        routed_length = _path_length(routed_segment)
-        if segment_debug_lines is not None:
-            target_text = "n/a" if target_length is None else "{:.1f}".format(target_length)
-            coiling_space_text = (
-                "n/a" if coiling_space_cell_count is None else str(coiling_space_cell_count)
-            )
-            coiler_summary = ""
-            if coiling_stats is not None:
-                fallback_used = coiling_stats.get("candidate_fallback_used", 0)
-                fallback_len = coiling_stats.get("candidate_fallback_length", 0)
-                entry_sep = coiling_stats.get("entry_exit_sep", 0)
-                coil_target_dbg = coiling_stats.get("coil_target", 0)
-                raw_len_dbg = coiling_stats.get("segment_raw_len", 0)
-                clean_len_dbg = coiling_stats.get("segment_clean_len", 0)
-                coiler_summary = (
-                    ", frontier_pairs={}, entry_exit_sep={}, coil_target={}, segment_raw_len={}, segment_clean_len={}, coiler_accepts={}, coiler_rejects={{connector:{}, revisit:{}, spacing:{}}}, backtracks={}, shortfalls={}, fallback_used={}, fallback_len={}".format(
-                        coiling_stats.get("frontier_pairs", 0),
-                        entry_sep,
-                        coil_target_dbg,
-                        raw_len_dbg,
-                        clean_len_dbg,
-                        coiling_stats.get("accepted_candidates", 0),
-                        coiling_stats.get("reject_connector", 0),
-                        coiling_stats.get("reject_revisit", 0),
-                        coiling_stats.get("reject_spacing", 0),
-                        coiling_stats.get("backtracks", 0),
-                        coiling_stats.get("target_shortfalls", 0),
-                        fallback_used,
-                        fallback_len,
-                    )
-                )
-            segment_debug_lines.append(
-                "  Debug segment {}/{}: corridor_radius_cells={}, coiling_space_cells={}, achieved_cells={:.1f}, target_cells={}{}".format(
-                    segment_index + 1,
-                    len(node_sequence) - 1,
-                    corridor_radius_cells,
-                    coiling_space_text,
-                    routed_length,
-                    target_text,
-                    coiler_summary,
-                )
-            )
-
-        if window_ratio is not None and target_length is not None and segment_index in coiling_segment_indices:
-            min_length = target_length * target_length_min_ratio
-            max_length = target_length * target_length_max_ratio
-            if routed_length + 1e-9 < min_length or routed_length - 1e-9 > max_length:
-                if segment_debug_lines is not None:
-                    if node_labels is not None:
-                        segment_debug_lines.append(
-                            "  Warning: pathway between {} and {} is outside the {:.0f}% target window (achieved_cells={:.1f}, target_cells={:.1f}); accepting best candidate.".format(
-                                node_labels[segment_index],
-                                node_labels[segment_index + 1],
-                                window_ratio * 100.0,
-                                routed_length,
-                                target_length,
-                            )
-                        )
-                    else:
-                        segment_debug_lines.append(
-                            "  Warning: coiling segment is outside the {:.0f}% target window (achieved_cells={:.1f}, target_cells={:.1f}); accepting best candidate.".format(
-                                window_ratio * 100.0, routed_length, target_length
-                            )
-                        )
-
-        segment_xy, segment_z = _classify_segment_cells(routed_segment)
-        endpoint_ignore = dilate_cells({start, goal}, endpoint_only_exemption_radius)
-        if _violates_typed_spacing(
-            existing_xy=occupied_xy,
-            existing_z=occupied_z,
-            new_xy=segment_xy,
-            new_z=segment_z,
-            xy_xy_radius=max(0, xy_xy_blocked_radius),
-            xy_z_radius=max(0, xy_z_blocked_radius),
-            z_z_radius=max(0, z_z_blocked_radius),
-            ignore_cells=endpoint_ignore,
-        ):
-            recovered_inter: Optional[List[GridIndex]] = None
-            if target_length is not None:
-                retry_penalties = {cell for cell in segment_valid if cell not in corridor_cells}
-                retry_candidates = _segment_candidate_paths(
-                    valid_cells=segment_valid,
-                    start=start,
-                    goal=goal,
-                    penalty_cells=retry_penalties,
-                    penalty_weight=penalty_weight,
-                    allow_diagonals=False,
-                    target_length=target_length,
-                    self_avoid_radius=max(0, xy_xy_blocked_radius),
-                    vertical_move_penalty=vertical_move_penalty,
-                    deadline=deadline,
-                )
-                for candidate in retry_candidates:
-                    candidate_xy, candidate_z = _classify_segment_cells(candidate)
-                    if _violates_typed_spacing(
-                        existing_xy=occupied_xy,
-                        existing_z=occupied_z,
-                        new_xy=candidate_xy,
-                        new_z=candidate_z,
-                        xy_xy_radius=max(0, xy_xy_blocked_radius),
-                        xy_z_radius=max(0, xy_z_blocked_radius),
-                        z_z_radius=max(0, z_z_blocked_radius),
-                        ignore_cells=endpoint_ignore,
-                    ):
-                        continue
-                    if _path_has_typed_spacing_violation(
-                        candidate,
-                        xy_xy_radius=0,
-                        xy_z_radius=0,
-                        z_z_radius=max(0, z_z_blocked_radius),
-                        local_window=internal_spacing_local_window,
-                    ):
-                        continue
-                    recovered_inter = candidate
-                    break
-            if recovered_inter is not None:
-                routed_segment = recovered_inter
-                segment_xy, segment_z = _classify_segment_cells(routed_segment)
-            else:
-                raise RoutingError("Generated segment violates inter-segment typed spacing constraints.")
-
-        occupied_xy.update(segment_xy)
-        occupied_z.update(segment_z)
-        segments.append(compress_index_path(routed_segment))
-
-    return segments
+    When Voronoi fill zones are active, the segment may only fill its own
+    zone — everything else (other zones + highway cells) is excluded.
+    Falls back to highway-only exclusion when zones are not available.
+    """
+    if segment_fill_zones is not None:
+        own_zone = segment_fill_zones[segment_index]
+        return (valid_cells - own_zone) | highway_cells
+    if highway_cells:
+        return highway_cells
+    return None
 
 
 def route_node_sequence(
@@ -3006,16 +1868,7 @@ def route_node_sequence(
     allow_diagonals: bool = True,
     vertical_move_penalty: float = 0.0,
     deadline: Optional[float] = None,
-    use_continuous_coiling: bool = False,
-    coiling_segment_indices: Optional[Set[int]] = None,
-    corridor_span: Optional[Tuple[int, int]] = None,
-    xy_xy_blocked_radius: int = 0,
-    xy_z_blocked_radius: int = 0,
-    z_z_blocked_radius: int = 0,
-    node_edge_clearance_radius: int = 0,
-    target_window_ratio: Optional[float] = None,
-    corridor_radius_cells: int = 2,
-    segment_debug_lines: Optional[List[str]] = None,
+    min_self_spacing: int = 0,
 ) -> List[List[GridIndex]]:
     if len(node_sequence) < 2:
         raise RoutingError("At least two nodes are required to build a route.")
@@ -3026,34 +1879,50 @@ def route_node_sequence(
     if node_labels is not None and len(node_labels) != len(node_sequence):
         raise RoutingError("Node labels must match the routed node sequence length.")
 
-    if use_continuous_coiling:
-        internal_segments = set(range(1, max(1, len(node_sequence) - 2)))
-        return _route_continuous_coiling_sequence(
-            valid_cells=valid_cells,
-            node_sequence=node_sequence,
-            segment_target_lengths=segment_target_lengths,
-            reserved_cells=reserved_cells or set(),
-            reserved_exemption_radius=reserved_exemption_radius,
-            blocked_exemption_radius=blocked_exemption_radius,
-            penalty_weight=penalty_weight,
-            vertical_move_penalty=vertical_move_penalty,
-            deadline=deadline,
-            node_labels=node_labels,
-            coiling_segment_indices=coiling_segment_indices or internal_segments,
-            corridor_span=corridor_span or (1, len(node_sequence) - 2),
-            xy_xy_blocked_radius=max(0, xy_xy_blocked_radius, blocked_radius),
-            xy_z_blocked_radius=max(0, xy_z_blocked_radius, blocked_radius),
-            z_z_blocked_radius=max(0, z_z_blocked_radius, blocked_radius),
-            node_edge_clearance_radius=max(0, node_edge_clearance_radius),
-            target_window_ratio=target_window_ratio,
-            corridor_radius_cells=max(1, corridor_radius_cells),
-            segment_debug_lines=segment_debug_lines,
-        )
-
     segments: List[List[GridIndex]] = []
     reserved = reserved_cells or set()
     roominess_map = _build_roominess_map(valid_cells)
     bottleneck_threshold = _bottleneck_threshold(roominess_map)
+
+    num_segments = len(node_sequence) - 1
+
+    # Compute highway Z-levels: evenly-spaced Z values that serpentine fills
+    # must avoid.  These layers act as transit corridors so inter-node paths
+    # always have clear routes even after earlier segments have densely filled
+    # their own Z-slices.  Only applied when target lengths are requested and
+    # blocked_radius is active (i.e. real multi-segment routing with spacing).
+    highway_cells: Set[GridIndex] = set()
+    if segment_target_lengths is not None and blocked_radius > 0:
+        all_z = sorted(set(c[2] for c in valid_cells))
+        highway_step = max(2, blocked_radius * 2 + 2)
+        if len(all_z) >= highway_step * 3:
+            highway_z_set = set(all_z[i] for i in range(0, len(all_z), highway_step))
+            highway_cells = {c for c in valid_cells if c[2] in highway_z_set}
+
+    # Per-segment Voronoi fill zones: partition non-highway cells so each
+    # segment gets a dedicated fill region closest to its midpoint.  This
+    # prevents earlier segments from filling space that later segments need.
+    segment_fill_zones: Optional[List[Set[GridIndex]]] = None
+    if segment_target_lengths is not None and blocked_radius > 0 and num_segments > 2:
+        fill_pool = valid_cells - highway_cells  # cells available for fills
+        # Midpoint of each segment (average of its two endpoint nodes).
+        midpoints = []
+        for si in range(num_segments):
+            a = node_sequence[si]
+            b = node_sequence[si + 1]
+            midpoints.append(((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0))
+
+        segment_fill_zones = [set() for _ in range(num_segments)]
+        for cell in fill_pool:
+            best_seg = 0
+            best_dist = float("inf")
+            cx, cy, cz = cell
+            for si, mid in enumerate(midpoints):
+                d = (cx - mid[0]) ** 2 + (cy - mid[1]) ** 2 + (cz - mid[2]) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    best_seg = si
+            segment_fill_zones[best_seg].add(cell)
 
     # Precompute node keepout zones: for each node, the set of cells
     # that paths NOT connecting to that node must avoid.  The radius
@@ -3069,7 +1938,6 @@ def route_node_sequence(
 
     # Adaptive beam search: reduce beam width and waypoint depth for
     # high node counts to keep per-segment candidate generation fast.
-    num_segments = len(node_sequence) - 1
     if num_segments > 10:
         seg_beam_width = 3
         seg_beam_max_waypoints = 1
@@ -3152,7 +2020,7 @@ def route_node_sequence(
         # PATH_SEPARATION_MM gap from every non-connected node.
         if per_node_keepout:
             endpoint_safe = dilate_cells(
-                {start, goal}, blocked_exemption_radius
+                {start, goal}, max(1, blocked_radius)
             )
             for node in node_sequence:
                 if node == start or node == goal:
@@ -3176,7 +2044,7 @@ def route_node_sequence(
             # Penalise cells in the direction the previous segment came from
             # (i.e. the reversed arrival direction).  This nudges A* to
             # leave the node in a different direction.
-            for depth in range(1, max(2, blocked_radius + 1)):
+            for depth in range(1, max(3, blocked_radius * 2 + 1)):
                 penalised = (
                     start[0] + prev_dir[0] * depth,
                     start[1] + prev_dir[1] * depth,
@@ -3206,29 +2074,11 @@ def route_node_sequence(
                 beam_width=seg_beam_width,
                 beam_max_waypoints=seg_beam_max_waypoints,
                 deadline=deadline,
+                min_self_spacing=min_self_spacing,
+                fill_excluded_cells=_segment_excluded_fill(
+                    segment_fill_zones, segment_index, valid_cells, highway_cells,
+                ),
             )
-            if segment_target_length is not None and candidate_paths and blocked_radius > 0:
-                best_candidate_length = max(_path_length(path) for path in candidate_paths)
-                if best_candidate_length + 1e-9 < segment_target_length:
-                    relaxed_candidates = _segment_candidate_paths(
-                        valid_cells=segment_valid_cells,
-                        start=start,
-                        goal=goal,
-                        penalty_cells=local_penalties,
-                        penalty_weight=penalty_weight,
-                        allow_diagonals=allow_diagonals,
-                        target_length=segment_target_length,
-                        self_avoid_radius=max(0, blocked_radius - 1),
-                        vertical_move_penalty=vertical_move_penalty,
-                        roominess_map=roominess_map,
-                        bottleneck_threshold=bottleneck_threshold,
-                        boundary_penalty_cells=boundary_penalty_cells,
-                        boundary_penalty_weight=0.2,
-                        beam_width=seg_beam_width,
-                        beam_max_waypoints=seg_beam_max_waypoints,
-                        deadline=deadline,
-                    )
-                    candidate_paths = _dedupe_paths(candidate_paths + relaxed_candidates)
         except RoutingError:
             candidate_paths = []
 
@@ -3258,14 +2108,16 @@ def route_node_sequence(
             # Cross-segment overlap check: verify the new segment does
             # not run parallel to the previous segment near the shared
             # node.  The blocked_exemption_radius is deliberately NOT
-            # used here — only a tiny 1-cell zone around the shared node
-            # is exempt so that near-node overlaps are caught.
+            # used here — node_adjacency is set to max(2, blocked_radius+1)
+            # so the exemption zone is just large enough for two paths to
+            # physically arrive/depart at the shared node while still
+            # catching near-node overlaps that violate the 1 mm gap.
             if blocked_radius > 0 and current_segments:
                 prev_seg = current_segments[-1]
                 shared = start
                 if _cross_segment_near_approach(
                     prev_seg, routed_segment, blocked_radius, shared,
-                    node_adjacency=max(2, blocked_exemption_radius),
+                    node_adjacency=max(2, blocked_radius + 1),
                 ):
                     continue
 
@@ -3274,6 +2126,26 @@ def route_node_sequence(
             # segments that do not directly connect to start or goal.
             if non_adjacent_blocked is not None:
                 if any(cell in non_adjacent_blocked for cell in routed_segment):
+                    continue
+
+            # Post-hoc per-node keepout check: the endpoint_safe exemption
+            # during valid_cells filtering may let a path slip through a
+            # non-connected node's keepout zone.  Reject it here.
+            if per_node_keepout and blocked_radius > 0:
+                routed_set = set(routed_segment)
+                posthoc_safe = dilate_cells(
+                    {start, goal}, max(1, blocked_radius)
+                )
+                node_violation = False
+                for node in node_sequence:
+                    if node == start or node == goal:
+                        continue
+                    if node in per_node_keepout:
+                        violation = (routed_set & per_node_keepout[node]) - posthoc_safe
+                        if violation:
+                            node_violation = True
+                            break
+                if node_violation:
                     continue
 
             next_penalty_cells = set(current_penalty_cells)
