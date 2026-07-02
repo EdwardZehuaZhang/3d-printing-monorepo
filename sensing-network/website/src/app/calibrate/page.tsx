@@ -39,8 +39,21 @@ const NODE_COLORS = [
   "#dc2626", "#7c3aed", "#0891b2", "#db2777",
 ];
 
+// C major scale starting at C4 — one note per node
+const NOTE_MAP: { name: string; freq: number }[] = [
+  { name: "C4",  freq: 261.63 },
+  { name: "D4",  freq: 293.66 },
+  { name: "E4",  freq: 329.63 },
+  { name: "F4",  freq: 349.23 },
+  { name: "G4",  freq: 392.00 },
+  { name: "A4",  freq: 440.00 },
+  { name: "B4",  freq: 493.88 },
+  { name: "C5",  freq: 523.25 },
+];
+
 export default function CalibratePage() {
   const [baudRate, setBaudRate] = useState(115200);
+  const [numNodes, setNumNodes] = useState(4);
 
   // Flash state
   const [isFlashing, setIsFlashing] = useState(false);
@@ -56,10 +69,57 @@ export default function CalibratePage() {
     "waiting" | "touching" | "collecting" | "releasing" | "done"
   >("waiting");
   const [calNodesCompleted, setCalNodesCompleted] = useState(0);
-  const numNodesRef = useRef(4); // default, updated from Arduino output
 
   // Live detection: parsed from Arduino output
   const [detectedNode, setDetectedNode] = useState<number | null>(null);
+
+  // Web Audio API for musical note feedback
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const oscRef = useRef<OscillatorNode | null>(null);
+  const gainRef = useRef<GainNode | null>(null);
+
+  // Play / stop note when detectedNode changes in live mode
+  useEffect(() => {
+    if (phaseRef.current !== "live") return;
+
+    // Stop any current tone
+    if (gainRef.current && oscRef.current) {
+      try {
+        gainRef.current.gain.cancelScheduledValues(audioCtxRef.current!.currentTime);
+        gainRef.current.gain.setTargetAtTime(0, audioCtxRef.current!.currentTime, 0.05);
+        const osc = oscRef.current;
+        setTimeout(() => { try { osc.stop(); } catch {} }, 100);
+      } catch {}
+      oscRef.current = null;
+      gainRef.current = null;
+    }
+
+    if (detectedNode === null) return;
+
+    // Lazily create AudioContext (must happen after user gesture)
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioContext();
+    }
+    const ctx = audioCtxRef.current;
+    if (ctx.state === "suspended") ctx.resume();
+
+    const noteIndex = ((detectedNode - 1) % NOTE_MAP.length + NOTE_MAP.length) % NOTE_MAP.length;
+    const { freq } = NOTE_MAP[noteIndex];
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    gain.gain.value = 0;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    // Smooth attack
+    gain.gain.setTargetAtTime(0.25, ctx.currentTime, 0.03);
+
+    oscRef.current = osc;
+    gainRef.current = gain;
+  }, [detectedNode]);
 
   // Live sensor values for chart (sum values)
   const [liveValues, setLiveValues] = useState<{ time: number; value: number; node?: number }[]>([]);
@@ -141,8 +201,6 @@ export default function CalibratePage() {
       const n = parseInt(touchHoldMatch[1]);
       setCalNode(n);
       setCalNodeStatus("waiting");
-      // Update numNodes if we see a higher node number
-      if (n > numNodesRef.current) numNodesRef.current = n;
       return;
     }
 
@@ -274,8 +332,6 @@ export default function CalibratePage() {
   })();
 
   const latestSum = liveValues.length > 0 ? liveValues[liveValues.length - 1].value : null;
-  const numNodes = numNodesRef.current;
-
   // Phase-specific status message
   const phaseMessage = (() => {
     switch (phase) {
@@ -379,14 +435,27 @@ export default function CalibratePage() {
             <motion.div variants={fadeUp} custom={1} className="flex shrink-0 flex-col items-end gap-2 pt-6">
               <div className="flex items-center gap-2">
                 {serial.status !== "connected" && !isFlashing && (
-                  <select
-                    value={baudRate}
-                    onChange={(e) => setBaudRate(parseInt(e.target.value))}
-                    className="appearance-none rounded-lg border-2 border-border bg-surface-inset bg-[url('data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236b7280%22%20d%3D%22M3%205l3%203%203-3%22%2F%3E%3C%2Fsvg%3E')] bg-[length:12px] bg-[position:right_8px_center] bg-no-repeat py-2 pl-3 pr-8 text-xs font-semibold focus:border-primary focus:outline-none"
-                  >
-                    <option value={9600}>9600</option>
-                    <option value={115200}>115200</option>
-                  </select>
+                  <>
+                    <select
+                      value={numNodes}
+                      onChange={(e) => setNumNodes(parseInt(e.target.value))}
+                      className="appearance-none rounded-lg border-2 border-border bg-surface-inset bg-[url('data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236b7280%22%20d%3D%22M3%205l3%203%203-3%22%2F%3E%3C%2Fsvg%3E')] bg-[length:12px] bg-[position:right_8px_center] bg-no-repeat py-2 pl-3 pr-8 text-xs font-semibold focus:border-primary focus:outline-none"
+                    >
+                      {Array.from({ length: 24 }, (_, i) => i + 1).map((n) => (
+                        <option key={n} value={n}>
+                          {n} node{n > 1 ? "s" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={baudRate}
+                      onChange={(e) => setBaudRate(parseInt(e.target.value))}
+                      className="appearance-none rounded-lg border-2 border-border bg-surface-inset bg-[url('data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2212%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%236b7280%22%20d%3D%22M3%205l3%203%203-3%22%2F%3E%3C%2Fsvg%3E')] bg-[length:12px] bg-[position:right_8px_center] bg-no-repeat py-2 pl-3 pr-8 text-xs font-semibold focus:border-primary focus:outline-none"
+                    >
+                      <option value={9600}>9600</option>
+                      <option value={115200}>115200</option>
+                    </select>
+                  </>
                 )}
                 {serial.status === "connected" ? (
                   <button
@@ -405,7 +474,11 @@ export default function CalibratePage() {
                       setIsFlashing(true);
                       setFlashStatus("Compiling & uploading sketch...");
                       try {
-                        const res = await fetch("/api/flash", { method: "POST" });
+                        const res = await fetch("/api/flash", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ numNodes }),
+                        });
                         const data = await res.json();
                         if (!res.ok) {
                           setFlashStatus(`Flash failed: ${data.error}`);
@@ -668,20 +741,29 @@ export default function CalibratePage() {
                 </span>
                 <div className="flex flex-1 items-center justify-center rounded-xl border-2 border-dashed border-border bg-surface-inset p-12">
                   <AnimatePresence mode="wait">
-                    <motion.span
+                    <motion.div
                       key={detectedNode ?? "none"}
                       initial={{ opacity: 0, scale: 0.8 }}
                       animate={{ opacity: 1, scale: 1 }}
                       exit={{ opacity: 0, scale: 0.8 }}
                       transition={{ duration: 0.2 }}
-                      className={`text-6xl font-bold ${
-                        detectedNode !== null
-                          ? "text-secondary"
-                          : "text-text-tertiary"
-                      }`}
+                      className="flex flex-col items-center gap-1"
                     >
-                      {detectedNode !== null ? detectedNode : "\u2014"}
-                    </motion.span>
+                      <span
+                        className={`text-6xl font-bold ${
+                          detectedNode !== null
+                            ? "text-secondary"
+                            : "text-text-tertiary"
+                        }`}
+                      >
+                        {detectedNode !== null ? detectedNode : "\u2014"}
+                      </span>
+                      {detectedNode !== null && phase === "live" && (
+                        <span className="text-lg font-semibold text-secondary/70">
+                          {NOTE_MAP[((detectedNode - 1) % NOTE_MAP.length + NOTE_MAP.length) % NOTE_MAP.length].name}
+                        </span>
+                      )}
+                    </motion.div>
                   </AnimatePresence>
                 </div>
               </div>
@@ -741,73 +823,65 @@ export default function CalibratePage() {
 
             {/* SVG wiring diagram */}
             <div className="mb-5 overflow-x-auto rounded-lg bg-[#1a1a2e] p-5">
-              <svg viewBox="0 0 700 190" className="w-full max-w-[700px] mx-auto" style={{ minWidth: 420 }}>
-                {/* ── Row 1: Pin 5 —[ 10kΩ ]— Pin 2 ——— wire ——→ TRACE START ── */}
+              {(() => {
+                const nodeSpacing = 60;
+                const chainStartX = 467;
+                const firstNodeCx = chainStartX + 13;
+                const lastNodeCx = firstNodeCx + (numNodes - 1) * nodeSpacing;
+                const chainEndX = lastNodeCx + 17;
+                const blockX = 445;
+                const blockW = chainEndX - blockX + 5;
+                const blockCenterX = blockX + blockW / 2;
+                const svgW = blockX + blockW + 15;
+                return (
+                  <svg viewBox={`0 0 ${svgW} 190`} className="w-full mx-auto" style={{ minWidth: 420, maxWidth: svgW }}>
+                    {/* ── Row 1: Pin 5 —[ 10kΩ ]— Pin 2 ——— wire ——→ TRACE START ── */}
+                    <text x="10" y="44" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 5</text>
+                    <line x1="68" y1="40" x2="110" y2="40" stroke="#60a5fa" strokeWidth="2" />
+                    <rect x="110" y="28" width="80" height="24" rx="5" fill="#334155" stroke="#facc15" strokeWidth="2" />
+                    <text x="150" y="45" textAnchor="middle" fill="#facc15" fontSize="11" fontWeight="bold" fontFamily="monospace">10kΩ</text>
+                    <line x1="190" y1="40" x2="250" y2="40" stroke="#60a5fa" strokeWidth="2" />
+                    <text x="253" y="44" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 2</text>
+                    <line x1="310" y1="40" x2="430" y2="40" stroke="#60a5fa" strokeWidth="2" strokeDasharray="8 4" />
+                    <polygon points="430,34 442,40 430,46" fill="#60a5fa" />
+                    <text x="370" y="30" textAnchor="middle" fill="#475569" fontSize="10" fontFamily="monospace">wire 1</text>
 
-                {/* Pin 5 label */}
-                <text x="10" y="44" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 5</text>
-                {/* wire to resistor */}
-                <line x1="68" y1="40" x2="110" y2="40" stroke="#60a5fa" strokeWidth="2" />
-                {/* resistor body */}
-                <rect x="110" y="28" width="80" height="24" rx="5" fill="#334155" stroke="#facc15" strokeWidth="2" />
-                <text x="150" y="45" textAnchor="middle" fill="#facc15" fontSize="11" fontWeight="bold" fontFamily="monospace">10kΩ</text>
-                {/* wire from resistor to Pin 2 */}
-                <line x1="190" y1="40" x2="250" y2="40" stroke="#60a5fa" strokeWidth="2" />
-                {/* Pin 2 label */}
-                <text x="253" y="44" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 2</text>
-                {/* long wire to block */}
-                <line x1="310" y1="40" x2="430" y2="40" stroke="#60a5fa" strokeWidth="2" strokeDasharray="8 4" />
-                {/* arrow */}
-                <polygon points="430,34 442,40 430,46" fill="#60a5fa" />
-                {/* wire label */}
-                <text x="370" y="30" textAnchor="middle" fill="#475569" fontSize="10" fontFamily="monospace">wire 1</text>
+                    {/* Block trace start */}
+                    <rect x={blockX} y="22" width={blockW} height="38" rx="6" fill="#1e293b" stroke="#3b82f6" strokeWidth="2" />
+                    <text x={blockCenterX} y="46" textAnchor="middle" fill="#60a5fa" fontSize="12" fontWeight="bold" fontFamily="monospace">TRACE START</text>
 
-                {/* Block trace start */}
-                <rect x="445" y="22" width="245" height="38" rx="6" fill="#1e293b" stroke="#3b82f6" strokeWidth="2" />
-                <text x="567" y="46" textAnchor="middle" fill="#60a5fa" fontSize="12" fontWeight="bold" fontFamily="monospace">TRACE START</text>
+                    {/* Connector line down from trace start box */}
+                    <line x1={blockCenterX} y1="60" x2={blockCenterX} y2="80" stroke="#3b82f6" strokeWidth="1.5" />
 
-                {/* Trace inside block: series chain */}
-                {/* Connector line down from trace start box */}
-                <line x1="567" y1="60" x2="567" y2="80" stroke="#3b82f6" strokeWidth="1.5" />
+                    {/* Series node chain */}
+                    <line x1={blockX} y1="100" x2={chainStartX} y2="100" stroke="#475569" strokeWidth="1.5" />
+                    {Array.from({ length: numNodes }, (_, i) => {
+                      const cx = firstNodeCx + i * nodeSpacing;
+                      return (
+                        <g key={i}>
+                          <circle cx={cx} cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
+                          <text x={cx} y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N{i + 1}</text>
+                          <line x1={cx + 13} y1="100" x2={i < numNodes - 1 ? cx + nodeSpacing - 13 : chainEndX} y2="100" stroke="#475569" strokeWidth="1.5" />
+                        </g>
+                      );
+                    })}
 
-                {/* Series node chain */}
-                <line x1="445" y1="100" x2="467" y2="100" stroke="#475569" strokeWidth="1.5" />
-                {/* N1 */}
-                <circle cx="480" cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
-                <text x="480" y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N1</text>
-                <line x1="493" y1="100" x2="527" y2="100" stroke="#475569" strokeWidth="1.5" />
-                {/* N2 */}
-                <circle cx="540" cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
-                <text x="540" y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N2</text>
-                <line x1="553" y1="100" x2="587" y2="100" stroke="#475569" strokeWidth="1.5" />
-                {/* N3 */}
-                <circle cx="600" cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
-                <text x="600" y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N3</text>
-                <line x1="613" y1="100" x2="647" y2="100" stroke="#475569" strokeWidth="1.5" />
-                {/* N4 */}
-                <circle cx="660" cy="100" r="13" fill="#1e3a5f" stroke="#3b82f6" strokeWidth="2" />
-                <text x="660" y="104" textAnchor="middle" fill="#60a5fa" fontSize="11" fontWeight="bold" fontFamily="monospace">N4</text>
-                <line x1="673" y1="100" x2="690" y2="100" stroke="#475569" strokeWidth="1.5" />
+                    {/* "inside block" bracket */}
+                    <rect x={blockX - 5} y="82" width={blockW + 10} height="36" rx="6" fill="none" stroke="#3b82f6" strokeWidth="1" strokeDasharray="4 3" opacity="0.4" />
+                    <text x={blockCenterX} y="133" textAnchor="middle" fill="#475569" fontSize="9" fontFamily="monospace">conductive trace inside block (nodes in series)</text>
 
-                {/* "inside block" bracket */}
-                <rect x="440" y="82" width="255" height="36" rx="6" fill="none" stroke="#3b82f6" strokeWidth="1" strokeDasharray="4 3" opacity="0.4" />
-                <text x="567" y="133" textAnchor="middle" fill="#475569" fontSize="9" fontFamily="monospace">conductive trace inside block (nodes in series)</text>
+                    {/* ── Row 2: Pin 3 ——— wire ——→ TRACE END ── */}
+                    <text x="10" y="162" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 3</text>
+                    <line x1="68" y1="158" x2="430" y2="158" stroke="#60a5fa" strokeWidth="2" strokeDasharray="8 4" />
+                    <polygon points="430,152 442,158 430,164" fill="#60a5fa" />
+                    <text x="250" y="148" textAnchor="middle" fill="#475569" fontSize="10" fontFamily="monospace">wire 2</text>
 
-                {/* ── Row 2: Pin 3 ——— wire ——→ TRACE END ── */}
-
-                {/* Pin 3 label */}
-                <text x="10" y="162" fill="#93c5fd" fontSize="13" fontWeight="bold" fontFamily="monospace">Pin 3</text>
-                {/* long wire to block */}
-                <line x1="68" y1="158" x2="430" y2="158" stroke="#60a5fa" strokeWidth="2" strokeDasharray="8 4" />
-                {/* arrow */}
-                <polygon points="430,152 442,158 430,164" fill="#60a5fa" />
-                {/* wire label */}
-                <text x="250" y="148" textAnchor="middle" fill="#475569" fontSize="10" fontFamily="monospace">wire 2</text>
-
-                {/* Block trace end */}
-                <rect x="445" y="140" width="245" height="38" rx="6" fill="#1e293b" stroke="#3b82f6" strokeWidth="2" />
-                <text x="567" y="164" textAnchor="middle" fill="#60a5fa" fontSize="12" fontWeight="bold" fontFamily="monospace">TRACE END</text>
-              </svg>
+                    {/* Block trace end */}
+                    <rect x={blockX} y="140" width={blockW} height="38" rx="6" fill="#1e293b" stroke="#3b82f6" strokeWidth="2" />
+                    <text x={blockCenterX} y="164" textAnchor="middle" fill="#60a5fa" fontSize="12" fontWeight="bold" fontFamily="monospace">TRACE END</text>
+                  </svg>
+                );
+              })()}
             </div>
 
             {/* Simple step-by-step */}

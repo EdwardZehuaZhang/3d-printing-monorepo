@@ -1,5 +1,5 @@
 /*
- * 4-Node Bidirectional Touch Sensor
+ * N-Node Bidirectional Touch Sensor
  * -----------------------------------
  * Charges the trace from BOTH ends alternately to create a unique
  * 2D signature (fwdB, revA) for each touch node.
@@ -34,8 +34,8 @@
 #define PIN_B       3   // trace END
 
 // ── Trace ────────────────────────────────────────────────────────────
-#define NUM_NODES 4
-const float nodeResKohm[NUM_NODES] = {3.0, 13.0, 19.0, 27.0};
+#define NUM_NODES 6
+const float nodeResKohm[NUM_NODES] = {7.0, 14.0, 21.0, 28.0, 35.0, 42.0};
 #define EXT_RES_KOHM 20.0  // external resistor on SEND path (Pin5 -> trace start)
 
 // ── Quality heuristics ────────────────────────────────────────────────
@@ -56,23 +56,13 @@ const float nodeResKohm[NUM_NODES] = {3.0, 13.0, 19.0, 27.0};
 #define DEBOUNCE_COUNT      6
 #define RELEASE_COUNT       5
 
-// ── Runtime robustness ──────────────────────────────────────────────
-#define CLASS_STD_FLOOR     18
-#define CLASS_MAX_SCORE     45.0f
-#define PRESS_SCORE_MAX      12.0f
-#define N23_AMBIG_MARGIN     1.25f
-#define SWITCH_CONFIRM_COUNT 7
-#define SWITCH_SCORE_MARGIN  2.5f
+// ── Runtime robustness (fixed) ──────────────────────────────────────
 #define SWITCH_LOCKOUT_FRAMES 4
 #define FILTER_ALPHA         0.18f
 #define BASELINE_TRACK_ALPHA 0.02f
 #define ENTRY_TOUCH_GATE_COUNT 2
 #define ENTRY_SUM_MARGIN      8
 #define ENTRY_DIFF_MARGIN     8
-#define ENTRY_SCORE_GAP_MIN   0.70f
-#define N23_ENTRY_GAP_MIN     1.60f
-#define N23_SWITCH_SCORE_MARGIN 4.0f
-#define N23_SWITCH_CONFIRM_COUNT 10
 
 // ── Calibration data ─────────────────────────────────────────────────
 long   nodeFwdMean[NUM_NODES];     // forward Pin B count mean
@@ -84,6 +74,18 @@ long   nodeFwdMax[NUM_NODES];
 long   nodeRevMin[NUM_NODES];
 long   nodeRevMax[NUM_NODES];
 int    sortIdx[NUM_NODES];
+int    nearestNeighbor[NUM_NODES]; // nearest centroid neighbor per node
+
+// Adaptive thresholds (computed from calibration data in computeAdaptiveThresholds)
+float  rtStdFloor       = 18.0f;
+float  rtClassMaxScore  = 45.0f;
+float  rtPressScoreMax  = 12.0f;
+float  rtEntryGapMin    = 0.70f;
+float  rtAmbigMargin    = 1.25f;
+float  rtSwitchMargin   = 2.5f;
+int    rtSwitchConfirm  = 7;
+float  rtAdjSwitchMargin  = 4.0f;
+int    rtAdjSwitchConfirm = 10;
 
 long   baselineFwd  = 0;
 long   baselineRev  = 0;
@@ -228,8 +230,8 @@ long dist2(long fwd, long rev, long fMean, long rMean) {
 float nodeScore(int idx, long fwd, long rev) {
   float fStd = (float)nodeFwdStd[idx];
   float rStd = (float)nodeRevStd[idx];
-  if (fStd < CLASS_STD_FLOOR) fStd = CLASS_STD_FLOOR;
-  if (rStd < CLASS_STD_FLOOR) rStd = CLASS_STD_FLOOR;
+  if (fStd < rtStdFloor) fStd = rtStdFloor;
+  if (rStd < rtStdFloor) rStd = rtStdFloor;
 
   float df = ((float)fwd - (float)nodeFwdMean[idx]) / fStd;
   float dr = ((float)rev - (float)nodeRevMean[idx]) / rStd;
@@ -337,6 +339,91 @@ void calibrateNodeLongWindow(int nodeIdx,
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// ADAPTIVE THRESHOLD COMPUTATION
+// ═════════════════════════════════════════════════════════════════════
+void computeAdaptiveThresholds() {
+  // 1. Find nearest centroid neighbor for each node and minimum pair sigma
+  float minSigma = 9999.0f;
+
+  for (int i = 0; i < NUM_NODES; i++) {
+    float bestDist = 1e9f;
+    nearestNeighbor[i] = -1;
+    for (int j = 0; j < NUM_NODES; j++) {
+      if (i == j) continue;
+      float d = sqrtf((float)dist2(nodeFwdMean[i], nodeRevMean[i],
+                                    nodeFwdMean[j], nodeRevMean[j]));
+      if (d < bestDist) {
+        bestDist = d;
+        nearestNeighbor[i] = j;
+      }
+      float maxStd = (float)max(max(nodeFwdStd[i], nodeRevStd[i]),
+                                max(nodeFwdStd[j], nodeRevStd[j]));
+      if (maxStd > 0) {
+        float sigma = d / maxStd;
+        if (sigma < minSigma) minSigma = sigma;
+      }
+    }
+  }
+
+  // 2. Average std across all nodes
+  float avgStd = 0.0f;
+  for (int i = 0; i < NUM_NODES; i++) {
+    avgStd += (float)(nodeFwdStd[i] + nodeRevStd[i]);
+  }
+  avgStd /= (float)(2 * NUM_NODES);
+
+  // 3. Compute adaptive thresholds based on actual calibration quality
+  //    These scale gracefully from 4 to 24 nodes.
+
+  // Std floor: half the average observed std, but at least 4
+  rtStdFloor = max(avgStd * 0.5f, 4.0f);
+
+  // Press score max: with more nodes, nearest centroid is farther in scaled space
+  rtPressScoreMax = max(12.0f, max((float)(NUM_NODES * 3), minSigma * minSigma * 1.5f));
+
+  // Class max score: upper bound before rejecting entirely
+  rtClassMaxScore = max(45.0f, rtPressScoreMax * 3.5f);
+
+  // Entry gap: fraction of minimum sigma; tighter clusters → smaller required gap
+  rtEntryGapMin = max(0.08f, minSigma * 0.10f);
+
+  // Ambiguity margin for adjacent pairs (stricter than general entry gap)
+  rtAmbigMargin = max(0.15f, minSigma * 0.12f);
+
+  // Switch margins
+  rtSwitchMargin = max(0.8f, minSigma * 0.20f);
+  rtSwitchConfirm = constrain(5 + NUM_NODES / 4, 5, 15);
+
+  // Adjacent pair switch: stricter to prevent flicker between neighbors
+  rtAdjSwitchMargin = rtSwitchMargin * 1.6f;
+  rtAdjSwitchConfirm = constrain(rtSwitchConfirm + 3, 7, 20);
+
+  // 4. Print computed thresholds
+  Serial.println();
+  Serial.println(F("  ADAPTIVE THRESHOLDS"));
+  Serial.println(F("  -------------------"));
+  Serial.print(F("  minSigma=")); Serial.print(minSigma, 2);
+  Serial.print(F("  avgStd=")); Serial.println(avgStd, 1);
+  Serial.print(F("  stdFloor=")); Serial.print(rtStdFloor, 1);
+  Serial.print(F("  pressMax=")); Serial.print(rtPressScoreMax, 1);
+  Serial.print(F("  classMax=")); Serial.println(rtClassMaxScore, 1);
+  Serial.print(F("  entryGap=")); Serial.print(rtEntryGapMin, 2);
+  Serial.print(F("  ambig=")); Serial.println(rtAmbigMargin, 2);
+  Serial.print(F("  switchMargin=")); Serial.print(rtSwitchMargin, 1);
+  Serial.print(F("  switchConfirm=")); Serial.println(rtSwitchConfirm);
+  Serial.print(F("  adjSwitchMargin=")); Serial.print(rtAdjSwitchMargin, 1);
+  Serial.print(F("  adjSwitchConfirm=")); Serial.println(rtAdjSwitchConfirm);
+
+  Serial.print(F("  Nearest neighbors: "));
+  for (int i = 0; i < NUM_NODES; i++) {
+    Serial.print(F("N")); Serial.print(i + 1);
+    Serial.print(F("→N")); Serial.print(nearestNeighbor[i] + 1);
+    if (i < NUM_NODES - 1) Serial.print(F(", "));
+  }
+  Serial.println();
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // SETUP
 // ═════════════════════════════════════════════════════════════════════
 void setup() {
@@ -345,10 +432,14 @@ void setup() {
 
   Serial.println();
   Serial.println(F("====================================================="));
-  Serial.println(F("  4-Node Bidirectional Touch Sensor"));
+  Serial.print(F("  ")); Serial.print(NUM_NODES); Serial.println(F("-Node Bidirectional Touch Sensor"));
   Serial.println(F("====================================================="));
   Serial.println();
-  Serial.println(F("  Trace: START -[3k]- N1 -[10k]- N2 -[6k]- N3 -[8k]- N4 - END"));
+  Serial.print(F("  Trace: START"));
+  for (int i = 0; i < NUM_NODES; i++) {
+    Serial.print(F(" - N")); Serial.print(i + 1);
+  }
+  Serial.println(F(" - END"));
   Serial.println();
   Serial.println(F("  WIRING:"));
   Serial.print(F("               ")); Serial.print(EXT_RES_KOHM, 0); Serial.println(F("k resistor"));
@@ -669,6 +760,8 @@ void setup() {
     Serial.print(F(" at ")); Serial.print(minSigmaAdj, 2); Serial.println(F("σ"));
   }
 
+  computeAdaptiveThresholds();
+
   calibrated = true;
   Serial.println();
   Serial.println(F("  ═════════════════════════════════════════════════════════════"));
@@ -729,22 +822,24 @@ void loop() {
       }
     }
 
-    if (bestScore > CLASS_MAX_SCORE) {
+    if (bestScore > rtClassMaxScore) {
       detectedNode = -1;
     }
   }
 
   float scoreGap = secondScore - bestScore;
-  bool n23Boundary = ((detectedNode == 1 && secondNode == 2) || (detectedNode == 2 && secondNode == 1));
-  bool n23Ambiguous = n23Boundary && (scoreGap < N23_AMBIG_MARGIN);
-  bool entryConfident = scoreGap >= ENTRY_SCORE_GAP_MIN;
-  bool n23EntryConfident = !n23Boundary || (scoreGap >= N23_ENTRY_GAP_MIN);
+  bool adjacentPair = (detectedNode >= 0 && secondNode >= 0 &&
+                       (nearestNeighbor[detectedNode] == secondNode ||
+                        nearestNeighbor[secondNode] == detectedNode));
+  bool adjacentAmbiguous = adjacentPair && (scoreGap < rtAmbigMargin);
+  float requiredGap = adjacentPair ? rtAmbigMargin : rtEntryGapMin;
+  bool entryConfident = scoreGap >= requiredGap;
   int entryRejectCode = 0;
 
   // ── Debounce ──────────────────────────────────────────────────
   if (currentNode == -1) {
-    if (detectedNode != -1 && bestScore <= PRESS_SCORE_MAX && !n23Ambiguous &&
-        entryTouchStable && entrySignalStrong && entryConfident && n23EntryConfident) {
+    if (detectedNode != -1 && bestScore <= rtPressScoreMax && !adjacentAmbiguous &&
+        entryTouchStable && entrySignalStrong && entryConfident) {
       if (detectedNode == candidateNode) hitCounter++;
       else { candidateNode = detectedNode; hitCounter = 1; }
 
@@ -764,7 +859,7 @@ void loop() {
       hitCounter = 0; candidateNode = -1;
       if (touchActive) {
         if (detectedNode == -1) entryRejectCode = 1;
-        else if (bestScore > PRESS_SCORE_MAX) entryRejectCode = 2;
+        else if (bestScore > rtPressScoreMax) entryRejectCode = 2;
         else if (!entryTouchStable) entryRejectCode = 3;
         else if (!entrySignalStrong) entryRejectCode = 4;
         else if (!entryConfident) entryRejectCode = 5;
@@ -789,16 +884,16 @@ void loop() {
       if (switchLockoutCounter > 0) switchLockoutCounter--;
     } else {
       missCounter = 0;
-      if (switchLockoutCounter > 0 || n23Ambiguous) {
+      if (switchLockoutCounter > 0 || adjacentAmbiguous) {
         if (switchLockoutCounter > 0) switchLockoutCounter--;
         switchCandidate = -1;
         switchCounter = 0;
       } else {
         float currentScore = nodeScore(currentNode, fwd, rev);
-        bool n23SwitchPair = ((currentNode == 1 && detectedNode == 2) ||
-                              (currentNode == 2 && detectedNode == 1));
-        float switchScoreMargin = n23SwitchPair ? N23_SWITCH_SCORE_MARGIN : SWITCH_SCORE_MARGIN;
-        int switchConfirmNeed = n23SwitchPair ? N23_SWITCH_CONFIRM_COUNT : SWITCH_CONFIRM_COUNT;
+        bool adjSwitchPair = (nearestNeighbor[currentNode] == detectedNode ||
+                              nearestNeighbor[detectedNode] == currentNode);
+        float switchScoreMargin = adjSwitchPair ? rtAdjSwitchMargin : rtSwitchMargin;
+        int switchConfirmNeed = adjSwitchPair ? rtAdjSwitchConfirm : rtSwitchConfirm;
         bool challengerIsClearlyBetter = (bestScore + switchScoreMargin < currentScore);
 
         if (challengerIsClearlyBetter) {
@@ -846,7 +941,7 @@ void loop() {
           case 3: Serial.print(F("gate")); break;
           case 4: Serial.print(F("amp")); break;
           case 5: Serial.print(F("gap")); break;
-          case 6: Serial.print(F("n23")); break;
+          case 6: Serial.print(F("adj")); break;
           case 7:
             Serial.print(F("deb("));
             Serial.print(hitCounter);
